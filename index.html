@@ -411,7 +411,12 @@
     <!-- Desktop Right Column: Configuration, Calibration, Backup Syncer -->
     <section class="desktop-config-panel">
       <div class="config-glass">
-        <h2><i data-lucide="sliders" class="inline-icon"></i> 核心理財控制台</h2>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid var(--panel-border); padding-bottom: 10px; width: 100%;">
+          <h2 style="margin: 0; padding: 0; border: none; font-size: 1.2rem; display: flex; align-items: center; gap: 8px;"><i data-lucide="sliders" class="inline-icon"></i> 核心理財控制台</h2>
+          <button id="close-config-btn" class="icon-btn" style="border: 1px solid var(--panel-border); border-radius: 50%; width: 32px; height: 32px; display: flex; justify-content: center; align-items: center; background: rgba(255,255,255,0.05);" title="關閉控制台" aria-label="關閉控制台">
+            <i data-lucide="x" style="width: 16px; height: 16px;"></i>
+          </button>
+        </div>
         
         <!-- Tab navigation inside Config -->
         <div class="config-tabs">

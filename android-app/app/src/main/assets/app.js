@@ -2656,12 +2656,21 @@ document.addEventListener('DOMContentLoaded', () => {
   
   document.getElementById('settings-toggle-btn').onclick = () => {
     playSound('click');
-    showToast("設定控制台已在右側（電腦端）或下方為您載入！");
+    const configPanel = document.querySelector('.desktop-config-panel');
     if (window.innerWidth <= 1024) {
-      document.querySelector('.desktop-config-panel').style.display = "block";
-      document.querySelector('.desktop-config-panel').scrollIntoView({ behavior: 'smooth' });
+      configPanel.classList.add('mobile-show');
+    } else {
+      showToast("核心理財控制台已在右側為您載入！", "info");
     }
   };
+
+  const closeConfigBtn = document.getElementById('close-config-btn');
+  if (closeConfigBtn) {
+    closeConfigBtn.onclick = () => {
+      playSound('click');
+      document.querySelector('.desktop-config-panel').classList.remove('mobile-show');
+    };
+  }
 
   // JSON 備份檔匯出
   document.getElementById('backup-export-btn').onclick = () => {
