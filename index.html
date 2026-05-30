@@ -790,10 +790,13 @@
       </div>
       
       <div class="modal-btn-row" style="margin-top: 15px; display: flex; justify-content: space-between; align-items: center;">
-        <button id="detail-memo-delete-btn" class="btn btn-secondary ripple" style="background: var(--danger-color); color: #fff; padding: 6px 12px; font-size: 0.72rem; border-radius: 8px;">
+        <button id="detail-memo-delete-btn" class="btn btn-secondary ripple" style="background: var(--danger-color); color: #fff; padding: 6px 10px; font-size: 0.72rem; border-radius: 8px;">
           <i data-lucide="trash-2"></i> 撕下備忘
         </button>
-        <button onclick="document.getElementById('memo-detail-modal').close()" class="btn btn-primary ripple" style="padding: 6px 16px; font-size: 0.72rem; border-radius: 8px;">
+        <button id="detail-memo-edit-btn" class="btn btn-dark ripple" style="background: var(--panel-border-focus); border: 1px solid var(--panel-border); padding: 6px 10px; font-size: 0.72rem; border-radius: 8px;">
+          <i data-lucide="settings-2"></i> 調整設定
+        </button>
+        <button onclick="document.getElementById('memo-detail-modal').close()" class="btn btn-primary ripple" style="padding: 6px 12px; font-size: 0.72rem; border-radius: 8px;">
           完成關閉
         </button>
       </div>

@@ -34,6 +34,9 @@ let state = {
 let userHasModifiedLedgerTime = false;
 let userHasModifiedLedgerDate = false;
 
+// 1.2 備忘錄編輯中卡片 ID 標記
+let editingMemoId = null;
+
 // 2. 瀏覽器音效合成器 (Web Audio API Synthesizer)
 let audioCtx = null;
 
@@ -977,6 +980,61 @@ function zoomMemo(id) {
     modal.close();
     deleteMemo(memo.id);
   };
+  
+  // 調整設定按鈕綁定
+  const editBtn = document.getElementById('detail-memo-edit-btn');
+  if (editBtn) {
+    editBtn.onclick = () => {
+      modal.close();
+      editingMemoId = memo.id;
+      
+      // 顯示編輯視窗，並預填所有欄位與更新標籤
+      const editModal = document.getElementById('custom-memo-modal');
+      editModal.querySelector('h3').textContent = "調整備忘錄設定";
+      document.getElementById('save-memo-btn').textContent = "更新設定";
+      
+      document.getElementById('memo-title').value = memo.title;
+      document.getElementById('memo-text').value = memo.text || "";
+      document.getElementById('memo-priority').value = memo.priority || "medium";
+      document.getElementById('memo-type').value = memo.type || "text";
+      document.getElementById('memo-reminder').value = memo.reminderTime || "";
+      document.getElementById('memo-color').value = memo.color || "pink";
+      
+      // 觸發類型切換狀態
+      const builder = document.getElementById('memo-checklist-builder');
+      const textGroup = document.getElementById('memo-text').closest('.form-group');
+      if (memo.type === 'checklist') {
+        builder.classList.remove('hidden');
+        if (textGroup) textGroup.classList.add('hidden');
+        
+        const container = document.getElementById('memo-checklist-items-container');
+        container.innerHTML = "";
+        
+        const items = memo.checklistItems || [];
+        items.forEach(item => {
+          const div = document.createElement('div');
+          div.className = "memo-checklist-item-row";
+          div.style.display = "flex";
+          div.style.alignItems = "center";
+          div.style.gap = "6px";
+          
+          div.innerHTML = `
+            <input type="text" class="form-input" style="flex: 1; padding: 6px 10px;" placeholder="輸入待辦清單項目..." value="${item.text}">
+            <button type="button" class="mini-icon-btn hover-danger" onclick="this.parentElement.remove()" style="width: 24px; height: 24px;">
+              <i data-lucide="trash-2" style="width: 14px; height: 14px;"></i>
+            </button>
+          `;
+          container.appendChild(div);
+        });
+        lucide.createIcons();
+      } else {
+        builder.classList.add('hidden');
+        if (textGroup) textGroup.classList.remove('hidden');
+      }
+      
+      editModal.showModal();
+    };
+  }
   
   modal.showModal();
   lucide.createIcons();
@@ -2042,7 +2100,12 @@ document.addEventListener('DOMContentLoaded', () => {
   // 生活備忘新增 (Memo Add)
   document.getElementById('add-memo-btn').onclick = () => {
     playSound('click');
+    editingMemoId = null; // 重設為新增模式
+    
     const modal = document.getElementById('custom-memo-modal');
+    modal.querySelector('h3').textContent = "粘貼生活備忘錄卡片";
+    document.getElementById('save-memo-btn').textContent = "黏貼備忘";
+    
     document.getElementById('memo-title').value = "";
     document.getElementById('memo-text').value = "";
     document.getElementById('memo-color').value = "pink";
@@ -2093,15 +2156,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const priority = document.getElementById('memo-priority').value;
     const reminderTime = document.getElementById('memo-reminder').value; // YYYY-MM-DDThh:mm
     
+    // 獲取原有的編輯對象，用於在清單變更時比對並保留其勾選狀態
+    const existingMemo = editingMemoId ? state.memos.find(m => m.id === editingMemoId) : null;
+    
     const checklistItems = [];
     if (type === 'checklist') {
       const rows = document.querySelectorAll('#memo-checklist-items-container .memo-checklist-item-row');
       rows.forEach(row => {
         const input = row.querySelector('input[type="text"]');
         if (input && input.value.trim() !== '') {
+          const textVal = input.value.trim();
+          // 若原項目存在同文字的待辦項目，保留原先的勾選狀態以優化操作體驗
+          const oldItem = existingMemo && existingMemo.checklistItems ? existingMemo.checklistItems.find(i => i.text === textVal) : null;
           checklistItems.push({
-            text: input.value.trim(),
-            checked: false
+            text: textVal,
+            checked: oldItem ? oldItem.checked : false
           });
         }
       });
@@ -2129,24 +2198,50 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     
     const nowTime = getFormattedLocalTime();
-    const newMemo = {
-      id: "memo-" + Date.now(),
-      title,
-      type,
-      text: type === 'text' ? text : "",
-      color,
-      priority,
-      reminderTime: reminderTime || "",
-      reminderTriggered: false,
-      checklistItems,
-      date: nowTime.date.substring(5, 10) + " " + nowTime.time // "MM-DD HH:MM"
-    };
     
-    state.memos.push(newMemo);
-    saveState();
-    
-    document.getElementById('custom-memo-modal').close();
-    showToast("備忘錄貼牆成功！", "success");
+    if (editingMemoId && existingMemo) {
+      // 編輯調整設定模式
+      existingMemo.title = title;
+      existingMemo.type = type;
+      existingMemo.text = type === 'text' ? text : "";
+      existingMemo.color = color;
+      existingMemo.priority = priority;
+      
+      // 如果提醒時間被重設或變更，重設其觸發狀態，以利定時引擎再次提醒
+      if (existingMemo.reminderTime !== reminderTime) {
+        existingMemo.reminderTime = reminderTime || "";
+        existingMemo.reminderTriggered = false;
+      }
+      
+      existingMemo.checklistItems = checklistItems;
+      
+      saveState();
+      document.getElementById('custom-memo-modal').close();
+      showToast("備忘錄設定已成功更新調整！", "success");
+      
+      // 重設編輯標記
+      editingMemoId = null;
+    } else {
+      // 全新張貼模式
+      const newMemo = {
+        id: "memo-" + Date.now(),
+        title,
+        type,
+        text: type === 'text' ? text : "",
+        color,
+        priority,
+        reminderTime: reminderTime || "",
+        reminderTriggered: false,
+        checklistItems,
+        date: nowTime.date.substring(5, 10) + " " + nowTime.time // "MM-DD HH:MM"
+      };
+      
+      state.memos.push(newMemo);
+      saveState();
+      
+      document.getElementById('custom-memo-modal').close();
+      showToast("備忘錄貼牆成功！", "success");
+    }
   };
 
   // 篩選與搜尋
