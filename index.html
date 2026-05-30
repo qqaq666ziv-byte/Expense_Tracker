@@ -41,26 +41,46 @@
         
         <!-- Desktop Stats Center -->
         <div class="desktop-stats-card">
-          <h3><i data-lucide="pie-chart" class="inline-icon"></i> 全功能支出佔比 (統計看板)</h3>
-          <div class="chart-wrapper">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px;">
+            <h3 style="margin: 0; font-size: 0.92rem; font-weight: 700;"><i data-lucide="bar-chart-2" class="inline-icon"></i> 數據統計看板</h3>
+            <!-- Time interval selection -->
+            <select id="stats-time-range" class="form-input" style="padding: 4px 8px; font-size: 0.72rem; border-radius: 6px; width: auto; background: rgba(0,0,0,0.25);">
+              <option value="all" selected>所有時間</option>
+              <option value="year">📅 本年</option>
+              <option value="month">📅 本月</option>
+              <option value="week">📅 本週</option>
+            </select>
+          </div>
+          
+          <!-- Chart type tab switcher -->
+          <div class="chart-tab-row" style="display: flex; gap: 6px; margin-bottom: 12px; border-bottom: 1px solid var(--panel-border); padding-bottom: 6px;">
+            <button id="chart-tab-pie" class="btn btn-sm btn-primary" style="padding: 4px 10px; font-size: 0.7rem; border-radius: 6px; flex: 1;">📊 支出佔比</button>
+            <button id="chart-tab-line" class="btn btn-sm btn-dark" style="padding: 4px 10px; font-size: 0.7rem; border-radius: 6px; flex: 1; border: 1px solid var(--panel-border);">📈 收支趨勢</button>
+          </div>
+          
+          <!-- Doughnut Chart wrapper -->
+          <div class="chart-wrapper" id="pie-chart-wrapper">
             <canvas id="desktop-chart"></canvas>
             <div id="chart-empty-state" class="chart-empty">無足夠支出資料</div>
           </div>
-          <div class="stats-grid">
-            <div class="stat-box">
-              <span class="stat-label">本月累計支出</span>
+          
+          <!-- Line Chart wrapper -->
+          <div class="chart-wrapper hidden" id="line-chart-wrapper">
+            <canvas id="desktop-trend-chart"></canvas>
+            <div id="line-chart-empty-state" class="chart-empty">無足夠趨勢資料</div>
+          </div>
+
+          <div class="stats-grid" style="margin-top: 15px;">
+            <div class="stat-box" style="flex: 1;">
+              <span class="stat-label">所選區間累計支出</span>
               <span id="total-expense-badge" class="stat-value expense-text">$0</span>
-            </div>
-            <div class="stat-box">
-              <span class="stat-label">防禦儲蓄率</span>
-              <span id="savings-rate-badge" class="stat-value savings-text">0%</span>
             </div>
           </div>
         </div>
         
         <div class="desktop-footer">
           <p>當前地區：<span id="desktop-timezone-text" class="highlight-text">臺灣標準時間 (GMT+8)</span></p>
-          <p>SPARK Ledger v2.1.2 • 安全防沙盒運行中</p>
+          <p>SPARK Ledger v2.2.0 • 安全防沙盒運行中</p>
         </div>
       </div>
     </header>
@@ -481,20 +501,43 @@
           <!-- GitHub Online Update Checker -->
           <div class="config-section">
             <h3><i data-lucide="refresh-cw" class="inline-icon"></i> 線上更新檢測</h3>
-            <p class="config-tip">透過 GitHub 讀取最新 Release 版本發布，支援一鍵線上熱更新 (Hot Reload) 模擬。</p>
+            <p class="config-tip">透過 GitHub 讀取最新 Release 版本發布，點擊下載並自動熱更新重載。</p>
             
-            <div class="updater-status-box">
+            <div class="updater-status-box" style="margin-bottom: 12px;">
               <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span style="font-size: 0.8rem; color: var(--text-muted);">當前版本：<span class="highlight-text">v2.1.2</span></span>
+                <span style="font-size: 0.8rem; color: var(--text-muted);">當前版本：<span class="highlight-text">v2.2.0</span></span>
                 <button id="check-update-btn" class="btn btn-sm btn-dark">檢查更新</button>
               </div>
-              <div id="update-loading-bar-wrapper" class="progress-bar-bg hidden" style="height: 6px; margin-top: 5px;">
+              <div id="update-loading-bar-wrapper" class="progress-bar-bg hidden" style="height: 6px; margin-top: 8px;">
                 <div id="update-loading-bar-fill" class="progress-bar-fill" style="width: 0%; background: var(--accent-color);"></div>
               </div>
               <div id="updater-notes-panel" class="hidden" style="font-size: 0.75rem; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 8px; line-height: 1.4;">
                 <span style="color: var(--success-color); font-weight: bold;">有可用更新！最新版本：<span id="new-ver-lbl">v2.2.0</span></span>
                 <p id="new-ver-notes" style="color: var(--text-secondary); margin-top: 5px; white-space: pre-line;"></p>
-                <button id="trigger-hot-update-btn" class="btn btn-xs btn-primary" style="margin-top: 8px; width: 100%; font-size: 0.7rem; padding: 4px 0;">立即執行熱更新升級</button>
+                <button id="trigger-hot-update-btn" class="btn btn-xs btn-primary" style="margin-top: 8px; width: 100%; font-size: 0.7rem; padding: 6px 0;">下載並自動安裝更新</button>
+              </div>
+            </div>
+            
+            <!-- 歷史更新日誌歷史面板 -->
+            <div class="changelog-history-box" style="border: 1px solid var(--panel-border); padding: 10px; border-radius: 8px; background: rgba(0,0,0,0.15); margin-top: 10px;">
+              <span style="font-size: 0.75rem; font-weight: bold; color: var(--text-main); display: flex; align-items: center; gap: 4px; margin-bottom: 6px;">
+                <i data-lucide="book-open" style="width: 12px; height: 12px; color: var(--accent-color);"></i> 歷史更新日誌 (Changelog)
+              </span>
+              <div style="font-size: 0.68rem; color: var(--text-secondary); line-height: 1.5; max-height: 110px; overflow-y: auto; padding-right: 4px;">
+                <strong>v2.2.0 (當前版)</strong>
+                <div style="margin-left: 6px; margin-bottom: 6px; color: var(--text-muted);">
+                  - 🌓 新增晨光馬卡龍亮色主題，一鍵無縫切換深淺模式！<br>
+                  - 📈 新增「收支趨勢折線圖」，數據統計看板圓餅圖支援本週/本月/本年/所有時間自由切換！<br>
+                  - ⏰ 高精確度記帳時間每秒動態對齊時鐘，支援手動編輯鎖定與送出後自動重設。<br>
+                  - 📋 生活待辦備忘錄卡片貼牆，支援互動複選清單勾選狀態「無損比對保存」與 iPhone PWA 系統原生通知！<br>
+                  - ⚙️ 支援對已張貼之備忘錄重新「調整設定」功能，支援動態變更提醒時間與項目清單內容。
+                </div>
+                <strong>v2.1.2</strong>
+                <div style="margin-left: 6px; margin-bottom: 6px; color: var(--text-muted);">
+                  - 🛡️ 無目標金庫演進為 5 階段「防禦能核」等級稱號系統。<br>
+                  - 💾 整合 Google Drive appData 一鍵雲端備份還原與 Sandbox 高保真離線模擬。<br>
+                  - 🏷️ 新增想買心願清單與記帳明細互鎖，一鍵購回自動轉為手動支出明細。
+                </div>
               </div>
             </div>
           </div>

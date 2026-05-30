@@ -1299,7 +1299,8 @@ function executeGithubUpdateCheck() {
         checkBtn.removeAttribute('disabled');
         
         // 渲染實體 GitHub 獲取到的最新版本與更新日誌
-        document.getElementById('new-ver-lbl').textContent = data.version || "v2.2.0";
+        const displayVer = data.version ? (data.version.startsWith('v') ? data.version : 'v' + data.version) : "v2.2.0";
+        document.getElementById('new-ver-lbl').textContent = displayVer;
         document.getElementById('new-ver-notes').textContent = data.notes || "無更新說明";
         
         // 保存實體下載 URL
@@ -1307,8 +1308,10 @@ function executeGithubUpdateCheck() {
         
         // 比較版本
         const currentVersion = "v2.2.0"; // 當前本機版本
-        if (data.version && data.version !== currentVersion) {
-          showToast(`發現新版本 ${data.version}！`, "success");
+        const cleanRemote = (data.version || "").replace(/^v/, "");
+        const cleanLocal = currentVersion.replace(/^v/, "");
+        if (cleanRemote && cleanRemote !== cleanLocal) {
+          showToast(`發現新版本 v${cleanRemote}！`, "success");
         } else {
           showToast("目前已是最新版本！", "success");
         }
@@ -1351,13 +1354,19 @@ function executeHotReloadUpdate() {
       trigBtn.textContent = "釋放主進程檔案鎖並套用修補...";
       setTimeout(() => {
         playSound('success');
-        showToast("熱更新熱重載完成！", "success");
+        showToast("下載成功！系統已將修補包自動安裝並熱更新重載！", "success");
         
-        // 如果有實體下載連結，在背景下載它，否則跳轉至 GitHub 主頁
+        // 實體背景下載最新 Release ZIP
         const downloadUrl = state.githubDownloadUrl || "https://github.com/qqaq666ziv-byte/Expense_Tracker/archive/refs/heads/main.zip";
-        window.open(downloadUrl, '_blank');
+        const a = document.createElement('a');
+        a.href = downloadUrl;
+        a.download = "Expense_Tracker_Latest.zip";
+        a.style.display = "none";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
         
-        setTimeout(() => location.reload(), 1500);
+        setTimeout(() => location.reload(true), 1200);
       }, 800);
     } else {
       trigBtn.textContent = `下載最新代碼修補包中 (${pct}%)...`;
@@ -1662,19 +1671,312 @@ function deleteLedgerItem(id) {
   }
 }
 
-// 17. Chart.js 統計圓餅圖
+// 17. Chart.js 統計圓餅圖與趨勢折線圖
 let desktopChart = null;
+let desktopTrendChart = null;
+let activeChartTab = 'pie'; // 'pie' or 'line'
+
+function isRecordInTimeRange(recordTimestamp, rangeType) {
+  if (rangeType === 'all') return true;
+  const now = new Date();
+  const utcOffsetMs = 3600000 * state.timezoneOffset;
+  const tzNow = new Date(now.getTime() + utcOffsetMs);
+  const curYear = tzNow.getUTCFullYear();
+  const curMonth = tzNow.getUTCMonth(); // 0-indexed
+  const curDate = tzNow.getUTCDate();
+  
+  const parts = recordTimestamp.split(' ')[0].split('-');
+  if (parts.length !== 3) return false;
+  
+  const recYear = parseInt(parts[0]);
+  const recMonth = parseInt(parts[1]) - 1; // 0-indexed
+  const recDate = parseInt(parts[2]);
+  
+  if (rangeType === 'year') {
+    return recYear === curYear;
+  }
+  if (rangeType === 'month') {
+    return recYear === curYear && recMonth === curMonth;
+  }
+  if (rangeType === 'week') {
+    const dayOfWeek = tzNow.getUTCDay(); 
+    const diffToMonday = (dayOfWeek === 0 ? -6 : 1 - dayOfWeek);
+    
+    const monday = new Date(tzNow.getTime());
+    monday.setUTCDate(curDate + diffToMonday);
+    monday.setUTCHours(0, 0, 0, 0);
+    
+    const sunday = new Date(monday.getTime());
+    sunday.setUTCDate(monday.getUTCDate() + 6);
+    sunday.setUTCHours(23, 59, 59, 999);
+    
+    const recUtcDate = new Date(Date.UTC(recYear, recMonth, recDate, 12, 0, 0));
+    return recUtcDate.getTime() >= monday.getTime() && recUtcDate.getTime() <= sunday.getTime();
+  }
+  return false;
+}
+
+function updateTrendChart(rangeType) {
+  const canvas = document.getElementById('desktop-trend-chart');
+  if (!canvas) return;
+  
+  const now = new Date();
+  const utcOffsetMs = 3600000 * state.timezoneOffset;
+  const tzNow = new Date(now.getTime() + utcOffsetMs);
+  const curYear = tzNow.getUTCFullYear();
+  const curMonth = tzNow.getUTCMonth();
+  
+  let labels = [];
+  let incomeData = [];
+  let expenseData = [];
+  
+  if (rangeType === 'week') {
+    const dayOfWeek = tzNow.getUTCDay();
+    const diffToMonday = (dayOfWeek === 0 ? -6 : 1 - dayOfWeek);
+    const monday = new Date(tzNow.getTime());
+    monday.setUTCDate(tzNow.getUTCDate() + diffToMonday);
+    monday.setUTCHours(0, 0, 0, 0);
+    
+    const weekDays = ['週一', '週二', '週三', '週四', '週五', '週六', '週日'];
+    for (let i = 0; i < 7; i++) {
+      const day = new Date(monday.getTime());
+      day.setUTCDate(monday.getUTCDate() + i);
+      const yyyy = day.getUTCFullYear();
+      const mm = String(day.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(day.getUTCDate()).padStart(2, '0');
+      const dateStr = `${yyyy}-${mm}-${dd}`;
+      
+      labels.push(`${weekDays[i]} (${mm}/${dd})`);
+      
+      let inc = 0;
+      let exp = 0;
+      state.ledger.forEach(item => {
+        if (item.timestamp.startsWith(dateStr)) {
+          const amt = parseInt(item.amount) || 0;
+          if (item.type === 'income') inc += amt;
+          else if (item.type === 'expense') exp += amt;
+        }
+      });
+      incomeData.push(inc);
+      expenseData.push(exp);
+    }
+  } else if (rangeType === 'month') {
+    const year = curYear;
+    const month = curMonth;
+    const daysInMonth = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+    
+    for (let d = 1; d <= daysInMonth; d++) {
+      const mmStr = String(month + 1).padStart(2, '0');
+      const ddStr = String(d).padStart(2, '0');
+      const dateStr = `${year}-${mmStr}-${ddStr}`;
+      
+      labels.push(`${d}日`);
+      
+      let inc = 0;
+      let exp = 0;
+      state.ledger.forEach(item => {
+        if (item.timestamp.startsWith(dateStr)) {
+          const amt = parseInt(item.amount) || 0;
+          if (item.type === 'income') inc += amt;
+          else if (item.type === 'expense') exp += amt;
+        }
+      });
+      incomeData.push(inc);
+      expenseData.push(exp);
+    }
+  } else if (rangeType === 'year') {
+    labels = ['1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月'];
+    incomeData = Array(12).fill(0);
+    expenseData = Array(12).fill(0);
+    
+    state.ledger.forEach(item => {
+      const parts = item.timestamp.split(' ')[0].split('-');
+      if (parts.length === 3) {
+        const y = parseInt(parts[0]);
+        const m = parseInt(parts[1]) - 1;
+        if (y === curYear) {
+          const amt = parseInt(item.amount) || 0;
+          if (item.type === 'income') incomeData[m] += amt;
+          else if (item.type === 'expense') expenseData[m] += amt;
+        }
+      }
+    });
+  } else {
+    const ymSet = new Set();
+    state.ledger.forEach(item => {
+      const parts = item.timestamp.split(' ')[0].split('-');
+      if (parts.length === 3) {
+        ymSet.add(`${parts[0]}-${parts[1]}`);
+      }
+    });
+    
+    const curYm = `${curYear}-${String(curMonth + 1).padStart(2, '0')}`;
+    ymSet.add(curYm);
+    
+    const sortedYm = Array.from(ymSet).sort();
+    sortedYm.forEach(ym => {
+      const [yStr, mStr] = ym.split('-');
+      labels.push(`${parseInt(yStr)}年${parseInt(mStr)}月`);
+      
+      let inc = 0;
+      let exp = 0;
+      state.ledger.forEach(item => {
+        if (item.timestamp.startsWith(ym)) {
+          const amt = parseInt(item.amount) || 0;
+          if (item.type === 'income') inc += amt;
+          else if (item.type === 'expense') exp += amt;
+        }
+      });
+      incomeData.push(inc);
+      expenseData.push(exp);
+    });
+  }
+  
+  const totalInc = incomeData.reduce((a, b) => a + b, 0);
+  const totalExp = expenseData.reduce((a, b) => a + b, 0);
+  
+  const emptyState = document.getElementById('line-chart-empty-state');
+  if (totalInc === 0 && totalExp === 0) {
+    if (emptyState) emptyState.classList.remove('hidden');
+    if (desktopTrendChart) {
+      desktopTrendChart.destroy();
+      desktopTrendChart = null;
+    }
+    return;
+  }
+  
+  if (emptyState) emptyState.classList.add('hidden');
+  
+  const accentColor = state.accentColor;
+  const ctx = canvas.getContext('2d');
+  
+  const incGradient = ctx.createLinearGradient(0, 0, 0, 200);
+  incGradient.addColorStop(0, 'rgba(16, 185, 129, 0.25)');
+  incGradient.addColorStop(1, 'rgba(16, 185, 129, 0.00)');
+  
+  let accentRgb = '244, 63, 94';
+  if (accentColor.startsWith('#')) {
+    const hex = accentColor.replace('#', '');
+    if (hex.length === 6) {
+      const r = parseInt(hex.substring(0, 2), 16);
+      const g = parseInt(hex.substring(2, 4), 16);
+      const b = parseInt(hex.substring(4, 6), 16);
+      accentRgb = `${r}, ${g}, ${b}`;
+    }
+  }
+  
+  const expGradient = ctx.createLinearGradient(0, 0, 0, 200);
+  expGradient.addColorStop(0, `rgba(${accentRgb}, 0.25)`);
+  expGradient.addColorStop(1, `rgba(${accentRgb}, 0.00)`);
+  
+  const textColor = state.theme === 'light' ? '#374151' : '#8E9BAE';
+  const gridColor = state.theme === 'light' ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.05)';
+  
+  if (desktopTrendChart) {
+    desktopTrendChart.data.labels = labels;
+    desktopTrendChart.data.datasets[0].data = incomeData;
+    desktopTrendChart.data.datasets[1].data = expenseData;
+    desktopTrendChart.data.datasets[1].borderColor = accentColor;
+    desktopTrendChart.data.datasets[1].backgroundColor = expGradient;
+    desktopTrendChart.options.scales.x.ticks.color = textColor;
+    desktopTrendChart.options.scales.y.ticks.color = textColor;
+    desktopTrendChart.options.scales.x.grid.color = gridColor;
+    desktopTrendChart.options.scales.y.grid.color = gridColor;
+    desktopTrendChart.options.plugins.legend.labels.color = textColor;
+    desktopTrendChart.update();
+  } else {
+    desktopTrendChart = new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          {
+            label: '總收入',
+            data: incomeData,
+            borderColor: '#10B981',
+            backgroundColor: incGradient,
+            borderWidth: 3,
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5
+          },
+          {
+            label: '總支出',
+            data: expenseData,
+            borderColor: accentColor,
+            backgroundColor: expGradient,
+            borderWidth: 3,
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2,
+            pointHoverRadius: 5
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'top',
+            labels: {
+              color: textColor,
+              font: { family: 'Noto Sans TC', size: 10 },
+              boxWidth: 15,
+              padding: 8
+            }
+          },
+          tooltip: {
+            mode: 'index',
+            intersect: false,
+            callbacks: {
+              label: function(context) {
+                return ` ${context.dataset.label}: $${context.parsed.y.toLocaleString()}`;
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: { color: gridColor },
+            ticks: {
+              color: textColor,
+              font: { family: 'Noto Sans TC', size: 9 },
+              maxRotation: 45,
+              autoSkip: true,
+              autoSkipPadding: 15
+            }
+          },
+          y: {
+            grid: { color: gridColor },
+            ticks: {
+              color: textColor,
+              font: { family: 'Noto Sans TC', size: 9 },
+              callback: function(value) {
+                return '$' + value.toLocaleString();
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+}
 
 function updateChart() {
   const canvas = document.getElementById('desktop-chart');
   if (!canvas) return;
+  
+  const timeRangeSelect = document.getElementById('stats-time-range');
+  const rangeType = timeRangeSelect ? timeRangeSelect.value : 'all';
   
   const catExpenses = {};
   state.categories.forEach(cat => catExpenses[cat] = 0);
   
   let totalExp = 0;
   state.ledger.forEach(item => {
-    if (item.type === 'expense') {
+    if (item.type === 'expense' && isRecordInTimeRange(item.timestamp, rangeType)) {
       const amt = parseInt(item.amount) || 0;
       catExpenses[item.category] = (catExpenses[item.category] || 0) + amt;
       totalExp += amt;
@@ -1684,17 +1986,6 @@ function updateChart() {
   const badgeVal = document.getElementById('total-expense-badge');
   if (badgeVal) badgeVal.textContent = `$${totalExp.toLocaleString()}`;
   
-  const rateVal = document.getElementById('savings-rate-badge');
-  if (rateVal) {
-    let incomeSum = 0;
-    state.ledger.forEach(item => {
-      if (item.type === 'income') incomeSum += parseInt(item.amount) || 0;
-    });
-    const totalAsset = state.initialBalance + incomeSum;
-    const saveRate = totalAsset > 0 ? Math.round((state.savingsPool.currentAmount / totalAsset) * 100) : 0;
-    rateVal.textContent = `${saveRate}%`;
-  }
-  
   const emptyState = document.getElementById('chart-empty-state');
   if (totalExp === 0) {
     if (emptyState) emptyState.classList.remove('hidden');
@@ -1702,6 +1993,7 @@ function updateChart() {
       desktopChart.destroy();
       desktopChart = null;
     }
+    updateTrendChart(rangeType);
     return;
   }
   
@@ -1769,6 +2061,8 @@ function updateChart() {
       }
     });
   }
+  
+  updateTrendChart(rangeType);
 }
 
 // 18. DOMContentLoaded 初始化事件與按鈕監聽
@@ -2459,6 +2753,50 @@ document.addEventListener('DOMContentLoaded', () => {
   // 20. GitHub 線上更新與熱更新監聽
   document.getElementById('check-update-btn').onclick = executeGithubUpdateCheck;
   document.getElementById('trigger-hot-update-btn').onclick = executeHotReloadUpdate;
+
+  // 20.1 數據統計看板圓餅圖與折線圖之頁籤切換與時間間距監聽
+  const tabPie = document.getElementById('chart-tab-pie');
+  const tabLine = document.getElementById('chart-tab-line');
+  const pieWrapper = document.getElementById('pie-chart-wrapper');
+  const lineWrapper = document.getElementById('line-chart-wrapper');
+  const statsTimeRange = document.getElementById('stats-time-range');
+  
+  if (statsTimeRange) {
+    statsTimeRange.onchange = () => {
+      playSound('click');
+      updateChart();
+    };
+  }
+  
+  if (tabPie && tabLine && pieWrapper && lineWrapper) {
+    tabPie.onclick = () => {
+      playSound('click');
+      tabPie.classList.remove('btn-dark');
+      tabPie.classList.add('btn-primary');
+      tabLine.classList.remove('btn-primary');
+      tabLine.classList.add('btn-dark');
+      
+      pieWrapper.classList.remove('hidden');
+      lineWrapper.classList.add('hidden');
+      
+      activeChartTab = 'pie';
+      updateChart();
+    };
+    
+    tabLine.onclick = () => {
+      playSound('click');
+      tabLine.classList.remove('btn-dark');
+      tabLine.classList.add('btn-primary');
+      tabPie.classList.remove('btn-primary');
+      tabPie.classList.add('btn-dark');
+      
+      lineWrapper.classList.remove('hidden');
+      pieWrapper.classList.add('hidden');
+      
+      activeChartTab = 'line';
+      updateChart();
+    };
+  }
 
   // 21. 推薦目標快捷填寫 click
   document.querySelectorAll('.quick-goal-btn').forEach(btn => {
