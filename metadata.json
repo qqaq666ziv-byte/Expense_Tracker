@@ -1,0 +1,6 @@
+{
+  "name": "柴柴極速記帳",
+  "description": "精巧可愛的柴犬主題記帳與財務理財應用，包含極速記帳、財務分析與柴柴存錢筒三大功能。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
