@@ -1,0 +1,81 @@
+import { describe, expect, it } from 'vitest';
+import type { Budget, FinanceData } from './model';
+import { createFinanceBackup, restoreFinanceBackup } from './backup';
+import { calculateBudgetUsage, normalizeBudgetScope } from './budgetEngine';
+
+describe('budget engine', () => {
+  it('uses shared calendar rules for overall and category budgets without counting income or adjustments', () => {
+    const data: FinanceData = {
+      accounts: [],
+      categories: [{
+        id: 'food', ownerId: 'guest', kind: 'expense', name: '外食', icon: { type: 'emoji', value: '🍜' },
+        isActive: false, sortOrder: 0, version: 2, updatedAt: '2026-08-20T00:00:00.000Z', lastOperationId: 'rename',
+      }],
+      transactions: [
+        {
+          id: 'expense', ownerId: 'guest', amount: 80, type: 'expense', categoryId: 'food', categoryName: '餐飲',
+          accountId: 'cash', accountName: '現金', occurredAt: '2026-08-21 12:00', version: 1,
+          updatedAt: '2026-08-21T04:00:00.000Z', lastOperationId: 'fixture',
+        },
+        {
+          id: 'income', ownerId: 'guest', amount: 500, type: 'income', categoryId: 'salary', categoryName: '薪水',
+          accountId: 'cash', accountName: '現金', occurredAt: '2026-08-21 09:00', version: 1,
+          updatedAt: '2026-08-21T01:00:00.000Z', lastOperationId: 'fixture',
+        },
+      ],
+      adjustments: [{
+        id: 'adjust', ownerId: 'guest', accountId: 'cash', amountDelta: -10, occurredAt: '2026-08-21 14:00',
+        version: 1, updatedAt: '2026-08-21T06:00:00.000Z', lastOperationId: 'fixture',
+      }],
+      goals: [], allocations: [], recurringRules: [],
+      budgets: [
+        {
+          id: 'overall', ownerId: 'guest', scope: 'overall', period: 'monthly', amount: 300, isActive: true,
+          version: 1, updatedAt: '2026-08-01T00:00:00.000Z', lastOperationId: 'fixture',
+        },
+        {
+          id: 'food-budget', ownerId: 'guest', scope: 'category', categoryId: 'food', categoryName: '餐飲',
+          period: 'monthly', amount: 100, isActive: true, version: 1,
+          updatedAt: '2026-08-01T00:00:00.000Z', lastOperationId: 'fixture',
+        },
+      ],
+      settings: { currency: 'TWD', locale: 'zh-TW' },
+    };
+
+    expect(calculateBudgetUsage(data, new Date(2026, 7, 21, 15))).toEqual([
+      {
+        budgetId: 'overall', scope: 'overall', period: 'monthly', name: '總預算',
+        limit: 300, used: 80, remaining: 220, overBy: 0, usageRatio: 80 / 300,
+      },
+      {
+        budgetId: 'food-budget', scope: 'category', categoryId: 'food', period: 'monthly', name: '外食',
+        limit: 100, used: 80, remaining: 20, overBy: 0, usageRatio: 0.8,
+      },
+    ]);
+  });
+
+  it('removes stale category fields when an overall budget is updated and survives backup round trip', () => {
+    const staleOverall: Budget = {
+      id: 'overall', ownerId: 'guest', scope: 'overall', categoryId: 'food', categoryName: '餐飲',
+      period: 'monthly', amount: 500, isActive: true, version: 2,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'update-overall',
+    };
+    const normalized = normalizeBudgetScope(staleOverall);
+    const data: FinanceData = {
+      accounts: [], categories: [], transactions: [], adjustments: [], goals: [], allocations: [],
+      budgets: [normalized], recurringRules: [], settings: { currency: 'TWD', locale: 'zh-TW' },
+    };
+
+    const restored = restoreFinanceBackup(
+      { ...data, budgets: [] },
+      createFinanceBackup(data, '2026-08-21T10:30:00.000Z'),
+      { ownerId: 'guest' },
+    );
+
+    expect(restored.budgets).toEqual([{
+      id: 'overall', ownerId: 'guest', scope: 'overall', period: 'monthly', amount: 500,
+      isActive: true, version: 2, updatedAt: '2026-08-21T10:00:00.000Z',
+      lastOperationId: 'update-overall',
+    }]);
+  });
+});

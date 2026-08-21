@@ -1,6 +1,0 @@
-{
-  "name": "柴柴極速記帳",
-  "description": "柴犬主題的個人記帳、預算管理與儲蓄目標應用",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

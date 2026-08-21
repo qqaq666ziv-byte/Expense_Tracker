@@ -95,3 +95,4 @@ When finishing a modifying task, report concisely:
 - the exact rollback path.
 
 Leave the worktree in a clean, understandable state and commit the completed work.
+
