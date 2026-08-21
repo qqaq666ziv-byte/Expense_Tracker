@@ -440,9 +440,11 @@ export default function Dashboard({ balance, transactions, onAddTransaction, onD
             <div className="flex items-center">
               <span className={`text-3xl font-bold mr-2 ${type === 'expense' ? (theme.id === 'shiba' ? 'text-amber-600' : 'text-emerald-600') : 'text-emerald-600'}`}>NT$</span>
               <input
-                type="number"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
                 value={amount}
-                onChange={(e) => setAmount(e.target.value)}
+                onChange={(e) => setAmount(e.target.value.replace(/\D/g, ''))}
                 placeholder="0"
                 className="w-full bg-transparent border-none p-0 focus:ring-0 text-3xl font-bold text-stone-900 dark:text-zinc-100 placeholder:text-stone-300 dark:placeholder:text-zinc-700"
                 required
@@ -935,9 +937,11 @@ export default function Dashboard({ balance, transactions, onAddTransaction, onD
                 }`}>
                   <label className={`text-xs font-semibold block mb-1 ${theme.styles.inputLabel}`}>金額 (NT$)</label>
                   <input
-                    type="number"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
                     value={editAmount}
-                    onChange={(e) => setEditAmount(e.target.value)}
+                    onChange={(e) => setEditAmount(e.target.value.replace(/\D/g, ''))}
                     placeholder="0"
                     className="w-full bg-transparent border-0 p-0 text-lg font-bold text-stone-900 dark:text-zinc-100 focus:ring-0"
                     required
