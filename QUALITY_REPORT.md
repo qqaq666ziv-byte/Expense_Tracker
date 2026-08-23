@@ -25,9 +25,9 @@
 
 - `npm ci`：394 packages 成功安裝；audit 結果 0 vulnerabilities。
 - `npm run lint`：TypeScript `--noEmit` 通過。
-- `npm test`：13 個 test files、102 個 tests 全數通過。
+- `npm test`：16 個 test files、116 個 tests 全數通過；包含兩台離線裝置同時釋放同一來源配置後收斂為單一 tombstone 的整合案例。
 - `npm run verify:migration`：9 組 PGlite 驗證全數通過，涵蓋 fresh/retry-safe DDL、future default grants、future-write checks、deterministic backfill、v3 goal UPSERT 保護、mixed-version bridge、goal allocation audit、RLS owner isolation、stale clock，以及 exact retry／same-clock divergent payload 拒絕。
-- `npm run build`：Vite 8.2.2 production PWA build 通過；主 chunk 494.38 kB（gzip 143.94 kB），PWA precache 13 entries／572.66 KiB。
+- `npm run build`：Vite 8.2.2 production PWA build 通過且沒有 chunk-size warning；app 主 chunk 292.16 kB（gzip 92.56 kB）、Supabase vendor 208.11 kB（gzip 53.77 kB），PWA precache 14 entries／580.13 KiB。
 - `npm audit --audit-level=moderate`：0 vulnerabilities；因此亦滿足 CI 的 `--audit-level=high` gate。
 
 ## 瀏覽器與 PWA 證據
@@ -58,6 +58,7 @@
 - 正確性／資料完整性審查修正：custom range 白屏、overall budget round-trip、adjustment audit history、local-date trend、日期 reference 更新與輸入空值。
 - 安全／隱私審查修正：strict grants/default privileges、future-write checks、mixed-version bridge、goal allocation audit、same-clock divergent payload、owner verification 與 v3 goal legacy-field 保護。
 - 對抗式／UX 審查修正：完整 persisted payload 驗證、malformed/foreign row 隔離、unresolved conflict 重排、guest import fingerprint、owner switch stale-result 防護、損毀快照 fail-closed 與封存影響提示。
+- 固定點程式審查修正：非法或超安全範圍遠端財務列與破損跨表引用隔離、訪客重複匯入衝突原子中止及 snapshot-first 持久化、封存目標仍可見且以來源 allocation tombstone 防止雙裝置重複釋放、帳本分批載入，以及跨裝置 `sortOrder` 一致呈現與新增項目 max+1 排序。
 - 上述修補後已重跑完整自動化與 production browser smoke；目前沒有已知可在此範圍合理修復的 blocking finding。
 
 ## 剩餘限制與發布門檻

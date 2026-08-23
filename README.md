@@ -5,11 +5,11 @@
 ## 目前功能
 
 - 資產帳戶：建立、改名、任意 Emoji／通用向量圖示、期初餘額、啟用／封存、是否納入總資產。
-- 收支分類：收入與支出分開、穩定 ID、改名／換圖示／封存後仍可解析歷史交易。
-- 日常帳本：收入、支出、帳戶、分類、時間、備註，以及可編輯與 tombstone 刪除。
+- 收支分類：收入與支出分開、穩定 ID、持久化顯示順序，改名／換圖示／封存後仍可解析歷史交易。
+- 日常帳本：收入、支出、帳戶、分類、時間、備註，以及可編輯、tombstone 刪除與每次 30 筆的完整歷史漸進載入。
 - 餘額校正：留下獨立可稽核調整紀錄，不混入收入、支出、儲蓄率或預算。
 - 財務分析：今日快照、本週（週一至週日）、本月、本年、自訂含結束日、前期比較、分類組成、支出趨勢、平均日支出、最大支出、儲蓄率與帳戶分布。
-- 儲蓄目標：配置金額不會讓資產消失；分開顯示總資產、已配置與可配置資產，並阻止超額新增配置。
+- 儲蓄目標：配置金額不會讓資產消失；分開顯示總資產、已配置與可配置資產，並阻止超額新增配置。封存目標仍會顯示，可重新啟用，或將原配置標成保留稽核資料的 tombstone 來釋放 earmark；兩台離線裝置釋放同一來源時不會重複釋放。
 - 預算：整體或分類預算，支援每週／每月及已用、剩餘、超支狀態。
 - 週期收支：收入或支出、每週／每月／每年、開始日、暫停／恢復、截至今日補齊及嚴格冪等去重。
 - 可攜資料：完整版本化 JSON 備份、安全合併／明確確認取代還原、匯入容量／筆數防護，以及具穩定欄位的交易 CSV。
@@ -88,9 +88,9 @@ CI 位於 `.github/workflows/ci.yml`，在 pull request、`main` 與 `codex/**` 
 - `syncEngine.ts`：`snapshot / operation queue / reconcile` 深層模組；衝突先比 `version`，再以 `lastOperationId` 決定。
 - `src/data/supabaseRemote.ts`：唯一雲端 adapter，會再次驗證目前登入 owner；每個 query 同時受明確 `user_id` 篩選與 RLS 保護。
 
-本機 key 格式為 `shiba-finance:v3:guest` 或 `shiba-finance:v3:user:<uuid>`。登入不會把訪客資料靜默合併；只有使用者按下「匯入此帳號」時，才會 remap 所有 ID 與關聯後加入該帳號。每位登入 owner 對 guest snapshot 的「匯入／保持分離」決策以不含財務值的指紋記住；同一快照不會反覆提示或重匯，已存在的登入端紀錄也不會被 guest 重匯覆寫。
+本機 key 格式為 `shiba-finance:v3:guest` 或 `shiba-finance:v3:user:<uuid>`。登入不會把訪客資料靜默合併；只有使用者按下「匯入此帳號」時，才會 remap 所有 ID 與關聯後加入該帳號。每位登入 owner 對 guest snapshot 的「匯入／保持分離」決策以不含財務值的指紋記住；同一快照不會反覆提示或重匯。若後續訪客快照與已匯入的同來源紀錄內容不同，整次匯入會原子中止、顯示衝突數量且不記為已處理；登入端紀錄不會被靜默覆寫。匯入時必須先成功寫入 owner snapshot 才會記住該指紋；quota／storage 失敗不會把尚未落盤的匯入藏起來，復原保護中的帳號也禁止匯入覆寫。
 
-離線 create/update/delete 會把最新 record snapshot 與 operation ID 一起寫入 owner 快照。刪除保留 tombstone；雲端 trigger 和 client 都先以 `(version, lastOperationId)` 檢查 stale write，再比較完整 app-owned payload。相同 clock 但內容不同會成為可見、保留待處理的衝突，不會假裝成功；單筆 malformed/foreign remote row 會被隔離並回報，其他合法 rows 仍能同步。同步等待期間的新本機操作會 rebase 到結果上，登出或切換 owner 後回來的舊同步結果會被丟棄。
+離線 create/update/delete 會把最新 record snapshot 與 operation ID 一起寫入 owner 快照。刪除保留 tombstone；雲端 trigger 和 client 都先以 `(version, lastOperationId)` 檢查 stale write，再比較完整 app-owned payload。相同 clock 但內容不同會成為可見、保留待處理的衝突，不會假裝成功；單筆 malformed、foreign-owner、非正交易金額、不安全數值、跨表引用遺失／型別不符或其他違反 domain 契約的 remote row 會被隔離並回報，其他合法 rows 仍能同步。同步等待期間的新本機操作會 rebase 到結果上，登出或切換 owner 後回來的舊同步結果會被丟棄。
 
 ## Supabase migration
 

@@ -18,6 +18,8 @@ import {
   guestSnapshotFingerprint,
   hasUserContent,
   loadFinanceStateWithRecovery,
+  persistGuestImportState,
+  planGuestImport,
   type LocalStateRecovery,
   putRecord,
   remapOwner,
@@ -33,6 +35,7 @@ export interface FinanceAppController {
   syncReport: SyncReport | null;
   storageError?: string;
   storageRecovery?: LocalStateRecovery;
+  guestImportNotice?: string;
   hasSeparateGuestData: boolean;
   dismissGuestImport(): void;
   importGuestData(): void;
@@ -61,6 +64,7 @@ export function useFinanceApp(): FinanceAppController {
   const [guestPromptDismissed, setGuestPromptDismissed] = useState(false);
   const [storageError, setStorageError] = useState<string>();
   const [storageRecovery, setStorageRecovery] = useState<LocalStateRecovery | undefined>(initialLoad.recovery);
+  const [guestImportNotice, setGuestImportNotice] = useState<string>();
   const [calendarDay, setCalendarDay] = useState(() => localDateString());
   const stateRef = useRef(state);
   const activeOwnerRef = useRef(state.ownerId);
@@ -89,6 +93,7 @@ export function useFinanceApp(): FinanceAppController {
     setSyncReport(null);
     setSyncBusy(false);
     setGuestPromptDismissed(false);
+    setGuestImportNotice(undefined);
   }, []);
 
   useEffect(() => {
@@ -246,6 +251,7 @@ export function useFinanceApp(): FinanceAppController {
   const hasSeparateGuestData = state.ownerId !== 'guest'
     && !guestPromptDismissed
     && !guestLoad.recovery
+    && !storageRecovery
     && rememberedGuestFingerprint !== guestFingerprint
     && hasUserContent(guestLoad.state.data);
 
@@ -261,28 +267,45 @@ export function useFinanceApp(): FinanceAppController {
 
   const importGuestData = useCallback(() => {
     if (stateRef.current.ownerId === 'guest') return;
+    setGuestImportNotice(undefined);
+    if (storageRecovery) {
+      setGuestImportNotice('目前帳號的本機快照仍在復原保護中；為避免覆寫可救援原始資料，請先完成備份還原或明確重設，再匯入訪客資料。');
+      return;
+    }
     const loadedGuest = loadFinanceStateWithRecovery('guest');
     if (loadedGuest.recovery) {
       setStorageError('訪客資料快照無法驗證，因此未匯入；原始內容仍保持不變。');
       return;
     }
     const imported = remapOwner(loadedGuest.state.data, stateRef.current.ownerId);
-    commitState((current) => {
-      let next = current;
-      const names: readonly FinanceEntityName[] = [
-        'accounts', 'categories', 'transactions', 'adjustments',
-        'goals', 'allocations', 'budgets', 'recurringRules',
-      ];
-      for (const entity of names) {
-        for (const record of imported[entity] as FinanceData[typeof entity][number][]) {
-          if ((current.data[entity] as SyncRecord[]).some((existing) => existing.id === record.id)) continue;
-          next = putRecord(next, entity, record);
-        }
-      }
-      return next;
-    });
-    rememberGuestDecision(guestDecisionKey, guestFingerprint);
-  }, [commitState, guestDecisionKey, guestFingerprint, rememberGuestDecision]);
+    const plan = planGuestImport(stateRef.current, imported);
+    if (plan.conflicts.length > 0) {
+      setGuestImportNotice(`訪客匯入已中止：${plan.conflicts.length} 筆同來源資料在兩邊內容不同，本次未修改任何帳號資料，也未把此快照標記為已處理。請先下載兩邊 JSON 備份，再選擇保持分離或以備份還原流程明確合併。`);
+      return;
+    }
+    if (!guestDecisionKey) return;
+    let persistence;
+    try {
+      persistence = persistGuestImportState(
+        plan.state,
+        guestDecisionKey,
+        guestFingerprint,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStorageError(`訪客資料匯入無法安全寫入：${message}`);
+      setGuestImportNotice('訪客匯入已中止：帳號快照未能持久化，因此目前資料未變更，且此訪客快照未標記為已處理。');
+      return;
+    }
+    commitState(() => plan.state);
+    if (persistence.decisionRemembered) {
+      setGuestPromptDismissed(true);
+      setGuestImportNotice(`訪客資料匯入完成：新增 ${plan.addedCount} 筆，略過 ${plan.skippedCount} 筆內容相同的既有資料。`);
+    } else {
+      setStorageError(`訪客資料已匯入，但無法記住匯入決策：${persistence.decisionError}`);
+      setGuestImportNotice(`訪客資料已安全匯入：新增 ${plan.addedCount} 筆，略過 ${plan.skippedCount} 筆；但瀏覽器未能記住此決策，下次可能再次提示。`);
+    }
+  }, [commitState, guestDecisionKey, guestFingerprint, storageRecovery]);
 
   const dismissGuestImport = useCallback(() => {
     rememberGuestDecision(guestDecisionKey, guestFingerprint);
@@ -314,6 +337,7 @@ export function useFinanceApp(): FinanceAppController {
     syncReport,
     storageError,
     storageRecovery,
+    guestImportNotice,
     hasSeparateGuestData,
     dismissGuestImport,
     importGuestData,

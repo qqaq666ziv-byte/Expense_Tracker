@@ -2,6 +2,7 @@ import { useMemo, useState, type FormEvent } from 'react';
 import { AlertTriangle, Pencil, Plus, Scale, Trash2, WalletCards } from 'lucide-react';
 import type { BalanceAdjustment, FinanceData, Transaction } from '../domain/model';
 import { buildLedgerHistory, calculateFinancials } from '../domain/financeEngine';
+import { sortByDisplayOrder } from '../domain/displayOrder';
 import { changedRecordMeta, newRecordMeta } from '../app/state';
 import { money, parseRequiredNumberInput, shortDate, toLocalInput } from '../app/format';
 import { FinanceIcon } from './FinanceIcon';
@@ -15,6 +16,7 @@ interface HomeViewProps {
 }
 
 export function HomeView({ data, ownerId, put, putAdjustment, deleteTransaction }: HomeViewProps) {
+  const ledgerPageSize = 30;
   const summary = useMemo(() => calculateFinancials(data), [data]);
   const [type, setType] = useState<'expense' | 'income'>('expense');
   const [amount, setAmount] = useState('');
@@ -29,14 +31,15 @@ export function HomeView({ data, ownerId, put, putAdjustment, deleteTransaction 
   const [adjustmentAccount, setAdjustmentAccount] = useState('');
   const [adjustmentReason, setAdjustmentReason] = useState('盤點校正');
   const [adjustmentError, setAdjustmentError] = useState('');
+  const [historyLimit, setHistoryLimit] = useState(ledgerPageSize);
 
-  const activeAccounts = data.accounts.filter((item) => item.isActive && !item.deletedAt);
-  const accounts = data.accounts.filter((item) => !item.deletedAt && (
+  const activeAccounts = sortByDisplayOrder(data.accounts.filter((item) => item.isActive && !item.deletedAt));
+  const accounts = sortByDisplayOrder(data.accounts.filter((item) => !item.deletedAt && (
     item.isActive || editing?.accountId === item.id
-  ));
-  const categories = data.categories.filter((item) => !item.deletedAt && item.kind === type && (
+  )));
+  const categories = sortByDisplayOrder(data.categories.filter((item) => !item.deletedAt && item.kind === type && (
     item.isActive || editing?.categoryId === item.id
-  ));
+  )));
 
   const resolvedCategoryId = categories.some((item) => item.id === categoryId) ? categoryId : categories[0]?.id ?? '';
   const resolvedAccountId = accounts.some((item) => item.id === accountId) ? accountId : accounts[0]?.id ?? '';
@@ -175,7 +178,7 @@ export function HomeView({ data, ownerId, put, putAdjustment, deleteTransaction 
         <div className="section-heading"><div><p className="eyebrow">完整帳本</p><h2 id="history-title">最近交易與校正</h2></div><span className="count-badge">{history.length}</span></div>
         {history.length === 0 ? <p className="empty-state">🐕 還沒有交易或校正，從上方記下第一筆吧。</p> : (
           <div className="space-y-2">
-            {history.slice(0, 30).map((entry) => {
+            {history.slice(0, historyLimit).map((entry) => {
               if (entry.kind === 'adjustment') {
                 const adjustment = entry.record;
                 const account = data.accounts.find((item) => item.id === adjustment.accountId);
@@ -201,6 +204,15 @@ export function HomeView({ data, ownerId, put, putAdjustment, deleteTransaction 
                 </article>
               );
             })}
+            {historyLimit < history.length && (
+              <button
+                type="button"
+                className="secondary-button w-full justify-center"
+                onClick={() => setHistoryLimit((current) => Math.min(history.length, current + ledgerPageSize))}
+              >
+                載入更多歷史（剩餘 {history.length - historyLimit} 筆）
+              </button>
+            )}
           </div>
         )}
       </section>

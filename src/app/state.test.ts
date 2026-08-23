@@ -9,7 +9,10 @@ import {
   loadFinanceState,
   loadFinanceStateWithRecovery,
   mergeConcurrentSync,
+  persistGuestImportState,
+  planGuestImport,
   putRecord,
+  releaseGoalAllocations,
   remapOwner,
   saveFinanceState,
   storageKey,
@@ -80,6 +83,122 @@ describe('owner-scoped local state', () => {
     expect(imported.transactions[0].accountId).toBe(imported.accounts[0].id);
     expect(imported.transactions[0].categoryId).toBe(imported.categories.find((item) => item.kind === 'expense')!.id);
     expect(imported.transactions[0].ownerId).toBe('user-a');
+  });
+
+  it('fails an explicit guest re-import atomically when an earlier imported record changed', () => {
+    const guest = createInitialState('guest').data;
+    guest.categories[0] = { ...guest.categories[0], name: '早餐' };
+    const firstMapped = remapOwner(guest, 'user-a');
+    const firstImport = planGuestImport(
+      createInitialState('user-a'),
+      firstMapped,
+    );
+    expect(firstImport.conflicts).toEqual([]);
+    expect(firstImport.addedCount).toBeGreaterThan(0);
+
+    const changedGuest = structuredClone(guest);
+    changedGuest.categories[0] = { ...changedGuest.categories[0], name: '早午餐' };
+    const secondImport = planGuestImport(
+      firstImport.state,
+      remapOwner(changedGuest, 'user-a'),
+    );
+
+    expect(secondImport.conflicts).toEqual([
+      expect.objectContaining({ entity: 'categories', id: firstMapped.categories[0].id }),
+    ]);
+    expect(secondImport.state).toBe(firstImport.state);
+    expect(secondImport.addedCount).toBe(0);
+  });
+
+  it('treats a repeated identical guest import as an explicit no-op despite new sync metadata', () => {
+    const guest = createInitialState('guest').data;
+    const firstImport = planGuestImport(
+      createInitialState('user-a'),
+      remapOwner(guest, 'user-a'),
+    );
+    const repeated = planGuestImport(
+      firstImport.state,
+      remapOwner(guest, 'user-a'),
+    );
+
+    expect(repeated.conflicts).toEqual([]);
+    expect(repeated.addedCount).toBe(0);
+    expect(repeated.skippedCount).toBeGreaterThan(0);
+  });
+
+  it('never remembers a guest import when its owner snapshot could not be persisted', () => {
+    const imported = planGuestImport(
+      createInitialState('user-a'),
+      remapOwner(createInitialState('guest').data, 'user-a'),
+    ).state;
+    const writes: string[] = [];
+    const storage = {
+      setItem: (key: string) => {
+        writes.push(key);
+        if (key === storageKey('user-a')) throw new Error('quota exceeded');
+      },
+    };
+
+    expect(() => persistGuestImportState(
+      imported,
+      'shiba-finance:v3:guest-decision:user-a',
+      'guest-fingerprint',
+      storage,
+    )).toThrow(/quota exceeded/);
+    expect(writes).toEqual([storageKey('user-a')]);
+  });
+
+  it('reports a decision-write failure only after the imported owner snapshot is durable', () => {
+    const imported = planGuestImport(
+      createInitialState('user-a'),
+      remapOwner(createInitialState('guest').data, 'user-a'),
+    ).state;
+    const values = new Map<string, string>();
+    const decisionKey = 'shiba-finance:v3:guest-decision:user-a';
+    const result = persistGuestImportState(imported, decisionKey, 'fingerprint', {
+      setItem: (key, value) => {
+        if (key === decisionKey) throw new Error('decision storage denied');
+        values.set(key, value);
+      },
+    });
+
+    expect(result).toEqual({
+      decisionRemembered: false,
+      decisionError: 'decision storage denied',
+    });
+    expect(JSON.parse(values.get(storageKey('user-a')) ?? '{}')).toMatchObject({
+      schemaVersion: 3,
+      ownerId: 'user-a',
+    });
+  });
+
+  it('releases each source allocation by stable tombstone so concurrent devices cannot double-release', () => {
+    const base = [{
+      ...newRecordForTest('allocation-source', 'user-a'),
+      goalId: 'goal-a',
+      amountDelta: 800,
+      occurredAt: '2026-08-21 10:00',
+    }];
+    const deviceA = releaseGoalAllocations(
+      base,
+      'goal-a',
+      new Date('2026-08-21T12:00:00.000Z'),
+      () => 'release-a',
+    );
+    const deviceB = releaseGoalAllocations(
+      base,
+      'goal-a',
+      new Date('2026-08-21T12:01:00.000Z'),
+      () => 'release-b',
+    );
+
+    expect(deviceA).toEqual([expect.objectContaining({
+      id: 'allocation-source', amountDelta: 800, deletedAt: '2026-08-21T12:00:00.000Z',
+    })]);
+    expect(deviceB[0].id).toBe(deviceA[0].id);
+    expect(new Set([...deviceA, ...deviceB].map((record) => record.id))).toEqual(
+      new Set(['allocation-source']),
+    );
   });
 
   it('treats guest-only category customization as user content and fingerprints changes', () => {

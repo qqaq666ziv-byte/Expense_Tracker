@@ -54,6 +54,134 @@ function accountRow(record: AssetAccount): Record<string, unknown> {
   };
 }
 
+function categoryRow(
+  id: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    ...commonRow(id),
+    kind: 'expense',
+    name: '餐飲',
+    icon_type: 'emoji',
+    icon_value: '🍜',
+    is_active: true,
+    sort_order: 0,
+    legacy_key: null,
+    ...overrides,
+  };
+}
+
+function transactionRow(
+  id: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    id,
+    user_id: 'user-a',
+    version: 1,
+    updated_at: NOW,
+    last_operation_id: `op-${id}`,
+    deleted_at: null,
+    amount: 20,
+    type: 'expense',
+    category_id: 'food',
+    category_name: '餐飲',
+    account_id: 'cash',
+    account_name: 'Cash',
+    occurred_at: '2026-08-21T09:00',
+    note: null,
+    recurring_rule_id: null,
+    occurrence_date: null,
+    ...overrides,
+  };
+}
+
+function recurringRow(
+  id: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    id,
+    user_id: 'user-a',
+    version: 1,
+    updated_at: NOW,
+    last_operation_id: `op-${id}`,
+    deleted_at: null,
+    name: 'Monthly lunch',
+    type: 'expense',
+    amount: 100,
+    category_id: 'food',
+    category_name: '餐飲',
+    account_id: 'cash',
+    account_name: 'Cash',
+    frequency: 'monthly',
+    start_date: '2026-08-21',
+    anchor_day: 21,
+    next_occurrence_date: '2026-09-21',
+    is_active: true,
+    note: null,
+    ...overrides,
+  };
+}
+
+function commonRow(id: string): Record<string, unknown> {
+  return {
+    id,
+    user_id: 'user-a',
+    version: 1,
+    updated_at: NOW,
+    last_operation_id: `op-${id}`,
+    deleted_at: null,
+  };
+}
+
+function adjustmentRow(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...commonRow(id),
+    account_id: 'cash',
+    amount_delta: -25,
+    occurred_at: '2026-08-21T09:00',
+    reason: null,
+    ...overrides,
+  };
+}
+
+function goalRow(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...commonRow(id),
+    name: 'Emergency fund',
+    target_amount: 10_000,
+    target_date: '2027-08-21',
+    is_active: true,
+    legacy_unit: null,
+    ...overrides,
+  };
+}
+
+function allocationRow(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...commonRow(id),
+    goal_id: 'goal-valid',
+    amount_delta: -30,
+    occurred_at: '2026-08-21T09:00',
+    note: null,
+    ...overrides,
+  };
+}
+
+function budgetRow(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...commonRow(id),
+    scope: 'overall',
+    category_id: null,
+    category_name: null,
+    period: 'monthly',
+    amount: 500,
+    is_active: true,
+    ...overrides,
+  };
+}
+
 class FakeSupabaseClient {
   readonly auth: { getUser: () => Promise<{ data: { user: { id: string } | null }; error: null }> };
   readonly tables = new Map<string, Record<string, unknown>[]>();
@@ -109,6 +237,7 @@ describe('Supabase remote adapter', () => {
   it('isolates one malformed legacy row while returning other valid remote records with diagnostics', async () => {
     const client = new FakeSupabaseClient();
     client.tables.set('accounts', [accountRow(account())]);
+    client.tables.set('categories', [categoryRow('food')]);
     client.tables.set('transactions', [
       {
         id: 'legacy-incomplete',
@@ -157,6 +286,7 @@ describe('Supabase remote adapter', () => {
 
     expect(result.records).toEqual([
       expect.objectContaining({ entity: 'accounts', record: expect.objectContaining({ id: 'cash' }) }),
+      expect.objectContaining({ entity: 'categories', record: expect.objectContaining({ id: 'food' }) }),
       expect.objectContaining({
         entity: 'transactions',
         record: expect.objectContaining({ id: 'valid-after-malformed' }),
@@ -170,6 +300,160 @@ describe('Supabase remote adapter', () => {
         message: expect.stringContaining('category_id'),
       }),
     ]);
+  });
+
+  it('isolates non-positive and unsafe transaction amounts while returning a later valid row', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account())]);
+    client.tables.set('categories', [categoryRow('food')]);
+    client.tables.set('transactions', [
+      transactionRow('zero-amount', { amount: 0 }),
+      transactionRow('negative-amount', { amount: -1 }),
+      transactionRow('unsafe-amount', { amount: Number.MAX_SAFE_INTEGER + 1 }),
+      transactionRow('valid-after-invalid', { amount: 80 }),
+    ]);
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const result = await remote.pull('user-a') as RemotePullResult;
+
+    expect(result.records.map(({ record }) => record.id)).toEqual(['cash', 'food', 'valid-after-invalid']);
+    expect(result.issues.map(({ entity, recordId, message }) => ({ entity, recordId, message })))
+      .toEqual([
+        expect.objectContaining({ entity: 'transactions', recordId: 'zero-amount', message: expect.stringContaining('amount') }),
+        expect.objectContaining({ entity: 'transactions', recordId: 'negative-amount', message: expect.stringContaining('amount') }),
+        expect.objectContaining({ entity: 'transactions', recordId: 'unsafe-amount', message: expect.stringContaining('amount') }),
+      ]);
+  });
+
+  it('isolates invalid sync clocks and integer domain fields while preserving valid rows', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [
+      accountRow(account({ id: 'fractional-version', version: 1.5 })),
+      accountRow(account({ id: 'zero-version', version: 0 })),
+      { ...accountRow(account({ id: 'timezone-free-update' })), updated_at: '2026-08-21T10:00' },
+      { ...accountRow(account({ id: 'fractional-sort' })), sort_order: 0.5 },
+      accountRow(account({ id: 'valid-account' })),
+    ]);
+    client.tables.set('categories', [categoryRow('food')]);
+    client.tables.set('recurring_rules', [
+      recurringRow('fractional-anchor', { anchor_day: 21.5 }),
+      recurringRow('valid-rule', { account_id: 'valid-account' }),
+    ]);
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const result = await remote.pull('user-a') as RemotePullResult;
+
+    expect(result.records.map(({ record }) => record.id)).toEqual(['valid-account', 'food', 'valid-rule']);
+    expect(result.issues.map(({ recordId }) => recordId)).toEqual([
+      'fractional-version',
+      'zero-version',
+      'timezone-free-update',
+      'fractional-sort',
+      'fractional-anchor',
+    ]);
+  });
+
+  it('enforces remaining FinanceData row contracts without rejecting signed deltas', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [
+      accountRow(account({ id: 'unsafe-opening', openingBalance: Number.MAX_SAFE_INTEGER + 1 })),
+      accountRow(account({ id: 'blank-account-name', name: '   ' })),
+      accountRow(account({ id: 'cash' })),
+    ]);
+    client.tables.set('categories', [categoryRow('food')]);
+    client.tables.set('transactions', [
+      transactionRow('invalid-transaction-date', { occurred_at: '2026-02-30' }),
+    ]);
+    client.tables.set('adjustments', [
+      adjustmentRow('zero-adjustment', { amount_delta: 0 }),
+      adjustmentRow('signed-adjustment', { amount_delta: -25 }),
+    ]);
+    client.tables.set('goals', [
+      goalRow('zero-goal', { target_amount: 0 }),
+      goalRow('invalid-goal-date', { target_date: '2027-02-29' }),
+      goalRow('goal-valid'),
+    ]);
+    client.tables.set('savings_allocations', [
+      allocationRow('zero-allocation', { amount_delta: 0 }),
+      allocationRow('signed-allocation', { amount_delta: -30 }),
+    ]);
+    client.tables.set('budgets', [
+      budgetRow('zero-budget', { amount: 0 }),
+      budgetRow('overall-with-category', { category_id: 'food', category_name: '餐飲' }),
+      budgetRow('budget-valid'),
+    ]);
+    client.tables.set('recurring_rules', [
+      recurringRow('zero-recurring', { amount: 0 }),
+      recurringRow('invalid-recurring-date', { start_date: '2026-13-01' }),
+      recurringRow('recurring-valid'),
+    ]);
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const result = await remote.pull('user-a') as RemotePullResult;
+
+    expect(result.records.map(({ record }) => record.id)).toEqual([
+      'cash',
+      'food',
+      'signed-adjustment',
+      'goal-valid',
+      'signed-allocation',
+      'budget-valid',
+      'recurring-valid',
+    ]);
+    expect(result.issues.map(({ recordId }) => recordId)).toEqual([
+      'unsafe-opening',
+      'blank-account-name',
+      'invalid-transaction-date',
+      'zero-adjustment',
+      'zero-goal',
+      'invalid-goal-date',
+      'zero-allocation',
+      'zero-budget',
+      'overall-with-category',
+      'zero-recurring',
+      'invalid-recurring-date',
+    ]);
+    expect(result.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        entity: 'adjustments',
+        record: expect.objectContaining({ id: 'signed-adjustment', amountDelta: -25 }),
+      }),
+      expect.objectContaining({
+        entity: 'allocations',
+        record: expect.objectContaining({ id: 'signed-allocation', amountDelta: -30 }),
+      }),
+    ]));
+  });
+
+  it('isolates decoded rows whose cross-entity references are missing or the wrong kind', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account({ id: 'cash' }))]);
+    client.tables.set('categories', [
+      categoryRow('food', { kind: 'expense' }),
+      categoryRow('salary', { kind: 'income' }),
+    ]);
+    client.tables.set('transactions', [
+      transactionRow('missing-account', { account_id: 'missing' }),
+      transactionRow('wrong-kind', { category_id: 'salary', category_name: '薪資' }),
+      transactionRow('valid-transaction'),
+    ]);
+    client.tables.set('recurring_rules', [
+      recurringRow('broken-rule', { account_id: 'missing' }),
+    ]);
+    client.tables.set('savings_allocations', [
+      allocationRow('missing-goal', { goal_id: 'missing' }),
+    ]);
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const result = await remote.pull('user-a') as RemotePullResult;
+
+    expect(result.records.map(({ record }) => record.id)).toEqual(['cash', 'food', 'salary', 'valid-transaction']);
+    expect(result.issues.map(({ stage, recordId }) => ({ stage, recordId }))).toEqual(expect.arrayContaining([
+      { stage: 'validation', recordId: 'missing-account' },
+      { stage: 'validation', recordId: 'wrong-kind' },
+      { stage: 'validation', recordId: 'broken-rule' },
+      { stage: 'validation', recordId: 'missing-goal' },
+    ]));
   });
 
   it('accepts explicit database normalization without weakening payload comparison', async () => {

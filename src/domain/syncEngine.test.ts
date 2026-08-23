@@ -4,6 +4,7 @@ import type {
   FinanceData,
   PendingOperation,
   PersistedFinanceState,
+  SavingsAllocation,
 } from './model';
 import type { RemoteAdapter, RemoteRecord } from './syncEngine';
 import { enqueueSyncRecord, syncFinanceState } from './syncEngine';
@@ -51,6 +52,17 @@ function operation(record: AssetAccount): PendingOperation {
   return {
     id: record.lastOperationId,
     entity: 'accounts',
+    recordId: record.id,
+    record,
+    attempts: 0,
+    queuedAt: NOW,
+  };
+}
+
+function allocationOperation(record: SavingsAllocation): PendingOperation {
+  return {
+    id: record.lastOperationId,
+    entity: 'allocations',
     recordId: record.id,
     record,
     attempts: 0,
@@ -405,6 +417,51 @@ describe('offline sync engine', () => {
         recordId: 'higher-local-version', winner: 'local', reason: 'version',
       }),
     ]);
+  });
+
+  it('converges concurrent releases of one source allocation to one tombstone', async () => {
+    const source: SavingsAllocation = {
+      id: 'allocation-source',
+      ownerId: 'user-a',
+      version: 1,
+      updatedAt: '2026-08-21T09:00:00.000Z',
+      lastOperationId: 'op-create-allocation',
+      goalId: 'goal-a',
+      amountDelta: 800,
+      occurredAt: '2026-08-21 09:00',
+    };
+    const releasedA: SavingsAllocation = {
+      ...source,
+      version: 2,
+      updatedAt: '2026-08-21T10:00:00.000Z',
+      lastOperationId: 'op-release-a',
+      deletedAt: '2026-08-21T10:00:00.000Z',
+    };
+    const releasedB: SavingsAllocation = {
+      ...source,
+      version: 2,
+      updatedAt: '2026-08-21T10:01:00.000Z',
+      lastOperationId: 'op-release-z',
+      deletedAt: '2026-08-21T10:01:00.000Z',
+    };
+    const releaseState = (record: SavingsAllocation): PersistedFinanceState => ({
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), allocations: [record] },
+      outbox: [allocationOperation(record)],
+    });
+    const remote = new InMemoryRemote([{ entity: 'allocations', record: source }]);
+
+    const afterA = await syncFinanceState(releaseState(releasedA), 'user-a', remote, () => NOW);
+    const afterB = await syncFinanceState(releaseState(releasedB), 'user-a', remote, () => NOW);
+    const convergedA = await syncFinanceState(afterA.state, 'user-a', remote, () => NOW);
+    const remoteAllocations = (await remote.pull('user-a'))
+      .filter((entry) => entry.entity === 'allocations');
+
+    expect(remoteAllocations).toEqual([{ entity: 'allocations', record: releasedB }]);
+    expect(afterB.state.data.allocations).toEqual([releasedB]);
+    expect(convergedA.state.data.allocations).toEqual([releasedB]);
+    expect(convergedA.state.data.allocations.filter((record) => !record.deletedAt)).toEqual([]);
   });
 
   it('does not let a queued stale operation overwrite a newer remote record', async () => {

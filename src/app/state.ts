@@ -3,6 +3,7 @@ import type {
   FinanceEntityName,
   OwnerId,
   PersistedFinanceState,
+  SavingsAllocation,
   SyncRecord,
 } from '../domain/model';
 import { enqueueSyncRecord } from '../domain/syncEngine';
@@ -236,6 +237,34 @@ export function saveFinanceState(
   storage.setItem(storageKey(state.ownerId), JSON.stringify(state));
 }
 
+export interface GuestImportPersistenceResult {
+  decisionRemembered: boolean;
+  decisionError?: string;
+}
+
+/**
+ * Persist imported finance data before remembering the guest decision. If the
+ * owner snapshot write fails, the decision write is never attempted, so a
+ * reload cannot hide an import that was lost to quota/storage failure.
+ */
+export function persistGuestImportState(
+  state: PersistedFinanceState,
+  decisionKey: string,
+  fingerprint: string,
+  storage: Pick<Storage, 'setItem'> = localStorage,
+): GuestImportPersistenceResult {
+  saveFinanceState(state, storage);
+  try {
+    storage.setItem(decisionKey, fingerprint);
+    return { decisionRemembered: true };
+  } catch (error) {
+    return {
+      decisionRemembered: false,
+      decisionError: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 export function canAutoSaveFinanceState(
   state: PersistedFinanceState,
   activeOwnerId: OwnerId,
@@ -272,6 +301,88 @@ export function putRecord<E extends FinanceEntityName>(
     ...state,
     data: { ...state.data, [entity]: nextRecords },
   };
+}
+
+export interface GuestImportConflict {
+  entity: FinanceEntityName;
+  id: string;
+}
+
+export interface GuestImportPlan {
+  state: PersistedFinanceState;
+  addedCount: number;
+  skippedCount: number;
+  conflicts: GuestImportConflict[];
+}
+
+function canonicalImportValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalImportValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, canonicalImportValue(child)]),
+    );
+  }
+  return value;
+}
+
+function guestImportContent(record: SyncRecord): string {
+  const content = Object.fromEntries(
+    Object.entries(record).filter(([key]) => ![
+      'version',
+      'updatedAt',
+      'lastOperationId',
+    ].includes(key)),
+  );
+  return JSON.stringify(canonicalImportValue(content));
+}
+
+/**
+ * Prepare an explicit guest import without ever overwriting account-owned data.
+ * Sync metadata is ignored for equality because remapping intentionally creates
+ * a fresh operation clock each time. Any business-content collision aborts the
+ * entire import so the UI can report it instead of silently losing one side.
+ */
+export function planGuestImport(
+  state: PersistedFinanceState,
+  imported: FinanceData,
+): GuestImportPlan {
+  if (state.ownerId === 'guest') throw new Error('訪客資料不需要匯入訪客帳號');
+  validateFinanceData(imported, 'explicit guest import');
+
+  const conflicts: GuestImportConflict[] = [];
+  let skippedCount = 0;
+  for (const entity of entityNames) {
+    const currentById = new Map(
+      (state.data[entity] as SyncRecord[]).map((record) => [record.id, record]),
+    );
+    for (const record of imported[entity] as SyncRecord[]) {
+      if (record.ownerId !== state.ownerId) {
+        throw new Error('訪客匯入資料的 owner remap 不完整');
+      }
+      const existing = currentById.get(record.id);
+      if (!existing) continue;
+      if (guestImportContent(existing) === guestImportContent(record)) skippedCount += 1;
+      else conflicts.push({ entity, id: record.id });
+    }
+  }
+
+  if (conflicts.length > 0) {
+    return { state, addedCount: 0, skippedCount, conflicts };
+  }
+
+  let next = state;
+  let addedCount = 0;
+  for (const entity of entityNames) {
+    const existingIds = new Set((state.data[entity] as SyncRecord[]).map((record) => record.id));
+    for (const record of imported[entity] as FinanceData[typeof entity][number][]) {
+      if (existingIds.has(record.id)) continue;
+      next = putRecord(next, entity, record);
+      addedCount += 1;
+    }
+  }
+  return { state: next, addedCount, skippedCount, conflicts: [] };
 }
 
 /**
@@ -342,6 +453,30 @@ export function changedRecordMeta<T extends SyncRecord>(record: T, now = new Dat
     updatedAt: now.toISOString(),
     lastOperationId: crypto.randomUUID(),
   };
+}
+
+/**
+ * Release a goal by tombstoning the exact source allocation records. Two
+ * offline devices therefore update the same record IDs instead of creating
+ * additive negative rows that could double-release after reconciliation.
+ * Tombstones keep the original amount/date/note available for audit.
+ */
+export function releaseGoalAllocations(
+  allocations: readonly SavingsAllocation[],
+  goalId: string,
+  now = new Date(),
+  operationId: () => string = () => crypto.randomUUID(),
+): SavingsAllocation[] {
+  const timestamp = now.toISOString();
+  return allocations
+    .filter((allocation) => allocation.goalId === goalId && !allocation.deletedAt)
+    .map((allocation) => ({
+      ...allocation,
+      version: allocation.version + 1,
+      updatedAt: timestamp,
+      lastOperationId: operationId(),
+      deletedAt: timestamp,
+    }));
 }
 
 export function hasUserContent(data: FinanceData): boolean {

@@ -90,6 +90,7 @@ export default function App() {
           link.click();
           URL.revokeObjectURL(url);
         }}>下載原始快照</button></div> : app.storageError && <div className="warning-banner"><div><strong>本機儲存失敗</strong><p>{app.storageError}。請立即從「管理 → 備份」匯出 JSON，避免關閉頁面後遺失尚未落盤的變更。</p></div></div>}
+        {app.guestImportNotice && <div className="info-banner"><span><strong>訪客資料匯入結果</strong><br />{app.guestImportNotice}</span></div>}
         {app.hasSeparateGuestData && <div className="warning-banner"><div><strong>偵測到分離的訪客資料</strong><p>登入不會自動混入訪客帳本。你可以明確匯入，或保持分離。</p></div><div className="flex gap-2"><button type="button" className="primary-button" onClick={app.importGuestData}>匯入此帳號</button><button type="button" className="secondary-button" onClick={app.dismissGuestImport}>保持分離</button></div></div>}
         {app.state.lastSyncError && <div className="warning-banner"><div><strong>部分資料尚未同步</strong><p>{app.state.lastSyncError}</p></div><button type="button" className="secondary-button" onClick={() => void app.syncNow()}>重試</button></div>}
 

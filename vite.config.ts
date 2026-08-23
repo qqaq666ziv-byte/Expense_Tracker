@@ -46,6 +46,19 @@ export default defineConfig(() => {
         '@': import.meta.dirname,
       },
     },
+    build: {
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [{
+              name: 'supabase-vendor',
+              test: /node_modules[\\/]@supabase[\\/]/,
+              priority: 10,
+            }],
+          },
+        },
+      },
+    },
     server: {
       port: 8888,
       host: '0.0.0.0',

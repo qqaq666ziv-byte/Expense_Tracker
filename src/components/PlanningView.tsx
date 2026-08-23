@@ -3,7 +3,8 @@ import { AlertTriangle, Archive, PiggyBank, Plus, Target } from 'lucide-react';
 import type { Budget, FinanceData, SavingsAllocation, SavingsGoal } from '../domain/model';
 import { calculateBudgetUsage, normalizeBudgetScope } from '../domain/budgetEngine';
 import { calculateFinancials } from '../domain/financeEngine';
-import { changedRecordMeta, newRecordMeta } from '../app/state';
+import { sortByDisplayOrder } from '../domain/displayOrder';
+import { changedRecordMeta, newRecordMeta, releaseGoalAllocations } from '../app/state';
 import { localDate, money, parseRequiredNumberInput, shortDate, toLocalInput } from '../app/format';
 import { useCalendarReference } from '../app/useCalendarReference';
 
@@ -35,8 +36,14 @@ function SavingsPanel({ data, ownerId, putGoal, putAllocation, archiveGoal, refe
   const [goalId, setGoalId] = useState('');
   const [allocation, setAllocation] = useState('');
   const [message, setMessage] = useState('');
-  const goals = data.goals.filter((item) => item.isActive && !item.deletedAt);
+  const visibleGoals = data.goals.filter((item) => !item.deletedAt);
+  const goals = visibleGoals.filter((item) => item.isActive);
   const resolvedGoalId = goals.some((goal) => goal.id === goalId) ? goalId : goals[0]?.id ?? '';
+  const allocatedToGoal = (id: string) => data.allocations
+    .filter((item) => !item.deletedAt && item.goalId === id)
+    .reduce((sum, item) => sum + item.amountDelta, 0);
+  const releasedFromGoal = (id: string) => data.allocations
+    .filter((item) => item.deletedAt && item.goalId === id).length;
 
   const createGoal = (event: FormEvent) => {
     event.preventDefault();
@@ -55,6 +62,14 @@ function SavingsPanel({ data, ownerId, putGoal, putAllocation, archiveGoal, refe
     setAllocation(''); setMessage('已配置；總資產不會因此減少');
   };
 
+  const releaseGoalAllocation = (goal: SavingsGoal, allocated: number) => {
+    if (allocated <= 0) return;
+    if (!window.confirm(`釋放「${goal.name}」目前配置的 ${money.format(allocated)}？原配置會保留為可同步、可稽核的釋放紀錄，總資產不變。`)) return;
+    const releases = releaseGoalAllocations(data.allocations, goal.id);
+    releases.forEach(putAllocation);
+    setMessage(`已釋放「${goal.name}」的 ${releases.length} 筆配置；總資產不變`);
+  };
+
   return (
     <>
       <section className="hero-card hero-card-savings" aria-labelledby="savings-overview-title"><div className="relative z-10"><p id="savings-overview-title" className="text-sm font-bold text-white/75">資產配置</p><p className="mt-1 text-3xl font-black">已配置 {money.format(financials.allocatedSavings)}</p><p className="mt-2 text-sm text-white/80">總資產 {money.format(financials.totalAssets)} · 可配置 {money.format(financials.availableAssets)}</p>{financials.availableAssets < 0 && <p className="mt-3 flex items-center gap-2 rounded-xl bg-rose-950/30 p-2 text-sm"><AlertTriangle className="h-4 w-4" />舊資料配置高於資產，資料已保留；新增配置暫停。</p>}</div></section>
@@ -62,7 +77,34 @@ function SavingsPanel({ data, ownerId, putGoal, putAllocation, archiveGoal, refe
         <section className="card" aria-labelledby="new-goal-title"><div className="section-heading"><div><p className="eyebrow">真實資料</p><h2 id="new-goal-title">建立儲蓄目標</h2></div><Target className="h-7 w-7 text-amber-600" /></div><form className="space-y-3" onSubmit={createGoal}><label className="field-label">目標名稱<input aria-label="目標名稱" className="field mt-1" value={name} onChange={(event) => setName(event.target.value)} /></label><label className="field-label">目標金額<input aria-label="目標金額" className="field mt-1" inputMode="decimal" value={target} onChange={(event) => setTarget(event.target.value.replace(/[^0-9.]/g, ''))} /></label><label className="field-label">目標日期（選填）<input aria-label="目標日期" type="date" min={localDate(reference)} className="field mt-1" value={targetDate} onChange={(event) => setTargetDate(event.target.value)} /></label><button className="primary-button w-full" type="submit"><Plus className="h-4 w-4" />建立目標</button></form></section>
         <section className="card" aria-labelledby="allocation-title"><div className="section-heading"><div><p className="eyebrow">不減少總資產</p><h2 id="allocation-title">配置儲蓄</h2></div><PiggyBank className="h-7 w-7 text-amber-600" /></div><form className="space-y-3" onSubmit={allocate}><label className="field-label">目標<select aria-label="配置目標" className="field mt-1" value={resolvedGoalId} onChange={(event) => setGoalId(event.target.value)}>{goals.map((goal) => <option key={goal.id} value={goal.id}>{goal.name}</option>)}</select></label><label className="field-label">配置金額<input aria-label="配置金額" className="field mt-1" inputMode="decimal" value={allocation} onChange={(event) => setAllocation(event.target.value.replace(/[^0-9.]/g, ''))} /></label><button className="primary-button w-full" type="submit" disabled={goals.length === 0 || financials.availableAssets <= 0}>配置到目標</button></form>{message && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-sm dark:bg-zinc-800">{message}</p>}</section>
       </div>
-      <section className="card" aria-labelledby="goal-list-title"><div className="section-heading"><div><p className="eyebrow">進度</p><h2 id="goal-list-title">目標清單</h2></div></div>{goals.length === 0 ? <p className="empty-state">沒有示範數字；建立目標後才會顯示進度。</p> : <div className="space-y-4">{goals.map((goal) => { const current = data.allocations.filter((item) => !item.deletedAt && item.goalId === goal.id).reduce((sum, item) => sum + item.amountDelta, 0); const ratio = goal.targetAmount > 0 ? current / goal.targetAmount : 0; return <article key={goal.id}><div className="flex items-center justify-between"><div><strong>{goal.name}</strong><p className="text-xs text-zinc-500">{money.format(current)} / {money.format(goal.targetAmount)}{goal.targetDate ? ` · ${shortDate(goal.targetDate)}` : ''}</p></div><button className="icon-button" type="button" aria-label={`封存 ${goal.name}`} onClick={() => archiveGoal(goal)}><Archive className="h-4 w-4" /></button></div><div className="progress-track mt-2"><span style={{ width: `${Math.min(100, ratio * 100)}%` }} /></div></article>; })}</div>}</section>
+      <section className="card" aria-labelledby="goal-list-title">
+        <div className="section-heading"><div><p className="eyebrow">進度與可稽核配置</p><h2 id="goal-list-title">目標清單</h2></div></div>
+        {visibleGoals.length === 0 ? <p className="empty-state">沒有示範數字；建立目標後才會顯示進度。</p> : (
+          <div className="space-y-4">{visibleGoals.map((goal) => {
+            const current = allocatedToGoal(goal.id);
+            const releasedCount = releasedFromGoal(goal.id);
+            const ratio = goal.targetAmount > 0 ? current / goal.targetAmount : 0;
+            return (
+              <article className={goal.isActive ? '' : 'rounded-2xl bg-zinc-50 p-3 opacity-75 dark:bg-zinc-800'} key={goal.id}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <strong>{goal.name}</strong>{!goal.isActive && <span className="ml-2 rounded-full bg-zinc-200 px-2 py-0.5 text-[10px] dark:bg-zinc-700">已封存</span>}
+                    <p className="text-xs text-zinc-500">{money.format(current)} / {money.format(goal.targetAmount)}{goal.targetDate ? ` · ${shortDate(goal.targetDate)}` : ''}</p>
+                    {releasedCount > 0 && <p className="text-[11px] text-zinc-500">{releasedCount} 筆已釋放配置保留 tombstone 稽核</p>}
+                  </div>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    {current > 0 && <button className="secondary-button" type="button" aria-label={`釋放${goal.name}配置`} onClick={() => releaseGoalAllocation(goal, current)}>釋放配置</button>}
+                    {goal.isActive
+                      ? <button className="icon-button" type="button" aria-label={`封存 ${goal.name}`} onClick={() => archiveGoal(goal)}><Archive className="h-4 w-4" /></button>
+                      : <button className="secondary-button" type="button" aria-label={`重新啟用${goal.name}`} onClick={() => putGoal({ ...goal, ...changedRecordMeta(goal), isActive: true })}>重新啟用</button>}
+                  </div>
+                </div>
+                <div className="progress-track mt-2"><span style={{ width: `${Math.max(0, Math.min(100, ratio * 100))}%` }} /></div>
+              </article>
+            );
+          })}</div>
+        )}
+      </section>
     </>
   );
 }
@@ -73,7 +115,7 @@ function BudgetPanel({ data, ownerId, putBudget, archiveBudget, reference }: Pla
   const [period, setPeriod] = useState<'weekly' | 'monthly'>('monthly');
   const [amount, setAmount] = useState('');
   const [message, setMessage] = useState('');
-  const categories = data.categories.filter((item) => item.kind === 'expense' && item.isActive && !item.deletedAt);
+  const categories = sortByDisplayOrder(data.categories.filter((item) => item.kind === 'expense' && item.isActive && !item.deletedAt));
   const resolvedCategoryId = categories.some((item) => item.id === categoryId) ? categoryId : categories[0]?.id ?? '';
   const usages = useMemo(() => calculateBudgetUsage(data, reference), [data, reference]);
 

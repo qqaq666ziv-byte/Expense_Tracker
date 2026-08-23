@@ -23,6 +23,7 @@ import type {
 type DatabaseRow = Record<string, unknown>;
 
 const PAGE_SIZE = 500;
+const DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(?:Z|([+-])(\d{2}):(\d{2}))?)?$/;
 
 const TABLE_BY_ENTITY: Record<FinanceEntityName, string> = {
   accounts: 'accounts',
@@ -44,7 +45,7 @@ function errorText(error: { code?: string; message?: string } | null, context: s
 
 function requiredString(row: DatabaseRow, column: string): string {
   const value = row[column];
-  if (typeof value !== 'string' || value.length === 0) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
     throw new Error(`Supabase row is missing required text column ${column}`);
   }
   return value;
@@ -60,11 +61,90 @@ function optionalString(row: DatabaseRow, column: string): string | undefined {
 }
 
 function requiredNumber(row: DatabaseRow, column: string): number {
-  const value = Number(row[column]);
-  if (!Number.isFinite(value)) {
+  const raw = row[column];
+  if ((typeof raw !== 'number' && typeof raw !== 'string')
+    || (typeof raw === 'string' && raw.trim() === '')) {
+    throw new Error(`Supabase row has invalid numeric column ${column}`);
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER) {
     throw new Error(`Supabase row has invalid numeric column ${column}`);
   }
   return value;
+}
+
+function requiredPositiveNumber(row: DatabaseRow, column: string): number {
+  const value = requiredNumber(row, column);
+  if (value <= 0) {
+    throw new Error(`Supabase row requires positive numeric column ${column}`);
+  }
+  return value;
+}
+
+function requiredNonZeroNumber(row: DatabaseRow, column: string): number {
+  const value = requiredNumber(row, column);
+  if (value === 0) {
+    throw new Error(`Supabase row requires non-zero numeric column ${column}`);
+  }
+  return value;
+}
+
+function requiredInteger(
+  row: DatabaseRow,
+  column: string,
+  minimum?: number,
+  maximum?: number,
+): number {
+  const value = requiredNumber(row, column);
+  if (!Number.isInteger(value)
+    || (minimum !== undefined && value < minimum)
+    || (maximum !== undefined && value > maximum)) {
+    throw new Error(`Supabase row has invalid integer column ${column}`);
+  }
+  return value;
+}
+
+function validateDateText(value: string, column: string, requireExplicitTimezone: boolean): string {
+  const match = DATE_PATTERN.exec(value);
+  if (!match) throw new Error(`Supabase row has invalid date column ${column}`);
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, , , offsetHour, offsetMinute] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const maxDay = month >= 1 && month <= 12 ? new Date(Date.UTC(year, month, 0)).getUTCDate() : 0;
+  if (year < 1 || day < 1 || day > maxDay) {
+    throw new Error(`Supabase row has invalid date column ${column}`);
+  }
+  if (hourText !== undefined
+    && (Number(hourText) > 23 || Number(minuteText) > 59 || Number(secondText ?? 0) > 59)) {
+    throw new Error(`Supabase row has invalid date column ${column}`);
+  }
+  if (offsetHour !== undefined && (Number(offsetHour) > 23 || Number(offsetMinute) > 59)) {
+    throw new Error(`Supabase row has invalid date column ${column}`);
+  }
+  if (requireExplicitTimezone
+    && (hourText === undefined || (!value.endsWith('Z') && match[8] === undefined))) {
+    throw new Error(`Supabase row has invalid sync timestamp column ${column}`);
+  }
+  return value;
+}
+
+function requiredDate(row: DatabaseRow, column: string): string {
+  return validateDateText(requiredString(row, column), column, false);
+}
+
+function optionalDate(row: DatabaseRow, column: string): string | undefined {
+  const value = optionalString(row, column);
+  return value === undefined ? undefined : validateDateText(value, column, false);
+}
+
+function requiredSyncTimestamp(row: DatabaseRow, column: string): string {
+  return validateDateText(requiredString(row, column), column, true);
+}
+
+function optionalSyncTimestamp(row: DatabaseRow, column: string): string | undefined {
+  const value = optionalString(row, column);
+  return value === undefined ? undefined : validateDateText(value, column, true);
 }
 
 function requiredBoolean(row: DatabaseRow, column: string): boolean {
@@ -76,12 +156,12 @@ function requiredBoolean(row: DatabaseRow, column: string): boolean {
 }
 
 function commonRecord(row: DatabaseRow): SyncRecord {
-  const deletedAt = optionalString(row, 'deleted_at');
+  const deletedAt = optionalSyncTimestamp(row, 'deleted_at');
   return {
     id: requiredString(row, 'id'),
     ownerId: requiredString(row, 'user_id'),
-    version: requiredNumber(row, 'version'),
-    updatedAt: requiredString(row, 'updated_at'),
+    version: requiredInteger(row, 'version', 1),
+    updatedAt: requiredSyncTimestamp(row, 'updated_at'),
     lastOperationId: requiredString(row, 'last_operation_id'),
     ...(deletedAt === undefined ? {} : { deletedAt }),
   };
@@ -111,7 +191,7 @@ function decodeAccount(row: DatabaseRow): AssetAccount {
     openingBalance: requiredNumber(row, 'opening_balance'),
     includeInTotalAssets: requiredBoolean(row, 'include_in_total_assets'),
     isActive: requiredBoolean(row, 'is_active'),
-    sortOrder: requiredNumber(row, 'sort_order'),
+    sortOrder: requiredInteger(row, 'sort_order'),
     ...(legacyKey === undefined ? {} : { legacyKey }),
     ...(row.requires_review === null || row.requires_review === undefined
       ? {}
@@ -147,16 +227,16 @@ function decodeTransaction(row: DatabaseRow): Transaction {
   }
   const note = optionalString(row, 'note');
   const recurringRuleId = optionalString(row, 'recurring_rule_id');
-  const occurrenceDate = optionalString(row, 'occurrence_date');
+  const occurrenceDate = optionalDate(row, 'occurrence_date');
   return {
     ...commonRecord(row),
-    amount: requiredNumber(row, 'amount'),
+    amount: requiredPositiveNumber(row, 'amount'),
     type,
     categoryId: requiredString(row, 'category_id'),
     categoryName: requiredString(row, 'category_name'),
     accountId: requiredString(row, 'account_id'),
     accountName: requiredString(row, 'account_name'),
-    occurredAt: requiredString(row, 'occurred_at'),
+    occurredAt: requiredDate(row, 'occurred_at'),
     ...(note === undefined ? {} : { note }),
     ...(recurringRuleId === undefined ? {} : { recurringRuleId }),
     ...(occurrenceDate === undefined ? {} : { occurrenceDate }),
@@ -168,19 +248,19 @@ function decodeAdjustment(row: DatabaseRow): BalanceAdjustment {
   return {
     ...commonRecord(row),
     accountId: requiredString(row, 'account_id'),
-    amountDelta: requiredNumber(row, 'amount_delta'),
-    occurredAt: requiredString(row, 'occurred_at'),
+    amountDelta: requiredNonZeroNumber(row, 'amount_delta'),
+    occurredAt: requiredDate(row, 'occurred_at'),
     ...(reason === undefined ? {} : { reason }),
   };
 }
 
 function decodeGoal(row: DatabaseRow): SavingsGoal {
-  const targetDate = optionalString(row, 'target_date');
+  const targetDate = optionalDate(row, 'target_date');
   const legacyUnit = optionalString(row, 'legacy_unit');
   return {
     ...commonRecord(row),
     name: requiredString(row, 'name'),
-    targetAmount: requiredNumber(row, 'target_amount'),
+    targetAmount: requiredPositiveNumber(row, 'target_amount'),
     ...(targetDate === undefined ? {} : { targetDate }),
     isActive: requiredBoolean(row, 'is_active'),
     ...(legacyUnit === undefined ? {} : { legacyUnit }),
@@ -192,8 +272,8 @@ function decodeAllocation(row: DatabaseRow): SavingsAllocation {
   return {
     ...commonRecord(row),
     goalId: requiredString(row, 'goal_id'),
-    amountDelta: requiredNumber(row, 'amount_delta'),
-    occurredAt: requiredString(row, 'occurred_at'),
+    amountDelta: requiredNonZeroNumber(row, 'amount_delta'),
+    occurredAt: requiredDate(row, 'occurred_at'),
     ...(note === undefined ? {} : { note }),
   };
 }
@@ -209,13 +289,17 @@ function decodeBudget(row: DatabaseRow): Budget {
   }
   const categoryId = optionalString(row, 'category_id');
   const categoryName = optionalString(row, 'category_name');
+  if ((scope === 'overall' && (categoryId !== undefined || categoryName !== undefined))
+    || (scope === 'category' && (categoryId === undefined || categoryName === undefined))) {
+    throw new Error('Supabase budget has category columns inconsistent with scope');
+  }
   return {
     ...commonRecord(row),
     scope,
     ...(categoryId === undefined ? {} : { categoryId }),
     ...(categoryName === undefined ? {} : { categoryName }),
     period,
-    amount: requiredNumber(row, 'amount'),
+    amount: requiredPositiveNumber(row, 'amount'),
     isActive: requiredBoolean(row, 'is_active'),
   };
 }
@@ -232,21 +316,21 @@ function decodeRecurringRule(row: DatabaseRow): RecurringRule {
   const anchorDayValue = row.anchor_day;
   const anchorDay = anchorDayValue === null || anchorDayValue === undefined
     ? undefined
-    : requiredNumber(row, 'anchor_day');
+    : requiredInteger(row, 'anchor_day', 1, 31);
   const note = optionalString(row, 'note');
   return {
     ...commonRecord(row),
     name: requiredString(row, 'name'),
     type,
-    amount: requiredNumber(row, 'amount'),
+    amount: requiredPositiveNumber(row, 'amount'),
     categoryId: requiredString(row, 'category_id'),
     categoryName: requiredString(row, 'category_name'),
     accountId: requiredString(row, 'account_id'),
     accountName: requiredString(row, 'account_name'),
     frequency,
-    startDate: requiredString(row, 'start_date'),
+    startDate: requiredDate(row, 'start_date'),
     ...(anchorDay === undefined ? {} : { anchorDay }),
-    nextOccurrenceDate: requiredString(row, 'next_occurrence_date'),
+    nextOccurrenceDate: requiredDate(row, 'next_occurrence_date'),
     isActive: requiredBoolean(row, 'is_active'),
     ...(note === undefined ? {} : { note }),
   };
@@ -464,6 +548,92 @@ async function pullEntity(
   return { records, issues };
 }
 
+/**
+ * A row can be structurally valid while pointing at a row that was missing or
+ * quarantined. Filter the decoded graph before reconciliation so one malformed
+ * account/category/goal cannot admit dependent records that would make the
+ * persisted FinanceData snapshot fail closed on its next reload.
+ */
+function validateRemoteGraph(records: readonly RemoteRecord[]): RemotePullResult {
+  const accountIds = new Set(
+    records.filter((entry) => entry.entity === 'accounts').map((entry) => entry.record.id),
+  );
+  const categories = new Map(
+    records
+      .filter((entry): entry is Extract<RemoteRecord, { entity: 'categories' }> => entry.entity === 'categories')
+      .map((entry) => [entry.record.id, entry.record]),
+  );
+  const goalIds = new Set(
+    records.filter((entry) => entry.entity === 'goals').map((entry) => entry.record.id),
+  );
+
+  const invalidRecurringIds = new Set<string>();
+  for (const entry of records) {
+    if (entry.entity !== 'recurringRules') continue;
+    const category = categories.get(entry.record.categoryId);
+    if (!accountIds.has(entry.record.accountId) || category?.kind !== entry.record.type) {
+      invalidRecurringIds.add(entry.record.id);
+    }
+  }
+  const recurringIds = new Set(
+    records
+      .filter((entry) => entry.entity === 'recurringRules' && !invalidRecurringIds.has(entry.record.id))
+      .map((entry) => entry.record.id),
+  );
+
+  const accepted: RemoteRecord[] = [];
+  const issues: RemotePullIssue[] = [];
+  for (const entry of records) {
+    let reason: string | undefined;
+    switch (entry.entity) {
+      case 'transactions': {
+        const category = categories.get(entry.record.categoryId);
+        if (!accountIds.has(entry.record.accountId)) reason = 'references a missing account';
+        else if (!category) reason = 'references a missing category';
+        else if (category.kind !== entry.record.type) reason = 'references a category with the wrong kind';
+        else if (entry.record.recurringRuleId && !recurringIds.has(entry.record.recurringRuleId)) {
+          reason = 'references a missing or invalid recurring rule';
+        }
+        break;
+      }
+      case 'adjustments':
+        if (!accountIds.has(entry.record.accountId)) reason = 'references a missing account';
+        break;
+      case 'allocations':
+        if (!goalIds.has(entry.record.goalId)) reason = 'references a missing goal';
+        break;
+      case 'budgets':
+        if (entry.record.scope === 'category'
+          && categories.get(entry.record.categoryId)?.kind !== 'expense') {
+          reason = 'references a missing or non-expense category';
+        }
+        break;
+      case 'recurringRules': {
+        const category = categories.get(entry.record.categoryId);
+        if (!accountIds.has(entry.record.accountId)) reason = 'references a missing account';
+        else if (!category) reason = 'references a missing category';
+        else if (category.kind !== entry.record.type) reason = 'references a category with the wrong kind';
+        break;
+      }
+      case 'accounts':
+      case 'categories':
+      case 'goals':
+        break;
+    }
+    if (!reason) {
+      accepted.push(entry);
+      continue;
+    }
+    issues.push({
+      stage: 'validation',
+      entity: entry.entity,
+      recordId: entry.record.id,
+      message: `Skipped inconsistent ${entry.entity}/${entry.record.id}: ${reason}`,
+    });
+  }
+  return { records: accepted, issues };
+}
+
 function validateOperation(ownerId: string, operation: PendingOperation): void {
   if (operation.record.ownerId !== ownerId) {
     throw new Error('Pending operation owner does not match the requested Supabase owner');
@@ -492,9 +662,10 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
       const batches = await Promise.all(
         ENTITY_NAMES.map((entity) => pullEntity(client, ownerId, entity)),
       );
+      const graph = validateRemoteGraph(batches.flatMap((batch) => batch.records));
       return {
-        records: batches.flatMap((batch) => batch.records),
-        issues: batches.flatMap((batch) => batch.issues),
+        records: graph.records,
+        issues: [...batches.flatMap((batch) => batch.issues), ...graph.issues],
       };
     },
 

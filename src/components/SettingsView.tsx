@@ -3,6 +3,7 @@ import { Archive, Download, Pause, Play, Plus, RotateCcw, Save, Upload } from 'l
 import type { AssetAccount, Category, FinanceData, IconRef, RecurringRule } from '../domain/model';
 import { exportFinanceBackup, exportTransactionsCsv, MAX_BACKUP_CHARACTERS, restoreFinanceBackup } from '../domain/backup';
 import { getNextOccurrenceDate } from '../domain/recurrence';
+import { nextDisplayOrder, sortByDisplayOrder } from '../domain/displayOrder';
 import { changedRecordMeta, newRecordMeta } from '../app/state';
 import { localDate, money, parseRequiredNumberInput } from '../app/format';
 import { FinanceIcon, IconPicker } from './FinanceIcon';
@@ -34,7 +35,7 @@ function AccountsPanel({ data, ownerId, putAccount, archiveAccount }: SettingsVi
   const [included, setIncluded] = useState(true);
   const [icon, setIcon] = useState<IconRef>({ type: 'emoji', value: '💵' });
   const [message, setMessage] = useState('');
-  const accounts = data.accounts.filter((item) => !item.deletedAt);
+  const accounts = sortByDisplayOrder(data.accounts.filter((item) => !item.deletedAt));
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -47,7 +48,7 @@ function AccountsPanel({ data, ownerId, putAccount, archiveAccount }: SettingsVi
       setMessage('未修改期初餘額');
       return;
     }
-    const record: AssetAccount = editing ? { ...editing, ...changedRecordMeta(editing), name: name.trim(), openingBalance: amount, icon, includeInTotalAssets: included, requiresReview: false } : { ...newRecordMeta(ownerId), name: name.trim(), openingBalance: amount, icon, includeInTotalAssets: included, isActive: true, sortOrder: accounts.length };
+    const record: AssetAccount = editing ? { ...editing, ...changedRecordMeta(editing), name: name.trim(), openingBalance: amount, icon, includeInTotalAssets: included, requiresReview: false } : { ...newRecordMeta(ownerId), name: name.trim(), openingBalance: amount, icon, includeInTotalAssets: included, isActive: true, sortOrder: nextDisplayOrder(accounts) };
     putAccount(record); setEditing(null); setName(''); setOpening('0'); setIncluded(true); setIcon({ type: 'emoji', value: '💵' }); setMessage(editing ? '帳戶已更新' : '帳戶已建立');
   };
   const edit = (account: AssetAccount) => { setEditing(account); setName(account.name); setOpening(String(account.openingBalance)); setIncluded(account.includeInTotalAssets); setIcon(account.icon); };
@@ -61,10 +62,10 @@ function CategoriesPanel({ data, ownerId, putCategory, archiveCategory }: Settin
   const [name, setName] = useState('');
   const [icon, setIcon] = useState<IconRef>({ type: 'emoji', value: '🍜' });
   const [message, setMessage] = useState('');
-  const categories = data.categories.filter((item) => !item.deletedAt);
+  const categories = sortByDisplayOrder(data.categories.filter((item) => !item.deletedAt));
   const submit = (event: FormEvent) => {
     event.preventDefault(); if (!name.trim()) { setMessage('請輸入分類名稱'); return; }
-    const record: Category = editing ? { ...editing, ...changedRecordMeta(editing), name: name.trim(), icon } : { ...newRecordMeta(ownerId), kind, name: name.trim(), icon, isActive: true, sortOrder: categories.filter((item) => item.kind === kind).length };
+    const record: Category = editing ? { ...editing, ...changedRecordMeta(editing), name: name.trim(), icon } : { ...newRecordMeta(ownerId), kind, name: name.trim(), icon, isActive: true, sortOrder: nextDisplayOrder(categories.filter((item) => item.kind === kind)) };
     putCategory(record); setEditing(null); setName(''); setIcon({ type: 'emoji', value: kind === 'expense' ? '🍜' : '💰' }); setMessage(editing ? '分類已更新' : '分類已建立');
   };
   const edit = (category: Category) => { setEditing(category); setKind(category.kind); setName(category.name); setIcon(category.icon); };
@@ -80,8 +81,8 @@ function RecurringPanel({ data, ownerId, putRecurring, deleteRecurring }: Settin
   const [frequency, setFrequency] = useState<'weekly' | 'monthly' | 'yearly'>('monthly');
   const [startDate, setStartDate] = useState(localDate());
   const [message, setMessage] = useState('');
-  const categories = data.categories.filter((item) => item.kind === type && item.isActive && !item.deletedAt);
-  const accounts = data.accounts.filter((item) => item.isActive && !item.deletedAt);
+  const categories = sortByDisplayOrder(data.categories.filter((item) => item.kind === type && item.isActive && !item.deletedAt));
+  const accounts = sortByDisplayOrder(data.accounts.filter((item) => item.isActive && !item.deletedAt));
   const resolvedCategory = categories.find((item) => item.id === categoryId) ?? categories[0];
   const resolvedAccount = accounts.find((item) => item.id === accountId) ?? accounts[0];
   const submit = (event: FormEvent) => {
