@@ -166,3 +166,31 @@ export function getPreviousPeriodRange(
   const previousStartDay = shiftLocalDays(previousEndDay, -(countCalendarDays(current) - 1));
   return { start: startOfLocalDay(previousStartDay), end: endOfLocalDay(previousEndDay) };
 }
+
+/**
+ * Return a previous-period comparison with the same number of included local
+ * days when the selected calendar period is still in progress. A shorter
+ * previous period is clamped at its natural end (for example, March 31 versus
+ * February), while completed or historical/custom periods remain unchanged.
+ */
+export function getEquivalentPreviousPeriodRange(
+  period: PeriodKey,
+  reference: Date,
+  custom?: CustomRangeInput,
+): DateRange {
+  const current = getPeriodRange(period, reference, custom);
+  const previous = getPreviousPeriodRange(period, reference, custom);
+  if (period === 'custom'
+    || reference.getTime() < current.start.getTime()
+    || reference.getTime() >= current.end.getTime()) {
+    return previous;
+  }
+
+  const elapsedDays = countElapsedDays(current, reference);
+  if (elapsedDays <= 0) return previous;
+  const equivalentEnd = endOfLocalDay(shiftLocalDays(previous.start, elapsedDays - 1));
+  return {
+    start: previous.start,
+    end: equivalentEnd.getTime() < previous.end.getTime() ? equivalentEnd : previous.end,
+  };
+}

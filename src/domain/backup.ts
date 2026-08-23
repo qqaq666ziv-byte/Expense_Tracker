@@ -1,7 +1,7 @@
 import type { FinanceData, OwnerId } from './model';
 
 export const FINANCE_BACKUP_SCHEMA_VERSION = 1 as const;
-export const MAX_BACKUP_CHARACTERS = 5_000_000;
+export const MAX_BACKUP_BYTES = 5_000_000;
 const MAX_COLLECTION_RECORDS = 50_000;
 const MAX_BACKUP_STRING_LENGTH = 20_000;
 
@@ -24,10 +24,27 @@ export class BackupValidationError extends Error {
   }
 }
 
+export class BackupSizeLimitError extends BackupValidationError {
+  readonly limitBytes = MAX_BACKUP_BYTES;
+  readonly operation: 'export' | 'import';
+
+  constructor(operation: 'export' | 'import') {
+    super(operation === 'export'
+      ? `Backup exceeds the ${MAX_BACKUP_BYTES} byte safety limit and was not exported.`
+      : `Backup exceeds the ${MAX_BACKUP_BYTES} byte safety limit.`);
+    this.name = 'BackupSizeLimitError';
+    this.operation = operation;
+  }
+}
+
 const DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(?:Z|([+-])(\d{2}):(\d{2}))?)?$/;
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 export function createFinanceBackup(
@@ -54,7 +71,11 @@ export function exportFinanceBackup(
   data: FinanceData,
   exportedAt: string | Date = new Date(),
 ): string {
-  return JSON.stringify(createFinanceBackup(data, exportedAt), null, 2);
+  const serialized = JSON.stringify(createFinanceBackup(data, exportedAt), null, 2);
+  if (utf8ByteLength(serialized) > MAX_BACKUP_BYTES) {
+    throw new BackupSizeLimitError('export');
+  }
+  return serialized;
 }
 
 const TRANSACTION_CSV_HEADERS = [
@@ -102,8 +123,9 @@ export function exportTransactionsCsv(data: FinanceData): string {
 }
 
 export function parseFinanceBackup(input: string | unknown): FinanceBackup {
-  if (typeof input === 'string' && input.length > MAX_BACKUP_CHARACTERS) {
-    throw new BackupValidationError(`Backup exceeds the ${MAX_BACKUP_CHARACTERS} character safety limit.`);
+  if (typeof input === 'string'
+    && (input.length > MAX_BACKUP_BYTES || utf8ByteLength(input) > MAX_BACKUP_BYTES)) {
+    throw new BackupSizeLimitError('import');
   }
   let parsed: unknown;
   try {
@@ -170,6 +192,11 @@ function assertPositiveAmount(value: unknown, path: string): asserts value is nu
   if (value <= 0) fail(path, 'must be greater than zero');
 }
 
+function assertNonZeroAmount(value: unknown, path: string): asserts value is number {
+  assertFiniteNumber(value, path);
+  if (value === 0) fail(path, 'must not be zero');
+}
+
 function assertInteger(value: unknown, path: string, minimum?: number): asserts value is number {
   assertFiniteNumber(value, path);
   if (!Number.isInteger(value) || (minimum !== undefined && value < minimum)) {
@@ -211,8 +238,15 @@ function assertDate(value: unknown, path: string): asserts value is string {
   }
 }
 
-function assertOptionalDate(value: unknown, path: string): void {
-  if (value !== undefined) assertDate(value, path);
+function assertDateOnly(value: unknown, path: string): asserts value is string {
+  assertDate(value, path);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    fail(path, 'must be a date-only value (YYYY-MM-DD)');
+  }
+}
+
+function assertOptionalDateOnly(value: unknown, path: string): void {
+  if (value !== undefined) assertDateOnly(value, path);
 }
 
 function assertDateTime(value: unknown, path: string): asserts value is string {
@@ -332,7 +366,7 @@ export function validateFinanceData(value: unknown, path: string): asserts value
     if (transaction.recurringRuleId !== undefined) {
       assertReference(transaction.recurringRuleId, recurringIds, `${itemPath}.recurringRuleId`, 'recurring rule');
     }
-    assertOptionalDate(transaction.occurrenceDate, `${itemPath}.occurrenceDate`);
+    assertOptionalDateOnly(transaction.occurrenceDate, `${itemPath}.occurrenceDate`);
     const category = categoryById.get(transaction.categoryId as string);
     if (category?.kind !== transaction.type) fail(`${itemPath}.categoryId`, 'has the wrong category kind');
   });
@@ -340,7 +374,7 @@ export function validateFinanceData(value: unknown, path: string): asserts value
   adjustments.forEach((adjustment, index) => {
     const itemPath = `${path}.adjustments[${index}]`;
     assertReference(adjustment.accountId, accountIds, `${itemPath}.accountId`, 'account');
-    assertFiniteNumber(adjustment.amountDelta, `${itemPath}.amountDelta`);
+    assertNonZeroAmount(adjustment.amountDelta, `${itemPath}.amountDelta`);
     assertDate(adjustment.occurredAt, `${itemPath}.occurredAt`);
     assertOptionalString(adjustment.reason, `${itemPath}.reason`);
   });
@@ -349,7 +383,7 @@ export function validateFinanceData(value: unknown, path: string): asserts value
     const itemPath = `${path}.goals[${index}]`;
     assertString(goal.name, `${itemPath}.name`);
     assertPositiveAmount(goal.targetAmount, `${itemPath}.targetAmount`);
-    assertOptionalDate(goal.targetDate, `${itemPath}.targetDate`);
+    assertOptionalDateOnly(goal.targetDate, `${itemPath}.targetDate`);
     assertBoolean(goal.isActive, `${itemPath}.isActive`);
     assertOptionalString(goal.legacyUnit, `${itemPath}.legacyUnit`);
   });
@@ -357,7 +391,7 @@ export function validateFinanceData(value: unknown, path: string): asserts value
   allocations.forEach((allocation, index) => {
     const itemPath = `${path}.allocations[${index}]`;
     assertReference(allocation.goalId, goalIds, `${itemPath}.goalId`, 'goal');
-    assertFiniteNumber(allocation.amountDelta, `${itemPath}.amountDelta`);
+    assertNonZeroAmount(allocation.amountDelta, `${itemPath}.amountDelta`);
     assertDate(allocation.occurredAt, `${itemPath}.occurredAt`);
     assertOptionalString(allocation.note, `${itemPath}.note`);
   });
@@ -391,12 +425,12 @@ export function validateFinanceData(value: unknown, path: string): asserts value
     assertReference(rule.accountId, accountIds, `${itemPath}.accountId`, 'account');
     assertString(rule.accountName, `${itemPath}.accountName`);
     assertOneOf(rule.frequency, ['weekly', 'monthly', 'yearly'] as const, `${itemPath}.frequency`);
-    assertDate(rule.startDate, `${itemPath}.startDate`);
+    assertDateOnly(rule.startDate, `${itemPath}.startDate`);
     if (rule.anchorDay !== undefined) {
       assertInteger(rule.anchorDay, `${itemPath}.anchorDay`, 1);
       if ((rule.anchorDay as number) > 31) fail(`${itemPath}.anchorDay`, 'must be <= 31');
     }
-    assertDate(rule.nextOccurrenceDate, `${itemPath}.nextOccurrenceDate`);
+    assertDateOnly(rule.nextOccurrenceDate, `${itemPath}.nextOccurrenceDate`);
     assertBoolean(rule.isActive, `${itemPath}.isActive`);
     assertOptionalString(rule.note, `${itemPath}.note`);
     if (categoryById.get(rule.categoryId as string)?.kind !== rule.type) {

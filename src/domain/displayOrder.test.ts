@@ -26,4 +26,28 @@ describe('display ordering', () => {
     ])).toBe(10);
     expect(nextDisplayOrder([])).toBe(0);
   });
+
+  it('uses Unicode code-point ties instead of runtime ICU collation', () => {
+    const concurrentRecords = [
+      { id: 'record-umlaut', name: 'ä', sortOrder: 4 },
+      { id: 'record-ascii', name: 'z', sortOrder: 4 },
+    ];
+
+    expect(sortByDisplayOrder(concurrentRecords).map((item) => item.id)).toEqual([
+      'record-ascii',
+      'record-umlaut',
+    ]);
+  });
+
+  it('uses the raw opaque id when normalized display names are equivalent', () => {
+    const canonicallyEquivalentNames = [
+      { id: 'é', name: 'é', sortOrder: 2 },
+      { id: 'e\u0301', name: 'e\u0301', sortOrder: 2 },
+    ];
+
+    expect(sortByDisplayOrder(canonicallyEquivalentNames).map((item) => item.id)).toEqual([
+      'e\u0301',
+      'é',
+    ]);
+  });
 });

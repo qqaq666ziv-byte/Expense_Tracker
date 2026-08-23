@@ -83,6 +83,21 @@ describe('finance engine', () => {
     expect(result.allTime).toMatchObject({ income: 2_000, expense: 0, net: 2_000 });
   });
 
+  it('uses deterministic display-order ties for account balances regardless of pull order', () => {
+    const data: FinanceData = {
+      ...baseData,
+      accounts: [
+        { ...baseData.accounts[0], id: 'z-account', name: '同順位帳戶', sortOrder: 5 },
+        { ...baseData.accounts[0], id: 'a-account', name: '同順位帳戶', sortOrder: 5 },
+      ],
+    };
+
+    expect(calculateFinancials(data).accountBalances.map((account) => account.accountId)).toEqual([
+      'a-account',
+      'z-account',
+    ]);
+  });
+
   it('resolves history through a renamed, re-iconed and archived category', () => {
     const data: FinanceData = {
       ...baseData,
@@ -177,6 +192,65 @@ describe('finance engine', () => {
     expect(result.availableAssets).toBe(1_000);
   });
 
+  it('keeps two-decimal cash flow and available assets exact in minor units', () => {
+    const goal = {
+      id: 'goal-decimal', ownerId: 'guest', name: '零錢目標', targetAmount: 1,
+      isActive: true, version: 1, updatedAt: '2026-08-21T09:00:00.000Z', lastOperationId: 'fixture',
+    } satisfies FinanceData['goals'][number];
+    const allocation = (id: string, amountDelta: number) => ({
+      id, ownerId: 'guest', goalId: goal.id, amountDelta, occurredAt: '2026-08-21 09:00',
+      version: 1, updatedAt: '2026-08-21T09:00:00.000Z', lastOperationId: `fixture-${id}`,
+    }) satisfies FinanceData['allocations'][number];
+    const allocationData: FinanceData = {
+      ...baseData,
+      accounts: [{ ...baseData.accounts[0], openingBalance: 0.3 }],
+      goals: [goal],
+      allocations: [allocation('allocation-10', 0.1), allocation('allocation-20', 0.2)],
+    };
+
+    expect(calculateFinancials(allocationData)).toMatchObject({
+      totalAssets: 0.3,
+      allocatedSavings: 0.3,
+      availableAssets: 0,
+    });
+
+    const incomeCategory = {
+      ...baseData.categories[0], id: 'income', kind: 'income' as const, name: '收入',
+    };
+    const transaction = (
+      id: string,
+      amount: number,
+      type: 'income' | 'expense',
+      categoryId: string,
+      categoryName: string,
+    ) => ({
+      id, ownerId: 'guest', amount, type, categoryId, categoryName,
+      accountId: 'cash', accountName: '現金', occurredAt: '2026-08-21 10:00',
+      version: 1, updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: `fixture-${id}`,
+    }) satisfies FinanceData['transactions'][number];
+    const cashFlowData: FinanceData = {
+      ...baseData,
+      categories: [...baseData.categories, incomeCategory],
+      transactions: [
+        transaction('income-10', 0.1, 'income', 'income', '收入'),
+        transaction('income-20', 0.2, 'income', 'income', '收入'),
+        transaction('expense-30', 0.3, 'expense', 'food', '餐飲'),
+      ],
+    };
+    const financials = calculateFinancials(cashFlowData);
+    const insights = calculateInsights(cashFlowData, {
+      period: 'month',
+      reference: new Date(2026, 7, 21, 12),
+    });
+
+    expect(financials.allTime).toMatchObject({ income: 0.3, expense: 0.3, net: 0 });
+    expect(insights.today).toMatchObject({ income: 0.3, expense: 0.3, net: 0 });
+    expect(calculateSpendingTrend(
+      cashFlowData,
+      getPeriodRange('month', new Date(2026, 7, 21, 12)),
+    )).toEqual([['2026-08-21', 0.3]]);
+  });
+
   it('builds an always-local today snapshot independently from the selected period', () => {
     const data: FinanceData = {
       ...baseData,
@@ -241,6 +315,7 @@ describe('finance engine', () => {
         makeExpense('aug-1', 100, '2026-08-01 09:00'),
         makeExpense('aug-21', 110, '2026-08-21 13:00'),
         makeExpense('jul-15', 60, '2026-07-15 13:00'),
+        makeExpense('jul-25', 900, '2026-07-25 13:00'),
         {
           id: 'salary-aug', ownerId: 'guest', amount: 500, type: 'income', categoryId: 'salary', categoryName: '薪水',
           accountId: 'cash', accountName: '現金', occurredAt: '2026-08-10 09:00', version: 1,

@@ -1,9 +1,11 @@
 import type { BalanceAdjustment, FinanceData, Transaction } from './model';
 import type { CustomRangeInput, DateRange, PeriodKey } from './dateRange';
+import { sortByDisplayOrder } from './displayOrder';
+import { addMoney, compareMoney, subtractMoney, sumMoney } from './money';
 import {
   countElapsedDays,
+  getEquivalentPreviousPeriodRange,
   getPeriodRange,
-  getPreviousPeriodRange,
   getTodayRange,
   isWithinRange,
   parseLocalDateTime,
@@ -103,7 +105,7 @@ export function calculateSpendingTrend(
       continue;
     }
     const date = toLocalDateKey(transaction.occurredAt);
-    totals.set(date, (totals.get(date) ?? 0) + transaction.amount);
+    totals.set(date, addMoney(totals.get(date) ?? 0, transaction.amount));
   }
   return [...totals.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
@@ -115,55 +117,52 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
   const adjustments = data.adjustments.filter(isPresent);
   const categoriesById = new Map(data.categories.filter(isPresent).map((category) => [category.id, category]));
 
-  const accountBalances = data.accounts
-    .filter(isPresent)
-    .sort((left, right) => left.sortOrder - right.sortOrder)
+  const accountBalances = sortByDisplayOrder(data.accounts.filter(isPresent))
     .map((account) => {
-      const transactionDelta = transactions.reduce((sum, transaction) => {
-        if (transaction.accountId !== account.id) return sum;
-        return sum + (transaction.type === 'income' ? transaction.amount : -transaction.amount);
-      }, 0);
-      const adjustmentDelta = adjustments
+      const transactionDelta = sumMoney(transactions
+        .filter((transaction) => transaction.accountId === account.id)
+        .map((transaction) => transaction.type === 'income' ? transaction.amount : -transaction.amount));
+      const adjustmentDelta = sumMoney(adjustments
         .filter((adjustment) => adjustment.accountId === account.id)
-        .reduce((sum, adjustment) => sum + adjustment.amountDelta, 0);
+        .map((adjustment) => adjustment.amountDelta));
       return {
         accountId: account.id,
         name: account.name,
-        balance: account.openingBalance + transactionDelta + adjustmentDelta,
+        balance: sumMoney([account.openingBalance, transactionDelta, adjustmentDelta]),
         isActive: account.isActive,
         includeInTotalAssets: account.includeInTotalAssets,
       };
     });
 
-  const income = transactions
+  const income = sumMoney(transactions
     .filter((transaction) => transaction.type === 'income')
-    .reduce((sum, transaction) => sum + transaction.amount, 0);
+    .map((transaction) => transaction.amount));
   const expenseTransactions = transactions.filter((transaction) => transaction.type === 'expense');
-  const expense = expenseTransactions.reduce((sum, transaction) => sum + transaction.amount, 0);
+  const expense = sumMoney(expenseTransactions.map((transaction) => transaction.amount));
   const expenseByCategoryMap = new Map<string, number>();
   for (const transaction of expenseTransactions) {
     expenseByCategoryMap.set(
       transaction.categoryId,
-      (expenseByCategoryMap.get(transaction.categoryId) ?? 0) + transaction.amount,
+      addMoney(expenseByCategoryMap.get(transaction.categoryId) ?? 0, transaction.amount),
     );
   }
 
-  const totalAssets = accountBalances
+  const totalAssets = sumMoney(accountBalances
     .filter((account) => account.isActive && account.includeInTotalAssets)
-    .reduce((sum, account) => sum + account.balance, 0);
-  const allocatedSavings = data.allocations
+    .map((account) => account.balance));
+  const allocatedSavings = sumMoney(data.allocations
     .filter(isPresent)
-    .reduce((sum, allocation) => sum + allocation.amountDelta, 0);
+    .map((allocation) => allocation.amountDelta));
 
   return {
     accountBalances,
     totalAssets,
     allocatedSavings,
-    availableAssets: totalAssets - allocatedSavings,
+    availableAssets: subtractMoney(totalAssets, allocatedSavings),
     allTime: {
       income,
       expense,
-      net: income - expense,
+      net: subtractMoney(income, expense),
       expenseByCategory: [...expenseByCategoryMap.entries()]
         .map(([categoryId, amount]) => ({
           categoryId,
@@ -172,7 +171,7 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
             ?? '未知分類',
           amount,
         }))
-        .sort((left, right) => right.amount - left.amount),
+        .sort((left, right) => compareMoney(right.amount, left.amount)),
     },
   };
 }
@@ -182,23 +181,23 @@ export function calculateInsights(data: FinanceData, options: InsightsOptions): 
   const todayTransactions = data.transactions.filter(
     (transaction) => isPresent(transaction) && isWithinRange(transaction.occurredAt, todayRange),
   );
-  const income = todayTransactions
+  const income = sumMoney(todayTransactions
     .filter((transaction) => transaction.type === 'income')
-    .reduce((sum, transaction) => sum + transaction.amount, 0);
+    .map((transaction) => transaction.amount));
   const expenses = todayTransactions.filter((transaction) => transaction.type === 'expense');
-  const expense = expenses.reduce((sum, transaction) => sum + transaction.amount, 0);
+  const expense = sumMoney(expenses.map((transaction) => transaction.amount));
   const categoriesById = new Map(data.categories.filter(isPresent).map((category) => [category.id, category]));
   const byCategory = new Map<string, number>();
   for (const transaction of expenses) {
-    byCategory.set(transaction.categoryId, (byCategory.get(transaction.categoryId) ?? 0) + transaction.amount);
+    byCategory.set(transaction.categoryId, addMoney(byCategory.get(transaction.categoryId) ?? 0, transaction.amount));
   }
-  const topEntry = [...byCategory.entries()].sort((left, right) => right[1] - left[1])[0];
+  const topEntry = [...byCategory.entries()].sort((left, right) => compareMoney(right[1], left[1]))[0];
   const topTransaction = topEntry
     ? expenses.find((transaction) => transaction.categoryId === topEntry[0])
     : undefined;
 
   const currentRange = getPeriodRange(options.period, options.reference, options.custom);
-  const previousRange = getPreviousPeriodRange(options.period, options.reference, options.custom);
+  const previousRange = getEquivalentPreviousPeriodRange(options.period, options.reference, options.custom);
   const period = summarizePeriod(data, currentRange, options.reference);
   const previousPeriod = summarizePeriod(data, previousRange, options.reference);
 
@@ -206,7 +205,7 @@ export function calculateInsights(data: FinanceData, options: InsightsOptions): 
     today: {
       income,
       expense,
-      net: income - expense,
+      net: subtractMoney(income, expense),
       topExpenseCategory: topEntry
         ? {
             categoryId: topEntry[0],
@@ -218,9 +217,9 @@ export function calculateInsights(data: FinanceData, options: InsightsOptions): 
     period,
     previousPeriod,
     comparison: {
-      incomeDelta: period.income - previousPeriod.income,
-      expenseDelta: period.expense - previousPeriod.expense,
-      netDelta: period.net - previousPeriod.net,
+      incomeDelta: subtractMoney(period.income, previousPeriod.income),
+      expenseDelta: subtractMoney(period.expense, previousPeriod.expense),
+      netDelta: subtractMoney(period.net, previousPeriod.net),
     },
   };
 }
@@ -229,15 +228,18 @@ function summarizePeriod(data: FinanceData, range: DateRange, reference: Date): 
   const transactions = data.transactions.filter(
     (transaction) => isPresent(transaction) && isWithinRange(transaction.occurredAt, range),
   );
-  const income = transactions
+  const income = sumMoney(transactions
     .filter((transaction) => transaction.type === 'income')
-    .reduce((sum, transaction) => sum + transaction.amount, 0);
+    .map((transaction) => transaction.amount));
   const expenses = transactions.filter((transaction) => transaction.type === 'expense');
-  const expense = expenses.reduce((sum, transaction) => sum + transaction.amount, 0);
+  const expense = sumMoney(expenses.map((transaction) => transaction.amount));
   const categoriesById = new Map(data.categories.filter(isPresent).map((category) => [category.id, category]));
   const categoryTotals = new Map<string, number>();
   for (const transaction of expenses) {
-    categoryTotals.set(transaction.categoryId, (categoryTotals.get(transaction.categoryId) ?? 0) + transaction.amount);
+    categoryTotals.set(
+      transaction.categoryId,
+      addMoney(categoryTotals.get(transaction.categoryId) ?? 0, transaction.amount),
+    );
   }
   const expenseByCategory = [...categoryTotals.entries()]
     .map(([categoryId, amount]) => ({
@@ -247,19 +249,21 @@ function summarizePeriod(data: FinanceData, range: DateRange, reference: Date): 
         ?? '未知分類',
       amount,
     }))
-    .sort((left, right) => right.amount - left.amount);
+    .sort((left, right) => compareMoney(right.amount, left.amount));
   const elapsedDays = countElapsedDays(range, reference);
 
   return {
     range,
     income,
     expense,
-    net: income - expense,
+    net: subtractMoney(income, expense),
     expenseByCategory,
     averageDailyExpense: elapsedDays > 0 ? expense / elapsedDays : 0,
-    savingsRate: income > 0 ? (income - expense) / income : null,
+    savingsRate: income > 0 ? subtractMoney(income, expense) / income : null,
     largestExpense: expenses.reduce<Transaction | null>(
-      (largest, transaction) => !largest || transaction.amount > largest.amount ? transaction : largest,
+      (largest, transaction) => !largest || compareMoney(transaction.amount, largest.amount) > 0
+        ? transaction
+        : largest,
       null,
     ),
   };

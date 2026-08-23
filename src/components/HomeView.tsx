@@ -3,16 +3,18 @@ import { AlertTriangle, Pencil, Plus, Scale, Trash2, WalletCards } from 'lucide-
 import type { BalanceAdjustment, FinanceData, Transaction } from '../domain/model';
 import { buildLedgerHistory, calculateFinancials } from '../domain/financeEngine';
 import { sortByDisplayOrder } from '../domain/displayOrder';
+import { subtractMoney } from '../domain/money';
 import { changedRecordMeta, newRecordMeta } from '../app/state';
 import { money, parseRequiredNumberInput, shortDate, toLocalInput } from '../app/format';
+import { completeAppliedMutation } from '../app/mutationResult';
 import { FinanceIcon } from './FinanceIcon';
 
 interface HomeViewProps {
   data: FinanceData;
   ownerId: string;
-  put(entity: 'transactions', record: Transaction): void;
-  putAdjustment(record: BalanceAdjustment): void;
-  deleteTransaction(record: Transaction): void;
+  put(entity: 'transactions', record: Transaction): boolean;
+  putAdjustment(record: BalanceAdjustment): boolean;
+  deleteTransaction(record: Transaction): boolean;
 }
 
 export function HomeView({ data, ownerId, put, putAdjustment, deleteTransaction }: HomeViewProps) {
@@ -57,7 +59,7 @@ export function HomeView({ data, ownerId, put, putAdjustment, deleteTransaction 
     const numericAmount = parseRequiredNumberInput(amount);
     const category = data.categories.find((item) => item.id === resolvedCategoryId);
     const account = accounts.find((item) => item.id === resolvedAccountId);
-    if (numericAmount === null || numericAmount <= 0) return setError('金額必須大於 0，且最多兩位小數');
+    if (numericAmount === null || numericAmount <= 0) return setError('金額必須大於 0、最多兩位小數，且須在可安全精確處理的範圍內');
     if (!category || !account) return setError('請先建立可用的帳戶與分類');
     if (!occurredAt) return setError('請選擇交易時間');
 
@@ -83,8 +85,7 @@ export function HomeView({ data, ownerId, put, putAdjustment, deleteTransaction 
       occurredAt,
       note: note.trim() || undefined,
     };
-    put('transactions', record);
-    resetForm();
+    completeAppliedMutation(put('transactions', record), resetForm, setError);
   };
 
   const beginEdit = (transaction: Transaction) => {
@@ -104,18 +105,20 @@ export function HomeView({ data, ownerId, put, putAdjustment, deleteTransaction 
     const account = summary.accountBalances.find((item) => item.accountId === accountIdToAdjust);
     const target = parseRequiredNumberInput(actualBalance);
     if (!account || target === null) return setAdjustmentError('請輸入有效的實際餘額');
-    const delta = target - account.balance;
+    const delta = subtractMoney(target, account.balance);
     if (delta === 0) return setAdjustmentError('實際餘額與系統餘額相同，不需校正');
-    putAdjustment({
+    const applied = putAdjustment({
       ...newRecordMeta(ownerId),
       accountId: account.accountId,
       amountDelta: delta,
       occurredAt: toLocalInput(),
       reason: adjustmentReason.trim() || '餘額校正',
     });
-    setActualBalance('');
-    setShowAdjustment(false);
-    setAdjustmentError('');
+    completeAppliedMutation(applied, () => {
+      setActualBalance('');
+      setShowAdjustment(false);
+      setAdjustmentError('');
+    }, setAdjustmentError);
   };
 
   const history = buildLedgerHistory(data);

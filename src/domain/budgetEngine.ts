@@ -1,5 +1,6 @@
 import { getPeriodRange, isWithinRange } from './dateRange';
 import type { FinanceData } from './model';
+import { subtractMoney, sumMoney } from './money';
 
 export interface BudgetUsage {
   budgetId: string;
@@ -35,12 +36,13 @@ export function calculateBudgetUsage(data: FinanceData, reference: Date): Budget
     .filter((budget) => !budget.deletedAt && budget.isActive)
     .map((budget) => {
       const range = getPeriodRange(budget.period === 'weekly' ? 'week' : 'month', reference);
-      const used = expenses
+      const used = sumMoney(expenses
         .filter((transaction) => (
           isWithinRange(transaction.occurredAt, range)
           && (budget.scope === 'overall' || transaction.categoryId === budget.categoryId)
         ))
-        .reduce((sum, transaction) => sum + transaction.amount, 0);
+        .map((transaction) => transaction.amount));
+      const limit = sumMoney([budget.amount]);
       return {
         budgetId: budget.id,
         scope: budget.scope,
@@ -49,11 +51,11 @@ export function calculateBudgetUsage(data: FinanceData, reference: Date): Budget
         name: budget.scope === 'overall'
           ? '總預算'
           : categories.get(budget.categoryId ?? '')?.name ?? budget.categoryName ?? '未知分類',
-        limit: budget.amount,
+        limit,
         used,
-        remaining: Math.max(budget.amount - used, 0),
-        overBy: Math.max(used - budget.amount, 0),
-        usageRatio: budget.amount > 0 ? used / budget.amount : 0,
+        remaining: Math.max(subtractMoney(limit, used), 0),
+        overBy: Math.max(subtractMoney(used, limit), 0),
+        usageRatio: limit > 0 ? used / limit : 0,
       };
     });
 }

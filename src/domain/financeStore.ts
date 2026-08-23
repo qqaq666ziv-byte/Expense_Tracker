@@ -1,4 +1,5 @@
 import { calculateFinancials } from './financeEngine';
+import { compareMoney } from './money';
 import { parseLocalDateTime } from './dateRange';
 import type { PersistedFinanceState, SavingsAllocation, Transaction } from './model';
 
@@ -150,7 +151,7 @@ export function createFinanceStore(
       if (!Number.isFinite(command.amount) || command.amount <= 0) {
         return { ok: false, code: 'INVALID_AMOUNT', message: '配置金額必須大於零' };
       }
-      if (command.amount > calculateFinancials(state.data).availableAssets) {
+      if (compareMoney(command.amount, calculateFinancials(state.data).availableAssets) > 0) {
         return { ok: false, code: 'INSUFFICIENT_AVAILABLE_ASSETS', message: '可配置資產不足' };
       }
 

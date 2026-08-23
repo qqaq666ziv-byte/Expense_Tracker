@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { AssetAccount, PendingOperation } from '../domain/model';
+import type { AssetAccount, PendingOperation, SavingsAllocation } from '../domain/model';
 import type { RemotePullResult } from '../domain/syncEngine';
 import { createSupabaseRemoteAdapter } from './supabaseRemote';
 
@@ -27,6 +27,28 @@ function operation(record: AssetAccount): PendingOperation {
   return {
     id: record.lastOperationId,
     entity: 'accounts',
+    recordId: record.id,
+    record,
+    attempts: 0,
+    queuedAt: NOW,
+  };
+}
+
+function allocationOperation(overrides: Partial<SavingsAllocation> = {}): PendingOperation {
+  const record: SavingsAllocation = {
+    id: 'allocation-over-capacity',
+    ownerId: 'user-a',
+    version: 1,
+    updatedAt: NOW,
+    lastOperationId: 'op-allocation-over-capacity',
+    goalId: 'goal-valid',
+    amountDelta: 300,
+    occurredAt: '2026-08-21T09:00',
+    ...overrides,
+  };
+  return {
+    id: record.lastOperationId,
+    entity: 'allocations',
     recordId: record.id,
     record,
     attempts: 0,
@@ -186,6 +208,12 @@ class FakeSupabaseClient {
   readonly auth: { getUser: () => Promise<{ data: { user: { id: string } | null }; error: null }> };
   readonly tables = new Map<string, Record<string, unknown>[]>();
   applyResponse?: (table: string, row: Record<string, unknown>) => Record<string, unknown>;
+  applyError?: (table: string, row: Record<string, unknown>) => {
+    code: string;
+    message: string;
+    details?: string;
+    hint?: string;
+  } | null;
 
   constructor(ownerId = 'user-a') {
     this.auth = {
@@ -207,12 +235,17 @@ class FakeSupabaseClient {
         upserted = row;
         return builder;
       },
-      single: async () => ({
-        data: upserted === undefined
+      single: async () => {
+        const error = upserted === undefined
           ? null
-          : (this.applyResponse?.(table, upserted) ?? upserted),
-        error: null,
-      }),
+          : (this.applyError?.(table, upserted) ?? null);
+        return {
+          data: error || upserted === undefined
+            ? null
+            : (this.applyResponse?.(table, upserted) ?? upserted),
+          error,
+        };
+      },
     };
     return builder;
   }
@@ -223,6 +256,38 @@ function asSupabaseClient(client: FakeSupabaseClient): SupabaseClient {
 }
 
 describe('Supabase remote adapter', () => {
+  it('maps allocation capacity rejection to a private actionable message', async () => {
+    const client = new FakeSupabaseClient();
+    client.applyError = () => ({
+      code: '23514',
+      message: 'new savings allocation exceeds available assets',
+      details: 'Failing row contains private financial values',
+    });
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const failure = await remote.apply('user-a', allocationOperation()).then(
+      () => undefined,
+      (error: unknown) => error as Error,
+    );
+
+    expect(failure?.message).toBe(
+      '雲端可配置資產不足。請先釋放既有儲蓄配置或增加資產後再重試。',
+    );
+  });
+
+  it('preserves the existing diagnostic for unrelated server constraints', async () => {
+    const client = new FakeSupabaseClient();
+    client.applyError = () => ({
+      code: '23514',
+      message: 'new row violates check constraint "some_other_constraint"',
+    });
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    await expect(remote.apply('user-a', allocationOperation())).rejects.toThrow(
+      'Unable to apply allocations/allocation-over-capacity to Supabase: 23514: new row violates check constraint "some_other_constraint"',
+    );
+  });
+
   it('keeps an operation pending when Supabase returns the same clock with a different payload', async () => {
     const client = new FakeSupabaseClient();
     client.applyResponse = (_table, row) => ({ ...row, name: 'Cloud value' });
@@ -427,7 +492,10 @@ describe('Supabase remote adapter', () => {
 
   it('isolates decoded rows whose cross-entity references are missing or the wrong kind', async () => {
     const client = new FakeSupabaseClient();
-    client.tables.set('accounts', [accountRow(account({ id: 'cash' }))]);
+    client.tables.set('accounts', [
+      accountRow(account({ id: 'cash' })),
+      accountRow(account({ id: 'archived-account', isActive: false })),
+    ]);
     client.tables.set('categories', [
       categoryRow('food', { kind: 'expense' }),
       categoryRow('salary', { kind: 'income' }),
@@ -439,6 +507,11 @@ describe('Supabase remote adapter', () => {
     ]);
     client.tables.set('recurring_rules', [
       recurringRow('broken-rule', { account_id: 'missing' }),
+      recurringRow('active-rule-with-archived-parent', { account_id: 'archived-account' }),
+      recurringRow('paused-rule-with-archived-parent', {
+        account_id: 'archived-account',
+        is_active: false,
+      }),
     ]);
     client.tables.set('savings_allocations', [
       allocationRow('missing-goal', { goal_id: 'missing' }),
@@ -447,11 +520,19 @@ describe('Supabase remote adapter', () => {
 
     const result = await remote.pull('user-a') as RemotePullResult;
 
-    expect(result.records.map(({ record }) => record.id)).toEqual(['cash', 'food', 'salary', 'valid-transaction']);
+    expect(result.records.map(({ record }) => record.id)).toEqual([
+      'cash',
+      'archived-account',
+      'food',
+      'salary',
+      'valid-transaction',
+      'paused-rule-with-archived-parent',
+    ]);
     expect(result.issues.map(({ stage, recordId }) => ({ stage, recordId }))).toEqual(expect.arrayContaining([
       { stage: 'validation', recordId: 'missing-account' },
       { stage: 'validation', recordId: 'wrong-kind' },
       { stage: 'validation', recordId: 'broken-rule' },
+      { stage: 'validation', recordId: 'active-rule-with-archived-parent' },
       { stage: 'validation', recordId: 'missing-goal' },
     ]));
   });

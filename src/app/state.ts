@@ -64,6 +64,20 @@ export function createInitialData(ownerId: OwnerId): FinanceData {
   };
 }
 
+function createEmptyData(): FinanceData {
+  return {
+    accounts: [],
+    categories: [],
+    transactions: [],
+    adjustments: [],
+    goals: [],
+    allocations: [],
+    budgets: [],
+    recurringRules: [],
+    settings: { currency: 'TWD', locale: 'zh-TW' },
+  };
+}
+
 export function createInitialState(ownerId: OwnerId): PersistedFinanceState {
   let state: PersistedFinanceState = {
     schemaVersion: 3,
@@ -103,16 +117,40 @@ export function loadFinanceStateWithRecovery(
   storage: Pick<Storage, 'getItem'> = localStorage,
 ): LoadedFinanceState {
   const key = storageKey(ownerId);
-  const raw = storage.getItem(key);
+  let raw: string | null;
+  try {
+    raw = storage.getItem(key);
+  } catch (error) {
+    console.warn('無法讀取本機財務快照；已停止自動覆寫。', error);
+    return {
+      state: createInitialState(ownerId),
+      recovery: {
+        key,
+        raw: '',
+        message: `瀏覽器拒絕讀取本機財務快照：${error instanceof Error ? error.message : String(error)}`,
+      },
+    };
+  }
   if (!raw) {
     try {
       return { state: loadLegacyState(ownerId, storage) ?? createInitialState(ownerId) };
     } catch (error) {
-      const entries = Object.fromEntries(legacyStorageKeys(ownerId).map((legacyKey) => [
-        legacyKey,
-        storage.getItem(legacyKey),
-      ]));
-      const recoverableRaw = JSON.stringify({ format: 'legacy-localStorage-recovery', ownerId, entries }, null, 2);
+      let recoverableRaw: string;
+      try {
+        const entries = Object.fromEntries(legacyStorageKeys(ownerId).map((legacyKey) => [
+          legacyKey,
+          storage.getItem(legacyKey),
+        ]));
+        recoverableRaw = JSON.stringify({ format: 'legacy-localStorage-recovery', ownerId, entries }, null, 2);
+      } catch (recoveryReadError) {
+        recoverableRaw = JSON.stringify({
+          format: 'legacy-localStorage-recovery-unavailable',
+          ownerId,
+          message: recoveryReadError instanceof Error
+            ? recoveryReadError.message
+            : String(recoveryReadError),
+        }, null, 2);
+      }
       console.warn('舊版資料遷移驗證失敗；原始 localStorage 保持不變。', error);
       return {
         state: createInitialState(ownerId),
@@ -150,6 +188,49 @@ export function loadFinanceStateWithRecovery(
         || JSON.stringify(currentRecord) !== JSON.stringify(operation.record)) {
         throw new Error('outbox does not match the current local record');
       }
+    }
+    if (parsed.legacyBootstrap !== undefined) {
+      const bootstrap = parsed.legacyBootstrap;
+      if (!bootstrap || typeof bootstrap !== 'object'
+        || (bootstrap.status !== 'pending' && bootstrap.status !== 'ready')
+        || !Array.isArray(bootstrap.unsyncedTransactionIds)
+        || !bootstrap.candidate) {
+        throw new Error('invalid authenticated legacy bootstrap');
+      }
+      validateFinanceData(bootstrap.candidate, 'authenticated legacy candidate');
+      for (const entity of entityNames) {
+        if (bootstrap.candidate[entity].some((record) => record.ownerId !== ownerId)) {
+          throw new Error(`foreign owner in authenticated legacy candidate ${entity}`);
+        }
+      }
+      const transactionIds = new Set(bootstrap.candidate.transactions.map((record) => record.id));
+      const unsyncedIds = new Set<string>();
+      for (const id of bootstrap.unsyncedTransactionIds) {
+        if (typeof id !== 'string' || id.length === 0 || !transactionIds.has(id) || unsyncedIds.has(id)) {
+          throw new Error('invalid unsynced transaction in authenticated legacy candidate');
+        }
+        unsyncedIds.add(id);
+      }
+      if (bootstrap.status === 'pending' && parsed.outbox.length > 0) {
+        throw new Error('pending authenticated legacy bootstrap cannot contain remote operations');
+      }
+    } else if (ownerId !== 'guest' && parsed.migratedFromLegacy === true) {
+      // Recover snapshots produced by the pre-fix v3 migration path. Those
+      // snapshots queued the entire legacy cache, so demote the graph back to a
+      // review candidate before any subsequent launch can apply it remotely.
+      return {
+        state: {
+          ...parsed,
+          data: createEmptyData(),
+          outbox: [],
+          lastSyncedAt: undefined,
+          legacyBootstrap: {
+            status: 'pending',
+            candidate: parsed.data,
+            unsyncedTransactionIds: [],
+          },
+        },
+      };
     }
     return { state: parsed };
   } catch (error) {
@@ -213,20 +294,28 @@ function loadLegacyState(
   if (!hasLegacyData) return null;
 
   const migrated = migrateLegacyData(source, { ownerId, migratedAt: new Date() });
-  let state: PersistedFinanceState = {
+  const unsyncedTransactionIds = source.transactions.flatMap((record, index) => (
+    record !== null
+      && typeof record === 'object'
+      && !Array.isArray(record)
+      && (record as Record<string, unknown>).synced === false
+      ? [migrated.transactions[index].id]
+      : []
+  ));
+  const state: PersistedFinanceState = {
     schemaVersion: 3,
     ownerId,
-    data: migrated,
+    data: ownerId === 'guest' ? migrated : createEmptyData(),
     outbox: [],
     migratedFromLegacy: true,
+    ...(ownerId === 'guest' ? {} : {
+      legacyBootstrap: {
+        status: 'pending' as const,
+        candidate: migrated,
+        unsyncedTransactionIds,
+      },
+    }),
   };
-  if (ownerId !== 'guest') {
-    for (const entity of entityNames) {
-      for (const record of migrated[entity] as FinanceData[typeof entity][number][]) {
-        state = enqueueSyncRecord(state, entity, record);
-      }
-    }
-  }
   return state;
 }
 
@@ -271,6 +360,21 @@ export function canAutoSaveFinanceState(
   recovery?: LocalStateRecovery,
 ): boolean {
   return state.ownerId === activeOwnerId && recovery?.key !== storageKey(state.ownerId);
+}
+
+/**
+ * Advance the non-React mutation source before scheduling a render. React may
+ * batch state setters, so using the last rendered value as the next mutation
+ * base can otherwise lose an outbox operation when two commands run in one
+ * event-loop turn (for example, a put immediately followed by restore).
+ */
+export function advanceFinanceStateRef(
+  ref: { current: PersistedFinanceState },
+  update: (current: PersistedFinanceState) => PersistedFinanceState,
+): PersistedFinanceState {
+  const next = update(ref.current);
+  ref.current = next;
+  return next;
 }
 
 export const entityNames: readonly FinanceEntityName[] = [

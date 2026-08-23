@@ -38,9 +38,43 @@ const TABLE_BY_ENTITY: Record<FinanceEntityName, string> = {
 
 const ENTITY_NAMES = Object.keys(TABLE_BY_ENTITY) as FinanceEntityName[];
 
-function errorText(error: { code?: string; message?: string } | null, context: string): string {
+interface SupabaseErrorDiagnostic {
+  code?: string;
+  message?: string;
+  details?: string;
+  hint?: string;
+  constraint?: string;
+}
+
+function errorText(error: SupabaseErrorDiagnostic | null, context: string): string {
   const details = [error?.code, error?.message].filter(Boolean).join(': ');
   return details ? `${context}: ${details}` : context;
+}
+
+function applyErrorText(
+  error: SupabaseErrorDiagnostic | null,
+  operation: PendingOperation,
+): string {
+  const constraintDiagnostics = [
+    error?.constraint,
+    error?.message,
+    error?.details,
+    error?.hint,
+  ];
+  if (
+    operation.entity === 'allocations'
+    && error?.code === '23514'
+    && constraintDiagnostics.some((value) => (
+      value?.includes('finance_v3_allocation_capacity')
+      || value?.includes('new savings allocation exceeds available assets')
+    ))
+  ) {
+    return '雲端可配置資產不足。請先釋放既有儲蓄配置或增加資產後再重試。';
+  }
+  return errorText(
+    error,
+    `Unable to apply ${operation.entity}/${operation.recordId} to Supabase`,
+  );
 }
 
 function requiredString(row: DatabaseRow, column: string): string {
@@ -555,9 +589,12 @@ async function pullEntity(
  * persisted FinanceData snapshot fail closed on its next reload.
  */
 function validateRemoteGraph(records: readonly RemoteRecord[]): RemotePullResult {
-  const accountIds = new Set(
-    records.filter((entry) => entry.entity === 'accounts').map((entry) => entry.record.id),
+  const accounts = new Map(
+    records
+      .filter((entry): entry is Extract<RemoteRecord, { entity: 'accounts' }> => entry.entity === 'accounts')
+      .map((entry) => [entry.record.id, entry.record]),
   );
+  const accountIds = new Set(accounts.keys());
   const categories = new Map(
     records
       .filter((entry): entry is Extract<RemoteRecord, { entity: 'categories' }> => entry.entity === 'categories')
@@ -570,8 +607,15 @@ function validateRemoteGraph(records: readonly RemoteRecord[]): RemotePullResult
   const invalidRecurringIds = new Set<string>();
   for (const entry of records) {
     if (entry.entity !== 'recurringRules') continue;
+    const account = accounts.get(entry.record.accountId);
     const category = categories.get(entry.record.categoryId);
-    if (!accountIds.has(entry.record.accountId) || category?.kind !== entry.record.type) {
+    if (!account || category?.kind !== entry.record.type
+      || (entry.record.isActive && (
+        account.deletedAt !== undefined
+        || !account.isActive
+        || category.deletedAt !== undefined
+        || !category.isActive
+      ))) {
       invalidRecurringIds.add(entry.record.id);
     }
   }
@@ -609,10 +653,16 @@ function validateRemoteGraph(records: readonly RemoteRecord[]): RemotePullResult
         }
         break;
       case 'recurringRules': {
+        const account = accounts.get(entry.record.accountId);
         const category = categories.get(entry.record.categoryId);
-        if (!accountIds.has(entry.record.accountId)) reason = 'references a missing account';
+        if (!account) reason = 'references a missing account';
         else if (!category) reason = 'references a missing category';
         else if (category.kind !== entry.record.type) reason = 'references a category with the wrong kind';
+        else if (entry.record.isActive && (account.deletedAt || !account.isActive)) {
+          reason = 'is active while its account is unavailable';
+        } else if (entry.record.isActive && (category.deletedAt || !category.isActive)) {
+          reason = 'is active while its category is unavailable';
+        }
         break;
       }
       case 'accounts':
@@ -680,7 +730,7 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
         .select('*')
         .single();
       if (error) {
-        throw new Error(errorText(error, `Unable to apply ${operation.entity}/${operation.recordId} to Supabase`));
+        throw new Error(applyErrorText(error, operation));
       }
       if (!data || typeof data !== 'object') {
         throw new Error(`Supabase did not return the persisted ${operation.entity}/${operation.recordId}`);

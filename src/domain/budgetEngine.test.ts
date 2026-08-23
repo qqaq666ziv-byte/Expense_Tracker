@@ -78,4 +78,26 @@ describe('budget engine', () => {
       lastOperationId: 'update-overall',
     }]);
   });
+
+  it('does not report a cent-level overrun when 0.10 plus 0.20 meets a 0.30 budget', () => {
+    const transactions = [0.1, 0.2].map((amount, index) => ({
+      id: `expense-${index}`, ownerId: 'guest', amount, type: 'expense' as const,
+      categoryId: 'food', categoryName: '餐飲', accountId: 'cash', accountName: '現金',
+      occurredAt: '2026-08-21 12:00', version: 1,
+      updatedAt: '2026-08-21T04:00:00.000Z', lastOperationId: `fixture-${index}`,
+    }));
+    const budget: Budget = {
+      id: 'decimal-budget', ownerId: 'guest', scope: 'overall', period: 'monthly', amount: 0.3,
+      isActive: true, version: 1, updatedAt: '2026-08-01T00:00:00.000Z', lastOperationId: 'fixture',
+    };
+    const data: FinanceData = {
+      accounts: [], categories: [], transactions, adjustments: [], goals: [], allocations: [],
+      budgets: [budget], recurringRules: [], settings: { currency: 'TWD', locale: 'zh-TW' },
+    };
+
+    expect(calculateBudgetUsage(data, new Date(2026, 7, 21, 15))).toEqual([{
+      budgetId: 'decimal-budget', scope: 'overall', period: 'monthly', name: '總預算',
+      limit: 0.3, used: 0.3, remaining: 0, overBy: 0, usageRatio: 1,
+    }]);
+  });
 });

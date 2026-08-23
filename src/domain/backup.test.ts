@@ -1,10 +1,12 @@
-import { describe, expect, it } from 'vitest';
-import type { FinanceData } from './model';
+import { describe, expect, it, vi } from 'vitest';
+import type { FinanceData, PersistedFinanceState } from './model';
+import { applyRestoredData } from '../app/state';
+import { syncFinanceState, type RemoteAdapter } from './syncEngine';
 import {
   createFinanceBackup,
   exportFinanceBackup,
   exportTransactionsCsv,
-  MAX_BACKUP_CHARACTERS,
+  MAX_BACKUP_BYTES,
   parseFinanceBackup,
   restoreFinanceBackup,
 } from './backup';
@@ -82,6 +84,53 @@ describe('versioned finance backup', () => {
     ));
   });
 
+  it('rejects an export whose UTF-8 bytes exceed the limit even when its character count does not', () => {
+    const multibyteData = structuredClone(fixture);
+    multibyteData.transactions = Array.from({ length: 150 }, (_, index) => ({
+      ...fixture.transactions[0],
+      id: `multibyte-transaction-${index}`,
+      note: '中🙂'.repeat(5_000),
+      lastOperationId: `multibyte-operation-${index}`,
+    }));
+    const serialized = JSON.stringify(
+      createFinanceBackup(multibyteData, '2026-08-21T10:00:00.000Z'),
+      null,
+      2,
+    );
+
+    expect(serialized.length).toBeLessThan(MAX_BACKUP_BYTES);
+    expect(new TextEncoder().encode(serialized).byteLength).toBeGreaterThan(MAX_BACKUP_BYTES);
+    expect(() => exportFinanceBackup(multibyteData, '2026-08-21T10:00:00.000Z'))
+      .toThrow(/byte safety limit/i);
+  });
+
+  it('rejects an imported JSON string by UTF-8 bytes before parsing its structure', () => {
+    const serialized = JSON.stringify({
+      note: '中'.repeat(Math.ceil(MAX_BACKUP_BYTES / 3)),
+    });
+
+    expect(serialized.length).toBeLessThan(MAX_BACKUP_BYTES);
+    expect(new TextEncoder().encode(serialized).byteLength).toBeGreaterThan(MAX_BACKUP_BYTES);
+    expect(() => parseFinanceBackup(serialized)).toThrow(/byte safety limit/i);
+  });
+
+  it('short-circuits an oversized character count before allocating a UTF-8 buffer', () => {
+    const encode = vi.fn(() => {
+      throw new Error('TextEncoder must not run for an already oversized string');
+    });
+    vi.stubGlobal('TextEncoder', class {
+      encode = encode;
+    });
+
+    try {
+      expect(() => parseFinanceBackup(' '.repeat(MAX_BACKUP_BYTES + 1)))
+        .toThrow(/byte safety limit/i);
+      expect(encode).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('rejects malformed structure and unsupported versions without mutating current data', () => {
     const current = structuredClone(fixture);
     const before = structuredClone(current);
@@ -101,7 +150,18 @@ describe('versioned finance backup', () => {
   });
 
   it('rejects oversized input and unsafe numeric values before mutation', () => {
-    expect(() => parseFinanceBackup(' '.repeat(MAX_BACKUP_CHARACTERS + 1))).toThrow(/safety limit/i);
+    expect(() => parseFinanceBackup(' '.repeat(MAX_BACKUP_BYTES + 1))).toThrow(/safety limit/i);
+    const oversizedExport = structuredClone(fixture);
+    oversizedExport.transactions = Array.from(
+      { length: Math.ceil(MAX_BACKUP_BYTES / 20_000) + 1 },
+      (_, index) => ({
+        ...fixture.transactions[0],
+        id: `oversized-transaction-${index}`,
+        note: 'x'.repeat(20_000),
+        lastOperationId: `oversized-operation-${index}`,
+      }),
+    );
+    expect(() => exportFinanceBackup(oversizedExport)).toThrow(/was not exported/i);
     const unsafe = structuredClone(fixture);
     unsafe.transactions[0].amount = Number.MAX_SAFE_INTEGER + 1;
     expect(() => createFinanceBackup(unsafe)).toThrow(/safe numeric range/i);
@@ -131,7 +191,74 @@ describe('versioned finance backup', () => {
     const invalidAnchor = createFinanceBackup(fixture);
     invalidAnchor.data.recurringRules[0].anchorDay = 32;
     expect(() => parseFinanceBackup(invalidAnchor)).toThrow(/anchorDay/i);
+
+    const dateTimeRuleStart = createFinanceBackup(fixture);
+    dateTimeRuleStart.data.recurringRules[0].startDate = '2026-08-21T00:00:00Z';
+    expect(() => parseFinanceBackup(dateTimeRuleStart)).toThrow(/startDate.*date-only/i);
+
+    const dateTimeNextOccurrence = createFinanceBackup(fixture);
+    dateTimeNextOccurrence.data.recurringRules[0].nextOccurrenceDate = '2026-09-21T00:00:00Z';
+    expect(() => parseFinanceBackup(dateTimeNextOccurrence)).toThrow(/nextOccurrenceDate.*date-only/i);
+
+    const dateTimeOccurrence = createFinanceBackup(fixture);
+    dateTimeOccurrence.data.transactions[0].recurringRuleId = 'recurring-lunch';
+    dateTimeOccurrence.data.transactions[0].occurrenceDate = '2026-08-21T00:00:00Z';
+    expect(() => parseFinanceBackup(dateTimeOccurrence)).toThrow(/occurrenceDate.*date-only/i);
+
+    const dateTimeGoalTarget = createFinanceBackup(fixture);
+    dateTimeGoalTarget.data.goals[0].targetDate = '2028-02-29T00:00:00Z';
+    expect(() => parseFinanceBackup(dateTimeGoalTarget)).toThrow(/targetDate.*date-only/i);
   });
+
+  it.each(['adjustments', 'allocations'] as const)(
+    'rejects a zero %s delta before a restored backup can enqueue remote writes',
+    async (entity) => {
+      const incoming = structuredClone(fixture);
+      for (const records of [
+        incoming.accounts,
+        incoming.categories,
+        incoming.transactions,
+        incoming.adjustments,
+        incoming.goals,
+        incoming.allocations,
+        incoming.budgets,
+        incoming.recurringRules,
+      ]) {
+        records.forEach((record) => { record.ownerId = 'user-a'; });
+      }
+      incoming[entity][0].amountDelta = 0;
+      const backup = {
+        schemaVersion: 1,
+        exportedAt: '2026-08-21T10:00:00.000Z',
+        data: incoming,
+      };
+      const current: PersistedFinanceState = {
+        schemaVersion: 3,
+        ownerId: 'user-a',
+        data: emptyData(),
+        outbox: [],
+      };
+      let applyCount = 0;
+      const remote: RemoteAdapter = {
+        apply: async () => { applyCount += 1; },
+        pull: async () => [],
+      };
+
+      const restoreThenSync = async () => {
+        const restored = restoreFinanceBackup(current.data, backup, { ownerId: 'user-a' });
+        const queued = applyRestoredData(
+          current,
+          restored,
+          new Date('2026-08-21T10:00:00.000Z'),
+          () => 'restore-operation',
+        );
+        await syncFinanceState(queued, 'user-a', remote);
+      };
+
+      await expect(restoreThenSync()).rejects.toThrow(new RegExp(`${entity}.*amountDelta`, 'i'));
+      expect(applyCount).toBe(0);
+    },
+  );
 
   it('rejects duplicate identifiers and broken or semantically wrong references', () => {
     const missingAccount = createFinanceBackup(fixture);

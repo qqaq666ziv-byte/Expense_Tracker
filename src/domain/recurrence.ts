@@ -1,8 +1,23 @@
 import type { RecurringRule, Transaction } from './model';
 
+export const MAX_RECURRING_CATCH_UP_OCCURRENCES = 500;
+
+export interface RecurrenceCatchUpLimit {
+  maximumOccurrences: number;
+  overflowOccurrenceDate: string;
+}
+
+export interface RecurrenceCatchUpStatus {
+  blocked: boolean;
+  occurrenceCount: number;
+  maximumOccurrences: number;
+  overflowOccurrenceDate?: string;
+}
+
 export interface RecurrenceCatchUpResult {
   transactions: Transaction[];
   nextOccurrenceDate: string;
+  blockedByLimit?: RecurrenceCatchUpLimit;
 }
 
 interface CalendarDate {
@@ -21,7 +36,7 @@ function parseDate(value: string): CalendarDate {
   const year = Number(yearText);
   const month = Number(monthText);
   const day = Number(dayText);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
+  const parsed = new Date(toTimestamp({ year, month, day }));
   if (
     parsed.getUTCFullYear() !== year
     || parsed.getUTCMonth() !== month - 1
@@ -34,7 +49,10 @@ function parseDate(value: string): CalendarDate {
 }
 
 function toTimestamp(value: CalendarDate): number {
-  return Date.UTC(value.year, value.month - 1, value.day);
+  const date = new Date(0);
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCFullYear(value.year, value.month - 1, value.day);
+  return date.getTime();
 }
 
 function formatDate(value: CalendarDate): string {
@@ -51,7 +69,10 @@ function addWeeklyOccurrences(startDate: CalendarDate, count: number): CalendarD
 }
 
 function daysInMonth(year: number, month: number): number {
-  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const date = new Date(0);
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCFullYear(year, month, 0);
+  return date.getUTCDate();
 }
 
 function addMonthlyOccurrences(startDate: CalendarDate, count: number, anchorDay = startDate.day): CalendarDate {
@@ -129,17 +150,54 @@ function getActiveCursor(rule: RecurringRule): string {
   return firstOccurrenceOnOrAfter(rule, requestedDate);
 }
 
-export function getRecurringOccurrenceDates(rule: RecurringRule, throughDate: string): string[] {
-  parseDate(throughDate);
-  if (!rule.isActive || rule.deletedAt) return [];
+interface RecurrenceWindow {
+  occurrenceDates: string[];
+  blockedByLimit?: RecurrenceCatchUpLimit;
+}
 
-  const occurrences: string[] = [];
+function collectRecurringOccurrenceDates(rule: RecurringRule, throughDate: string): RecurrenceWindow {
+  parseDate(throughDate);
+  if (!rule.isActive || rule.deletedAt) return { occurrenceDates: [] };
+
+  const occurrenceDates: string[] = [];
   let occurrenceDate = getActiveCursor(rule);
   while (occurrenceDate <= throughDate) {
-    occurrences.push(occurrenceDate);
+    if (occurrenceDates.length === MAX_RECURRING_CATCH_UP_OCCURRENCES) {
+      return {
+        occurrenceDates,
+        blockedByLimit: {
+          maximumOccurrences: MAX_RECURRING_CATCH_UP_OCCURRENCES,
+          overflowOccurrenceDate: occurrenceDate,
+        },
+      };
+    }
+    occurrenceDates.push(occurrenceDate);
     occurrenceDate = getNextOccurrenceDate(rule, occurrenceDate);
   }
-  return occurrences;
+  return { occurrenceDates };
+}
+
+export function getRecurringCatchUpStatus(
+  rule: RecurringRule,
+  throughDate: string,
+): RecurrenceCatchUpStatus {
+  const result = collectRecurringOccurrenceDates(rule, throughDate);
+  return {
+    blocked: Boolean(result.blockedByLimit),
+    occurrenceCount: result.occurrenceDates.length,
+    maximumOccurrences: MAX_RECURRING_CATCH_UP_OCCURRENCES,
+    overflowOccurrenceDate: result.blockedByLimit?.overflowOccurrenceDate,
+  };
+}
+
+export function getRecurringOccurrenceDates(rule: RecurringRule, throughDate: string): string[] {
+  const result = collectRecurringOccurrenceDates(rule, throughDate);
+  if (result.blockedByLimit) {
+    throw new Error(
+      `Recurring catch-up exceeds the ${result.blockedByLimit.maximumOccurrences} occurrence safety limit`,
+    );
+  }
+  return result.occurrenceDates;
 }
 
 function createTransaction(rule: RecurringRule, occurrenceDate: string): Transaction {
@@ -177,6 +235,19 @@ export function catchUpRecurringTransactions(
     return { transactions: [], nextOccurrenceDate: cursor };
   }
 
+  if (!Number.isFinite(rule.amount) || rule.amount <= 0) {
+    throw new Error('Recurring transaction amount must be a positive finite number');
+  }
+
+  const recurrenceWindow = collectRecurringOccurrenceDates(rule, throughDate);
+  if (recurrenceWindow.blockedByLimit) {
+    return {
+      transactions: [],
+      nextOccurrenceDate: rule.nextOccurrenceDate,
+      blockedByLimit: recurrenceWindow.blockedByLimit,
+    };
+  }
+
   const existingKeys = new Set(existingTransactions
     .filter((transaction) => transaction.ownerId === rule.ownerId)
     .flatMap((transaction) => {
@@ -187,7 +258,7 @@ export function catchUpRecurringTransactions(
       return keys;
     }));
   const transactions: Transaction[] = [];
-  const occurrenceDates = getRecurringOccurrenceDates(rule, throughDate);
+  const { occurrenceDates } = recurrenceWindow;
   for (const occurrenceDate of occurrenceDates) {
     const id = occurrenceId(rule.id, occurrenceDate);
     if (!existingKeys.has(id)) transactions.push(createTransaction(rule, occurrenceDate));

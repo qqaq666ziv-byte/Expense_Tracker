@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   countElapsedDays,
+  getEquivalentPreviousPeriodRange,
   getPeriodRange,
   getPreviousPeriodRange,
   getTodayRange,
@@ -71,6 +72,21 @@ describe('calendar date range', () => {
     expect([previous.end.getMonth(), previous.end.getDate()]).toEqual([6, 31]);
     expect(countElapsedDays(current, reference)).toBe(21);
     expect(countElapsedDays(previous, reference)).toBe(31);
+  });
+
+  it('caps an in-progress previous month to the same elapsed included days', () => {
+    const previous = getEquivalentPreviousPeriodRange('month', new Date(2026, 7, 23, 12));
+
+    expect([previous.start.getMonth(), previous.start.getDate()]).toEqual([6, 1]);
+    expect([previous.end.getMonth(), previous.end.getDate()]).toEqual([6, 23]);
+  });
+
+  it('clamps short previous months and preserves elapsed-day equivalence across leap years', () => {
+    const shortMonth = getEquivalentPreviousPeriodRange('month', new Date(2026, 2, 31, 12));
+    const leapYear = getEquivalentPreviousPeriodRange('year', new Date(2028, 1, 29, 12));
+
+    expect([shortMonth.end.getMonth(), shortMonth.end.getDate()]).toEqual([1, 28]);
+    expect([leapYear.end.getMonth(), leapYear.end.getDate()]).toEqual([2, 1]);
   });
 
   it('returns an inline-safe validation result when a custom date is cleared', () => {

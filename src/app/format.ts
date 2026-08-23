@@ -1,4 +1,5 @@
 import { parseLocalDateTime } from '../domain/dateRange';
+import { toMinorUnits } from '../domain/money';
 
 export const money = new Intl.NumberFormat('zh-TW', {
   style: 'currency',
@@ -21,7 +22,17 @@ export function parseRequiredNumberInput(value: string): number | null {
   const normalized = value.trim();
   if (!/^-?(?:\d+|\d*\.\d{1,2})$/.test(normalized)) return null;
   const parsed = Number(normalized);
-  return Number.isFinite(parsed) && Math.abs(parsed) <= Number.MAX_SAFE_INTEGER ? parsed : null;
+  if (!Number.isFinite(parsed) || Math.abs(parsed) > Number.MAX_SAFE_INTEGER) return null;
+
+  const negative = normalized.startsWith('-');
+  const [whole, fraction = ''] = (negative ? normalized.slice(1) : normalized).split('.');
+  const exactMinorUnits = BigInt(whole || '0') * 100n
+    + BigInt(fraction.padEnd(2, '0'));
+  const signedExactMinorUnits = negative && exactMinorUnits !== 0n
+    ? -exactMinorUnits
+    : exactMinorUnits;
+
+  return toMinorUnits(parsed) === signedExactMinorUnits ? parsed : null;
 }
 
 export function shortDate(value: string): string {

@@ -8,11 +8,16 @@ import type {
   SyncRecord,
 } from '../domain/model';
 import { catchUpRecurringTransactions } from '../domain/recurrence';
-import { syncFinanceState, type SyncReport } from '../domain/syncEngine';
+import { recurringRuleParentIssue } from '../domain/recurringSafety';
+import type { SyncReport } from '../domain/syncEngine';
 import { createSupabaseRemoteAdapter } from '../data/supabaseRemote';
 import {
+  restoreFinanceStateAndClearRecovery,
+  syncFinanceStateUnlessRecovering,
+} from './safeSync';
+import {
   applySyncCompletion,
-  applyRestoredData,
+  advanceFinanceStateRef,
   canAutoSaveFinanceState,
   changedRecordMeta,
   guestSnapshotFingerprint,
@@ -36,15 +41,152 @@ export interface FinanceAppController {
   storageError?: string;
   storageRecovery?: LocalStateRecovery;
   guestImportNotice?: string;
+  legacyBootstrapNotice?: string;
+  safetyNotice?: string;
   hasSeparateGuestData: boolean;
   dismissGuestImport(): void;
   importGuestData(): void;
+  importLegacyCandidate(): void;
+  keepCloudData(): void;
   setData(data: FinanceData): void;
-  put<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): void;
-  softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): void;
+  put<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
+  softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
   syncNow(): Promise<void>;
   signIn(): Promise<void>;
   signOut(): Promise<void>;
+}
+
+export type LegacyBootstrapDecision = 'import-candidate' | 'keep-cloud';
+
+export interface OwnerActionContext {
+  ownerId: string;
+  generation: number;
+}
+
+/** Clear every recovery-only UI signal after the replacement snapshot is durably persisted. */
+export function clearSuccessfulRecoveryUiState(
+  recoveryRef: { current: LocalStateRecovery | undefined },
+  setRecovery: (value: LocalStateRecovery | undefined) => void,
+  setSafetyNotice: (value: string | undefined) => void,
+): void {
+  recoveryRef.current = undefined;
+  setRecovery(undefined);
+  setSafetyNotice(undefined);
+}
+
+/** Reject callbacks retained by a render that is no longer the active owner. */
+export function assertCurrentOwnerContext(
+  expected: OwnerActionContext,
+  activeOwnerId: string,
+  stateOwnerId: string,
+  currentGeneration: number,
+): void {
+  if (
+    expected.ownerId !== activeOwnerId
+    || expected.ownerId !== stateOwnerId
+    || expected.generation !== currentGeneration
+  ) {
+    throw new Error('帳號已切換；舊畫面的操作未執行');
+  }
+}
+
+/**
+ * Resolve a reviewed legacy candidate only after its cloud-first pull. Both
+ * decisions durably remove the bootstrap marker before callers update React
+ * memory; import additionally uses the same restore path as a JSON backup so
+ * every accepted record receives a fresh, retryable operation clock.
+ */
+export function resolveLegacyBootstrapState(
+  state: PersistedFinanceState,
+  decision: LegacyBootstrapDecision,
+  persist: (next: PersistedFinanceState) => void,
+  clearRecovery: () => void,
+): PersistedFinanceState {
+  const bootstrap = state.legacyBootstrap;
+  if (bootstrap?.status !== 'ready') {
+    throw new Error('legacy candidate decisions require a completed cloud-first pull');
+  }
+  const resolvedBase: PersistedFinanceState = {
+    ...state,
+    migratedFromLegacy: undefined,
+    legacyBootstrap: undefined,
+  };
+  if (decision === 'keep-cloud') {
+    persist(resolvedBase);
+    return resolvedBase;
+  }
+  return restoreFinanceStateAndClearRecovery(
+    resolvedBase,
+    bootstrap.candidate,
+    persist,
+    clearRecovery,
+  );
+}
+
+/**
+ * An ordinary JSON restore is a separate destructive decision. Do not let it
+ * race with, or be silently superseded by, an unresolved legacy candidate.
+ */
+export function restoreFinanceStateUnlessLegacyBootstrap(
+  state: PersistedFinanceState,
+  data: FinanceData,
+  persist: (next: PersistedFinanceState) => void,
+  clearRecovery: () => void,
+): PersistedFinanceState {
+  if (state.legacyBootstrap) {
+    throw new Error('請先完成舊版候選資料決策，再執行一般備份還原');
+  }
+  return restoreFinanceStateAndClearRecovery(state, data, persist, clearRecovery);
+}
+
+/**
+ * A malformed local snapshot is the recoverable source of truth until the
+ * user completes a durable restore. Never expose an in-memory mutation that
+ * autosave is intentionally forbidden to persist while that lock is active.
+ */
+export function applyFinanceMutationUnlessRecovering(
+  state: PersistedFinanceState,
+  recovery: LocalStateRecovery | undefined,
+  mutate: (current: PersistedFinanceState) => PersistedFinanceState,
+): PersistedFinanceState {
+  return recovery ? state : mutate(state);
+}
+
+export function materializeRecurringTransactionsUnlessRecovering(
+  state: PersistedFinanceState,
+  calendarDay: string,
+  recovery: LocalStateRecovery | undefined,
+): PersistedFinanceState {
+  return applyFinanceMutationUnlessRecovering(state, recovery, (current) => {
+    if (current.legacyBootstrap?.status === 'pending') return current;
+    let next = current;
+    let changed = false;
+    for (const rule of current.data.recurringRules.filter((item) => !item.deletedAt && item.isActive)) {
+      if (recurringRuleParentIssue(next.data, rule)) {
+        next = putRecord(next, 'recurringRules', {
+          ...rule,
+          ...changedRecordMeta(rule),
+          isActive: false,
+        });
+        changed = true;
+        continue;
+      }
+      const result = catchUpRecurringTransactions(rule, calendarDay, next.data.transactions);
+      for (const transaction of result.transactions) {
+        next = putRecord(next, 'transactions', transaction);
+        changed = true;
+      }
+      if (result.nextOccurrenceDate !== rule.nextOccurrenceDate) {
+        next = putRecord(next, 'recurringRules', {
+          ...rule,
+          ...changedRecordMeta(rule),
+          nextOccurrenceDate: result.nextOccurrenceDate,
+        });
+        changed = true;
+      }
+    }
+    return changed ? next : current;
+  });
 }
 
 function localDateString(date = new Date()): string {
@@ -65,20 +207,29 @@ export function useFinanceApp(): FinanceAppController {
   const [storageError, setStorageError] = useState<string>();
   const [storageRecovery, setStorageRecovery] = useState<LocalStateRecovery | undefined>(initialLoad.recovery);
   const [guestImportNotice, setGuestImportNotice] = useState<string>();
+  const [legacyBootstrapNotice, setLegacyBootstrapNotice] = useState<string>();
+  const [safetyNotice, setSafetyNotice] = useState<string>();
   const [calendarDay, setCalendarDay] = useState(() => localDateString());
   const stateRef = useRef(state);
   const activeOwnerRef = useRef(state.ownerId);
+  const storageRecoveryRef = useRef<LocalStateRecovery | undefined>(initialLoad.recovery);
   const ownerGenerationRef = useRef(0);
   const syncTokenRef = useRef<{ generation: number; ownerId: string; id: symbol } | null>(null);
+  const renderedOwnerId = state.ownerId;
+  const renderedOwnerGeneration = ownerGenerationRef.current;
 
-  useEffect(() => { stateRef.current = state; }, [state]);
+  const assertRenderedOwnerContext = useCallback(() => {
+    assertCurrentOwnerContext(
+      { ownerId: renderedOwnerId, generation: renderedOwnerGeneration },
+      activeOwnerRef.current,
+      stateRef.current.ownerId,
+      ownerGenerationRef.current,
+    );
+  }, [renderedOwnerGeneration, renderedOwnerId]);
 
   const commitState = useCallback((update: (current: PersistedFinanceState) => PersistedFinanceState) => {
-    setState((current) => {
-      const next = update(current);
-      stateRef.current = next;
-      return next;
-    });
+    const next = advanceFinanceStateRef(stateRef, update);
+    setState(next);
   }, []);
 
   const activateOwner = useCallback((nextOwnerId: string) => {
@@ -86,6 +237,7 @@ export function useFinanceApp(): FinanceAppController {
     ownerGenerationRef.current += 1;
     activeOwnerRef.current = nextOwnerId;
     const loaded = loadFinanceStateWithRecovery(nextOwnerId);
+    storageRecoveryRef.current = loaded.recovery;
     stateRef.current = loaded.state;
     setState(loaded.state);
     setStorageRecovery(loaded.recovery);
@@ -94,6 +246,8 @@ export function useFinanceApp(): FinanceAppController {
     setSyncBusy(false);
     setGuestPromptDismissed(false);
     setGuestImportNotice(undefined);
+    setLegacyBootstrapNotice(undefined);
+    setSafetyNotice(undefined);
   }, []);
 
   useEffect(() => {
@@ -159,10 +313,27 @@ export function useFinanceApp(): FinanceAppController {
     syncTokenRef.current = token;
     setSyncBusy(true);
     try {
-      const remote = createSupabaseRemoteAdapter(supabase);
-      const result = await syncFinanceState(started, ownerId, remote);
+      const result = await syncFinanceStateUnlessRecovering(
+        started,
+        ownerId,
+        storageRecoveryRef.current,
+        () => createSupabaseRemoteAdapter(supabase),
+      );
+      if (!result) return;
       if (ownerGenerationRef.current !== generation || activeOwnerRef.current !== ownerId) return;
-      commitState((current) => applySyncCompletion(started, current, result.state, ownerId));
+      commitState((current) => {
+        const merged = applySyncCompletion(started, current, result.state, ownerId);
+        // A durable legacy decision made while this sync was in flight wins
+        // over bootstrap metadata captured by the older response.
+        if (started.legacyBootstrap && !current.legacyBootstrap) {
+          return {
+            ...merged,
+            migratedFromLegacy: undefined,
+            legacyBootstrap: undefined,
+          };
+        }
+        return merged;
+      });
       setSyncReport(result.report);
     } finally {
       if (syncTokenRef.current === token) {
@@ -195,49 +366,92 @@ export function useFinanceApp(): FinanceAppController {
     entity: E,
     record: FinanceData[E][number],
   ) => {
-    commitState((current) => putRecord(current, entity, record));
-  }, [commitState]);
+    try {
+      assertRenderedOwnerContext();
+    } catch (error) {
+      setSafetyNotice(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+    if (stateRef.current.legacyBootstrap?.status === 'pending') {
+      setLegacyBootstrapNotice('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
+      return false;
+    }
+    if (storageRecoveryRef.current) {
+      setSafetyNotice('本機快照仍在復原保護中；完成有效備份還原前，本次帳本修改未執行。');
+      return false;
+    }
+    commitState((current) => applyFinanceMutationUnlessRecovering(
+      current,
+      storageRecoveryRef.current,
+      (recoverable) => putRecord(recoverable, entity, record),
+    ));
+    return true;
+  }, [assertRenderedOwnerContext, commitState]);
 
   const softDelete = useCallback(<E extends FinanceEntityName>(
     entity: E,
     record: FinanceData[E][number],
   ) => {
+    try {
+      assertRenderedOwnerContext();
+    } catch (error) {
+      setSafetyNotice(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+    if (stateRef.current.legacyBootstrap?.status === 'pending') {
+      setLegacyBootstrapNotice('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
+      return false;
+    }
+    if (storageRecoveryRef.current) {
+      setSafetyNotice('本機快照仍在復原保護中；完成有效備份還原前，本次刪除未執行。');
+      return false;
+    }
     const deleted = {
       ...record,
       ...changedRecordMeta(record as SyncRecord),
       deletedAt: new Date().toISOString(),
       ...('isActive' in record ? { isActive: false } : {}),
     } as FinanceData[E][number];
-    commitState((current) => putRecord(current, entity, deleted));
-  }, [commitState]);
+    commitState((current) => applyFinanceMutationUnlessRecovering(
+      current,
+      storageRecoveryRef.current,
+      (recoverable) => putRecord(recoverable, entity, deleted),
+    ));
+    return true;
+  }, [assertRenderedOwnerContext, commitState]);
 
   const setData = useCallback((data: FinanceData) => {
-    setStorageRecovery(undefined);
-    commitState((current) => applyRestoredData(current, data));
-  }, [commitState]);
+    try {
+      assertRenderedOwnerContext();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSafetyNotice(message);
+      throw error;
+    }
+    if (stateRef.current.legacyBootstrap) {
+      setLegacyBootstrapNotice('請先對舊版候選資料選擇「匯入候選」或「保留雲端」，本次一般備份還原未執行。');
+    }
+    const restored = restoreFinanceStateUnlessLegacyBootstrap(
+      stateRef.current,
+      data,
+      saveFinanceState,
+      () => clearSuccessfulRecoveryUiState(
+        storageRecoveryRef,
+        setStorageRecovery,
+        setSafetyNotice,
+      ),
+    );
+    commitState(() => restored);
+  }, [assertRenderedOwnerContext, commitState]);
 
   useEffect(() => {
-    commitState((current) => {
-      let next = current;
-      let changed = false;
-      for (const rule of current.data.recurringRules.filter((item) => !item.deletedAt && item.isActive)) {
-        const result = catchUpRecurringTransactions(rule, calendarDay, next.data.transactions);
-        for (const transaction of result.transactions) {
-          next = putRecord(next, 'transactions', transaction);
-          changed = true;
-        }
-        if (result.nextOccurrenceDate !== rule.nextOccurrenceDate) {
-          next = putRecord(next, 'recurringRules', {
-            ...rule,
-            ...changedRecordMeta(rule),
-            nextOccurrenceDate: result.nextOccurrenceDate,
-          });
-          changed = true;
-        }
-      }
-      return changed ? next : current;
-    });
-  }, [state.ownerId, recurrenceCursorKey, calendarDay, commitState]);
+    if (storageRecovery || state.legacyBootstrap?.status === 'pending') return;
+    commitState((current) => materializeRecurringTransactionsUnlessRecovering(
+      current,
+      calendarDay,
+      storageRecoveryRef.current,
+    ));
+  }, [state.ownerId, state.legacyBootstrap?.status, recurrenceCursorKey, calendarDay, commitState, storageRecovery]);
 
   const guestLoad = useMemo(() => loadFinanceStateWithRecovery('guest'), [state.ownerId, state.data.transactions.length]);
   const guestFingerprint = guestSnapshotFingerprint(guestLoad.state.data);
@@ -252,6 +466,7 @@ export function useFinanceApp(): FinanceAppController {
     && !guestPromptDismissed
     && !guestLoad.recovery
     && !storageRecovery
+    && !state.legacyBootstrap
     && rememberedGuestFingerprint !== guestFingerprint
     && hasUserContent(guestLoad.state.data);
 
@@ -266,8 +481,18 @@ export function useFinanceApp(): FinanceAppController {
   }, []);
 
   const importGuestData = useCallback(() => {
+    try {
+      assertRenderedOwnerContext();
+    } catch (error) {
+      setSafetyNotice(error instanceof Error ? error.message : String(error));
+      return;
+    }
     if (stateRef.current.ownerId === 'guest') return;
     setGuestImportNotice(undefined);
+    if (stateRef.current.legacyBootstrap) {
+      setGuestImportNotice('請先完成舊版帳本候選資料的匯入或保留雲端決定，再處理訪客資料。');
+      return;
+    }
     if (storageRecovery) {
       setGuestImportNotice('目前帳號的本機快照仍在復原保護中；為避免覆寫可救援原始資料，請先完成備份還原或明確重設，再匯入訪客資料。');
       return;
@@ -305,7 +530,49 @@ export function useFinanceApp(): FinanceAppController {
       setStorageError(`訪客資料已匯入，但無法記住匯入決策：${persistence.decisionError}`);
       setGuestImportNotice(`訪客資料已安全匯入：新增 ${plan.addedCount} 筆，略過 ${plan.skippedCount} 筆；但瀏覽器未能記住此決策，下次可能再次提示。`);
     }
-  }, [commitState, guestDecisionKey, guestFingerprint, storageRecovery]);
+  }, [assertRenderedOwnerContext, commitState, guestDecisionKey, guestFingerprint, storageRecovery]);
+
+  const decideLegacyBootstrap = useCallback((decision: LegacyBootstrapDecision) => {
+    setLegacyBootstrapNotice(undefined);
+    try {
+      assertRenderedOwnerContext();
+    } catch (error) {
+      setSafetyNotice(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (storageRecoveryRef.current) {
+      setLegacyBootstrapNotice('目前帳號快照仍在復原保護中；未修復前不會處理舊版候選資料。');
+      return;
+    }
+    try {
+      const next = resolveLegacyBootstrapState(
+        stateRef.current,
+        decision,
+        saveFinanceState,
+        () => {
+          storageRecoveryRef.current = undefined;
+          setStorageRecovery(undefined);
+        },
+      );
+      commitState(() => next);
+      setStorageError(undefined);
+      setLegacyBootstrapNotice(decision === 'import-candidate'
+        ? '舊版候選資料已明確匯入，並已建立可重試的待同步作業。'
+        : '已保留目前雲端帳本；舊版候選資料不會上傳。');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStorageError(`無法安全完成舊版資料決定：${message}`);
+      setLegacyBootstrapNotice('本次決定未生效；候選資料與現有帳本都保持不變。');
+    }
+  }, [assertRenderedOwnerContext, commitState]);
+
+  const importLegacyCandidate = useCallback(() => {
+    decideLegacyBootstrap('import-candidate');
+  }, [decideLegacyBootstrap]);
+
+  const keepCloudData = useCallback(() => {
+    decideLegacyBootstrap('keep-cloud');
+  }, [decideLegacyBootstrap]);
 
   const dismissGuestImport = useCallback(() => {
     rememberGuestDecision(guestDecisionKey, guestFingerprint);
@@ -338,9 +605,13 @@ export function useFinanceApp(): FinanceAppController {
     storageError,
     storageRecovery,
     guestImportNotice,
+    legacyBootstrapNotice,
+    safetyNotice,
     hasSeparateGuestData,
     dismissGuestImport,
     importGuestData,
+    importLegacyCandidate,
+    keepCloudData,
     setData,
     put,
     softDelete,

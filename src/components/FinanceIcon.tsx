@@ -72,7 +72,7 @@ export function IconPicker({ value, onChange }: { value: IconRef; onChange(icon:
       </div>
       {value.type === 'emoji' ? (
         <label className="field-label">任意 Emoji
-          <input className="field mt-1" aria-label="任意 Emoji" value={value.value} maxLength={12} onChange={(event) => onChange({ type: 'emoji', value: event.target.value || '💰' })} />
+          <input className="field mt-1" aria-label="任意 Emoji" value={value.value} maxLength={64} onChange={(event) => onChange({ type: 'emoji', value: event.target.value || '💰' })} />
         </label>
       ) : (
         <div className="grid grid-cols-9 gap-1" aria-label="向量圖示選擇">

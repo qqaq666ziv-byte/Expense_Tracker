@@ -1,5 +1,7 @@
+export type ThemeId = 'shiba' | 'mix';
+
 export interface Theme {
-  id: 'shiba' | 'mix';
+  id: ThemeId;
   name: string;
   dogName: string;
   avatarEmoji: string;
@@ -43,7 +45,7 @@ export interface Theme {
   };
 }
 
-export const themes: Record<'shiba' | 'mix', Theme> = {
+export const themes: Record<ThemeId, Theme> = {
   shiba: {
     id: 'shiba',
     name: '柴犬風格',

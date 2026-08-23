@@ -27,9 +27,9 @@ describe('HomeView ledger access', () => {
       <HomeView
         data={state.data}
         ownerId="guest"
-        put={() => undefined}
-        putAdjustment={() => undefined}
-        deleteTransaction={() => undefined}
+        put={() => true}
+        putAdjustment={() => true}
+        deleteTransaction={() => true}
       />,
     );
 

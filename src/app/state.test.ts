@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applySyncCompletion,
   applyRestoredData,
+  advanceFinanceStateRef,
   canAutoSaveFinanceState,
   createInitialState,
   guestSnapshotFingerprint,
@@ -27,6 +28,42 @@ function memoryStorage() {
 }
 
 describe('owner-scoped local state', () => {
+  it('advances the mutation source synchronously so a same-tick restore tombstones a queued put', () => {
+    const initial = createInitialState('user-a');
+    const backup = structuredClone(initial.data);
+    const ref = { current: initial };
+    const queuedAccount = {
+      ...initial.data.accounts[0],
+      id: 'same-tick-wallet',
+      name: '同一事件迴圈新增',
+      version: 1,
+      lastOperationId: 'same-tick-put',
+    };
+
+    advanceFinanceStateRef(ref, (current) => putRecord(current, 'accounts', queuedAccount));
+    const restored = applyRestoredData(
+      ref.current,
+      backup,
+      new Date('2026-08-23T12:00:00.000Z'),
+      () => 'same-tick-restore',
+    );
+
+    expect(restored.data.accounts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'same-tick-wallet',
+        deletedAt: '2026-08-23T12:00:00.000Z',
+        lastOperationId: 'same-tick-restore',
+      }),
+    ]));
+    expect(restored.outbox).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        entity: 'accounts',
+        recordId: 'same-tick-wallet',
+        id: 'same-tick-restore',
+      }),
+    ]));
+  });
+
   it('keeps guest, user A and user B in separate keys', () => {
     const storage = memoryStorage();
     const guest = createInitialState('guest');
@@ -47,20 +84,80 @@ describe('owner-scoped local state', () => {
     expect(() => putRecord(state, 'accounts', foreign)).toThrow(/其他使用者/);
   });
 
-  it('migrates account-specific legacy data without importing guest data into a user', () => {
+  it('keeps authenticated legacy data as a pull-only candidate without importing guest data', () => {
     const storage = memoryStorage();
     storage.setItem('guest_transactions', JSON.stringify([{ id: 'guest-tx', amount: 99, type: 'expense', category: '餐飲', account: '現金', date: '2026-08-20 12:00' }]));
-    storage.setItem('user_transactions_user-a', JSON.stringify([{ id: 'user-tx', amount: 200, type: 'income', category: '薪資', account: '現金', date: '2026-08-20 18:00' }]));
+    storage.setItem('user_transactions_user-a', JSON.stringify([{ id: 'user-tx', amount: 200, type: 'income', category: '薪資', account: '現金', date: '2026-08-20 18:00', synced: true }]));
     storage.setItem('custom_categories', JSON.stringify([{ name: '訪客私密分類', icon: '🔒', type: 'expense' }]));
 
     const guest = loadFinanceState('guest', storage);
     const user = loadFinanceState('user-a', storage);
 
     expect(guest.data.transactions.map((item) => item.id)).toEqual(['guest-tx']);
-    expect(user.data.transactions.map((item) => item.id)).toEqual(['user-tx']);
-    expect(user.outbox.length).toBeGreaterThan(0);
-    expect(user.data.transactions.every((item) => item.ownerId === 'user-a')).toBe(true);
-    expect(user.data.categories.some((item) => item.name === '訪客私密分類')).toBe(false);
+    expect(user.data.transactions).toEqual([]);
+    expect(user.outbox).toEqual([]);
+    expect(user.legacyBootstrap).toMatchObject({
+      status: 'pending',
+      unsyncedTransactionIds: [],
+    });
+    expect(user.legacyBootstrap?.candidate.transactions.map((item) => item.id)).toEqual(['user-tx']);
+    expect(user.legacyBootstrap?.candidate.transactions.every((item) => item.ownerId === 'user-a')).toBe(true);
+    expect(user.legacyBootstrap?.candidate.categories.some((item) => item.name === '訪客私密分類')).toBe(false);
+  });
+
+  it('preserves synced-false legacy transactions as durable review candidates across reloads', () => {
+    const storage = memoryStorage();
+    storage.setItem('user_transactions_user-a', JSON.stringify([
+      { id: 'acknowledged', amount: 100, type: 'expense', category: '餐飲', account: '現金', date: '2026-08-20 12:00', synced: true },
+      { id: 'offline-pending', amount: 250, type: 'expense', category: '交通', account: '現金', date: '2026-08-20 18:00', synced: false },
+    ]));
+
+    const first = loadFinanceState('user-a', storage);
+    saveFinanceState(first, storage);
+    const reloaded = loadFinanceState('user-a', storage);
+
+    expect(first.outbox).toEqual([]);
+    expect(first.legacyBootstrap?.candidate.transactions.map((item) => item.id)).toEqual([
+      'acknowledged',
+      'offline-pending',
+    ]);
+    expect(first.legacyBootstrap?.unsyncedTransactionIds).toEqual(['offline-pending']);
+    expect(reloaded.legacyBootstrap).toEqual(first.legacyBootstrap);
+  });
+
+  it('demotes a pre-fix v3 legacy outbox back to a pull-only candidate on reload', () => {
+    const storage = memoryStorage();
+    storage.setItem('user_transactions_user-a', JSON.stringify([
+      { id: 'stale-cache-row', amount: 180, type: 'expense', category: '餐飲', account: '現金', date: '2026-08-20 12:00', synced: true },
+    ]));
+    const safe = loadFinanceState('user-a', storage);
+    const candidate = safe.legacyBootstrap!.candidate;
+    const transaction = candidate.transactions[0];
+    const unsafePreFixState = {
+      ...safe,
+      data: candidate,
+      outbox: [{
+        id: transaction.lastOperationId,
+        entity: 'transactions' as const,
+        recordId: transaction.id,
+        record: transaction,
+        attempts: 0,
+        queuedAt: transaction.updatedAt,
+      }],
+      legacyBootstrap: undefined,
+    };
+    storage.setItem(storageKey('user-a'), JSON.stringify(unsafePreFixState));
+
+    const recovered = loadFinanceState('user-a', storage);
+
+    expect(recovered.data.transactions).toEqual([]);
+    expect(recovered.outbox).toEqual([]);
+    expect(recovered.lastSyncedAt).toBeUndefined();
+    expect(recovered.legacyBootstrap).toEqual({
+      status: 'pending',
+      candidate,
+      unsyncedTransactionIds: [],
+    });
   });
 
   it('remaps guest IDs and references before an explicit account import', () => {
@@ -256,6 +353,39 @@ describe('owner-scoped local state', () => {
     expect(loaded.recovery).toMatchObject({ key, raw: corruptRaw });
     expect(canAutoSaveFinanceState(loaded.state, 'user-a', loaded.recovery)).toBe(false);
     expect(storage.getItem(key)).toBe(corruptRaw);
+  });
+
+  it('fails closed instead of crashing when browser storage denies the primary snapshot read', () => {
+    const deniedStorage = {
+      getItem: () => { throw new Error('SecurityError: storage access denied'); },
+    };
+
+    const loaded = loadFinanceStateWithRecovery('user-a', deniedStorage);
+
+    expect(loaded.state.ownerId).toBe('user-a');
+    expect(loaded.recovery).toMatchObject({
+      key: storageKey('user-a'),
+      raw: '',
+    });
+    expect(loaded.recovery?.message).toContain('storage access denied');
+    expect(canAutoSaveFinanceState(loaded.state, 'user-a', loaded.recovery)).toBe(false);
+  });
+
+  it('keeps recovery mode active when legacy keys become unreadable after the primary lookup', () => {
+    const primaryKey = storageKey('user-a');
+    const intermittentlyDeniedStorage = {
+      getItem: (key: string) => {
+        if (key === primaryKey) return null;
+        throw new Error('legacy storage read denied');
+      },
+    };
+
+    const loaded = loadFinanceStateWithRecovery('user-a', intermittentlyDeniedStorage);
+
+    expect(loaded.state.ownerId).toBe('user-a');
+    expect(loaded.recovery?.raw).toContain('legacy-localStorage-recovery-unavailable');
+    expect(loaded.recovery?.raw).not.toContain('transactions":[');
+    expect(canAutoSaveFinanceState(loaded.state, 'user-a', loaded.recovery)).toBe(false);
   });
 
   it('blocks v3 autosave when corrupt legacy input cannot be migrated', () => {

@@ -3,6 +3,14 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL?.trim();
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
 
+/**
+ * Capability marker used only for backward-compatible tombstone visibility.
+ * It is not an authorization secret; RLS still enforces auth.uid() ownership.
+ */
+export const FINANCE_SYNC_CLIENT_HEADERS = Object.freeze({
+  'x-shiba-finance-client': 'v3',
+});
+
 export function isBrowserSafeSupabaseKey(value: string | undefined): boolean {
   if (!value || value.startsWith('sb_secret_')) return false;
   const parts = value.split('.');
@@ -23,5 +31,6 @@ export const supabaseConfigured = Boolean(supabaseUrl && isBrowserSafeSupabaseKe
 export const supabase: SupabaseClient | null = supabaseConfigured
   ? createClient(supabaseUrl!, supabaseAnonKey!, {
       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+      global: { headers: FINANCE_SYNC_CLIENT_HEADERS },
     })
   : null;

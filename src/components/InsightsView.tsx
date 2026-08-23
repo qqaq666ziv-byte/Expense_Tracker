@@ -15,13 +15,19 @@ const PERIODS: { key: PeriodKey; label: string }[] = [
   { key: 'custom', label: '自訂' },
 ];
 
-function Delta({ value }: { value: number }) {
-  const Icon = value > 0 ? ArrowUpRight : value < 0 ? ArrowDownRight : Minus;
-  return <span className={`inline-flex items-center gap-1 text-xs font-bold ${value > 0 ? 'text-emerald-600' : value < 0 ? 'text-rose-600' : 'text-zinc-500'}`}><Icon className="h-3 w-3" />較上期 {money.format(Math.abs(value))}</span>;
+export function deltaTone(value: number, increaseIsFavorable: boolean): string {
+  if (value === 0) return 'text-zinc-500';
+  const favorable = increaseIsFavorable ? value > 0 : value < 0;
+  return favorable ? 'text-emerald-600' : 'text-rose-600';
 }
 
-function Metric({ label, value, delta }: { label: string; value: string; delta?: number }) {
-  return <div className="metric-card"><span>{label}</span><strong>{value}</strong>{delta !== undefined && <Delta value={delta} />}</div>;
+function Delta({ value, increaseIsFavorable = true }: { value: number; increaseIsFavorable?: boolean }) {
+  const Icon = value > 0 ? ArrowUpRight : value < 0 ? ArrowDownRight : Minus;
+  return <span className={`inline-flex items-center gap-1 text-xs font-bold ${deltaTone(value, increaseIsFavorable)}`}><Icon className="h-3 w-3" />較上期 {money.format(Math.abs(value))}</span>;
+}
+
+function Metric({ label, value, delta, increaseIsFavorable }: { label: string; value: string; delta?: number; increaseIsFavorable?: boolean }) {
+  return <div className="metric-card"><span>{label}</span><strong>{value}</strong>{delta !== undefined && <Delta value={delta} increaseIsFavorable={increaseIsFavorable} />}</div>;
 }
 
 export function InsightsView({ data, onOpenLedger }: { data: FinanceData; onOpenLedger(): void }) {
@@ -71,7 +77,7 @@ export function InsightsView({ data, onOpenLedger }: { data: FinanceData; onOpen
           <p className="mt-3 text-xs text-zinc-500">{insights.period.range.start.toLocaleDateString('zh-TW')}－{insights.period.range.end.toLocaleDateString('zh-TW')}（本週為週一至週日）</p>
           <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
             <Metric label="期間收入" value={money.format(insights.period.income)} delta={insights.comparison.incomeDelta} />
-            <Metric label="期間支出" value={money.format(insights.period.expense)} delta={insights.comparison.expenseDelta} />
+            <Metric label="期間支出" value={money.format(insights.period.expense)} delta={insights.comparison.expenseDelta} increaseIsFavorable={false} />
             <Metric label="淨現金流" value={money.format(insights.period.net)} delta={insights.comparison.netDelta} />
             <Metric label="平均每日支出" value={money.format(insights.period.averageDailyExpense)} />
             <Metric label="儲蓄率" value={insights.period.savingsRate === null ? 'N/A' : `${(insights.period.savingsRate * 100).toFixed(1)}%`} />

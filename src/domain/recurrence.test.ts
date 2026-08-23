@@ -3,7 +3,9 @@ import type { RecurringRule } from './model';
 import {
   catchUpRecurringTransactions,
   getNextOccurrenceDate,
+  getRecurringCatchUpStatus,
   getRecurringOccurrenceDates,
+  MAX_RECURRING_CATCH_UP_OCCURRENCES,
 } from './recurrence';
 
 const createRule = (overrides: Partial<RecurringRule> = {}): RecurringRule => ({
@@ -28,6 +30,49 @@ const createRule = (overrides: Partial<RecurringRule> = {}): RecurringRule => ({
 });
 
 describe('recurring transactions', () => {
+  it('fails closed without advancing an extreme historical catch-up', () => {
+    const rule = createRule({
+      startDate: '0001-01-01',
+      nextOccurrenceDate: '0001-01-01',
+    });
+
+    expect(catchUpRecurringTransactions(rule, '2026-08-23')).toEqual({
+      transactions: [],
+      nextOccurrenceDate: '0001-01-01',
+      blockedByLimit: {
+        maximumOccurrences: MAX_RECURRING_CATCH_UP_OCCURRENCES,
+        overflowOccurrenceDate: expect.any(String),
+      },
+    });
+    expect(getRecurringCatchUpStatus(rule, '2026-08-23')).toMatchObject({
+      blocked: true,
+      maximumOccurrences: MAX_RECURRING_CATCH_UP_OCCURRENCES,
+    });
+    expect(() => getRecurringOccurrenceDates(rule, '2026-08-23'))
+      .toThrow(`${MAX_RECURRING_CATCH_UP_OCCURRENCES}`);
+  });
+
+  it('allows exactly the catch-up limit and blocks before occurrence 501', () => {
+    const rule = createRule({
+      startDate: '2017-01-02',
+      nextOccurrenceDate: '2017-01-02',
+    });
+
+    const atLimit = catchUpRecurringTransactions(rule, '2026-07-27');
+    expect(atLimit.transactions).toHaveLength(MAX_RECURRING_CATCH_UP_OCCURRENCES);
+    expect(atLimit.nextOccurrenceDate).toBe('2026-08-03');
+    expect(atLimit.blockedByLimit).toBeUndefined();
+
+    expect(catchUpRecurringTransactions(rule, '2026-08-03')).toEqual({
+      transactions: [],
+      nextOccurrenceDate: '2017-01-02',
+      blockedByLimit: {
+        maximumOccurrences: MAX_RECURRING_CATCH_UP_OCCURRENCES,
+        overflowOccurrenceDate: '2026-08-03',
+      },
+    });
+  });
+
   it('catches up weekly income through an inclusive date and advances the active cursor', () => {
     const rule = createRule();
 

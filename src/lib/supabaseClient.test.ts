@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isBrowserSafeSupabaseKey } from './supabaseClient';
+import { FINANCE_SYNC_CLIENT_HEADERS, isBrowserSafeSupabaseKey } from './supabaseClient';
 
 function jwt(role: string): string {
   const encode = (value: object) => btoa(JSON.stringify(value)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
@@ -12,5 +12,9 @@ describe('Supabase browser configuration', () => {
     expect(isBrowserSafeSupabaseKey(jwt('service_role'))).toBe(false);
     expect(isBrowserSafeSupabaseKey(jwt('anon'))).toBe(true);
     expect(isBrowserSafeSupabaseKey('sb_publishable_public')).toBe(true);
+  });
+
+  it('identifies v3 requests so RLS can hide tombstones from legacy clients', () => {
+    expect(FINANCE_SYNC_CLIENT_HEADERS).toEqual({ 'x-shiba-finance-client': 'v3' });
   });
 });

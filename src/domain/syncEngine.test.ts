@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type {
   AssetAccount,
+  Category,
   FinanceData,
   PendingOperation,
   PersistedFinanceState,
   SavingsAllocation,
+  SavingsGoal,
+  Transaction,
 } from './model';
 import type { RemoteAdapter, RemoteRecord } from './syncEngine';
 import { enqueueSyncRecord, syncFinanceState } from './syncEngine';
@@ -135,6 +138,207 @@ class InMemoryRemote implements RemoteAdapter {
 }
 
 describe('offline sync engine', () => {
+  it('uses an authenticated legacy cache only as a candidate when the remote row was deleted', async () => {
+    const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
+    const legacyCategory: Category = {
+      id: 'legacy-food',
+      ownerId: 'user-a',
+      version: 1,
+      updatedAt: NOW,
+      lastOperationId: 'op-legacy-food',
+      kind: 'expense',
+      name: '餐飲',
+      icon: { type: 'emoji', value: '🍜' },
+      isActive: true,
+      sortOrder: 0,
+    };
+    const staleCachedTransaction: Transaction = {
+      id: 'remote-deleted-transaction',
+      ownerId: 'user-a',
+      version: 1,
+      updatedAt: NOW,
+      lastOperationId: 'op-legacy-transaction',
+      amount: 120,
+      type: 'expense',
+      categoryId: legacyCategory.id,
+      categoryName: legacyCategory.name,
+      accountId: legacyAccount.id,
+      accountName: legacyAccount.name,
+      occurredAt: '2026-08-20 12:00',
+    };
+    const candidate: FinanceData = {
+      ...emptyData(),
+      accounts: [legacyAccount],
+      categories: [legacyCategory],
+      transactions: [staleCachedTransaction],
+    };
+    const bootstrap: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+      migratedFromLegacy: true,
+      legacyBootstrap: {
+        status: 'pending',
+        candidate,
+        unsyncedTransactionIds: [],
+      },
+    };
+    let applyCount = 0;
+    const remote: RemoteAdapter = {
+      apply: async () => { applyCount += 1; },
+      pull: async () => [],
+    };
+
+    const result = await syncFinanceState(bootstrap, 'user-a', remote, () => NOW);
+
+    expect(applyCount).toBe(0);
+    expect(result.report).toMatchObject({ status: 'synced', applied: 0, pulled: 0 });
+    expect(result.state.data.transactions).toEqual([]);
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.legacyBootstrap).toEqual({
+      status: 'ready',
+      candidate,
+      unsyncedTransactionIds: [],
+    });
+  });
+
+  it('keeps the authenticated legacy bootstrap gated when pull reports any issue', async () => {
+    const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
+    const candidate: FinanceData = { ...emptyData(), accounts: [legacyAccount] };
+    const bootstrap: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+      migratedFromLegacy: true,
+      legacyBootstrap: {
+        status: 'pending',
+        candidate,
+        unsyncedTransactionIds: [],
+      },
+    };
+    let applyCount = 0;
+    const remoteAccount = account('cloud-cash', 'user-a', 2, 'op-cloud-cash');
+    const remote: RemoteAdapter = {
+      apply: async () => { applyCount += 1; },
+      pull: async () => ({
+        records: [{ entity: 'accounts', record: remoteAccount }],
+        issues: [{
+          stage: 'validation',
+          entity: 'transactions',
+          recordId: 'malformed-row',
+          message: 'Skipped inconsistent transactions/malformed-row',
+        }],
+      }),
+    };
+
+    const result = await syncFinanceState(bootstrap, 'user-a', remote, () => NOW);
+
+    expect(applyCount).toBe(0);
+    expect(result.report).toMatchObject({ status: 'partial', applied: 0, pulled: 1 });
+    expect(result.state.data).toEqual(bootstrap.data);
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.lastSyncedAt).toBeUndefined();
+    expect(result.state.legacyBootstrap).toEqual(bootstrap.legacyBootstrap);
+  });
+
+  it('does not allow a local operation to enter a pending authenticated legacy bootstrap', () => {
+    const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
+    const bootstrap: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+      migratedFromLegacy: true,
+      legacyBootstrap: {
+        status: 'pending',
+        candidate: { ...emptyData(), accounts: [legacyAccount] },
+        unsyncedTransactionIds: [],
+      },
+    };
+
+    expect(() => enqueueSyncRecord(bootstrap, 'accounts', legacyAccount)).toThrow(
+      /legacy bootstrap/i,
+    );
+    expect(bootstrap.outbox).toEqual([]);
+  });
+
+  it('keeps the candidate and pending gate when the authenticated legacy pull fails', async () => {
+    const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
+    const bootstrap: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+      migratedFromLegacy: true,
+      legacyBootstrap: {
+        status: 'pending',
+        candidate: { ...emptyData(), accounts: [legacyAccount] },
+        unsyncedTransactionIds: [],
+      },
+    };
+    let applyCount = 0;
+    const remote: RemoteAdapter = {
+      apply: async () => { applyCount += 1; },
+      pull: async () => { throw new Error('offline during bootstrap pull'); },
+    };
+
+    const result = await syncFinanceState(bootstrap, 'user-a', remote, () => NOW);
+
+    expect(applyCount).toBe(0);
+    expect(result.report).toMatchObject({ status: 'partial', applied: 0, pulled: 0 });
+    expect(result.report.failures).toEqual([
+      expect.objectContaining({ stage: 'pull', message: 'offline during bootstrap pull' }),
+    ]);
+    expect(result.state.data).toEqual(bootstrap.data);
+    expect(result.state.legacyBootstrap).toEqual(bootstrap.legacyBootstrap);
+    expect(result.state.lastSyncedAt).toBeUndefined();
+  });
+
+  it('keeps the bootstrap gated when a nominally successful pull has an invalid graph', async () => {
+    const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
+    const bootstrap: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+      migratedFromLegacy: true,
+      legacyBootstrap: {
+        status: 'pending',
+        candidate: { ...emptyData(), accounts: [legacyAccount] },
+        unsyncedTransactionIds: [],
+      },
+    };
+    const invalidRemoteTransaction: Transaction = {
+      id: 'orphan-transaction',
+      ownerId: 'user-a',
+      version: 1,
+      updatedAt: NOW,
+      lastOperationId: 'op-orphan',
+      amount: 88,
+      type: 'expense',
+      categoryId: 'missing-category',
+      categoryName: '餐飲',
+      accountId: 'missing-account',
+      accountName: '現金',
+      occurredAt: '2026-08-20 12:00',
+    };
+    const remote: RemoteAdapter = {
+      apply: async () => { throw new Error('bootstrap must never apply'); },
+      pull: async () => [{ entity: 'transactions', record: invalidRemoteTransaction }],
+    };
+
+    const result = await syncFinanceState(bootstrap, 'user-a', remote, () => NOW);
+
+    expect(result.report.status).toBe('partial');
+    expect(result.report.failures).toEqual([
+      expect.objectContaining({ stage: 'validation', message: expect.stringContaining('remote bootstrap graph') }),
+    ]);
+    expect(result.state.data).toEqual(bootstrap.data);
+    expect(result.state.legacyBootstrap).toEqual(bootstrap.legacyBootstrap);
+  });
+
   it('queues create, update, and delete as idempotent record snapshots and tombstones', () => {
     const created = account('cash', 'user-a', 1, 'op-create');
     const updated = { ...created, name: 'wallet', version: 2, lastOperationId: 'op-update' };
@@ -420,6 +624,16 @@ describe('offline sync engine', () => {
   });
 
   it('converges concurrent releases of one source allocation to one tombstone', async () => {
+    const goal: SavingsGoal = {
+      id: 'goal-a',
+      ownerId: 'user-a',
+      version: 1,
+      updatedAt: '2026-08-21T09:00:00.000Z',
+      lastOperationId: 'op-goal',
+      name: '緊急預備金',
+      targetAmount: 10_000,
+      isActive: true,
+    };
     const source: SavingsAllocation = {
       id: 'allocation-source',
       ownerId: 'user-a',
@@ -447,10 +661,13 @@ describe('offline sync engine', () => {
     const releaseState = (record: SavingsAllocation): PersistedFinanceState => ({
       schemaVersion: 3,
       ownerId: 'user-a',
-      data: { ...emptyData(), allocations: [record] },
+      data: { ...emptyData(), goals: [goal], allocations: [record] },
       outbox: [allocationOperation(record)],
     });
-    const remote = new InMemoryRemote([{ entity: 'allocations', record: source }]);
+    const remote = new InMemoryRemote([
+      { entity: 'goals', record: goal },
+      { entity: 'allocations', record: source },
+    ]);
 
     const afterA = await syncFinanceState(releaseState(releasedA), 'user-a', remote, () => NOW);
     const afterB = await syncFinanceState(releaseState(releasedB), 'user-a', remote, () => NOW);
@@ -464,7 +681,7 @@ describe('offline sync engine', () => {
     expect(convergedA.state.data.allocations.filter((record) => !record.deletedAt)).toEqual([]);
   });
 
-  it('does not let a queued stale operation overwrite a newer remote record', async () => {
+  it('keeps a queued stale edit visible and pending when the remote clock is newer', async () => {
     const remoteNewer = {
       ...account('wallet', 'user-a', 3, 'op-remote-newer'),
       name: 'remote current value',
@@ -484,24 +701,31 @@ describe('offline sync engine', () => {
       () => NOW,
     );
 
-    expect(result.state.data.accounts).toEqual([remoteNewer]);
-    expect(result.state.outbox).toEqual([]);
+    expect(result.state.data.accounts).toEqual([localStale]);
+    expect(result.state.outbox).toEqual([
+      expect.objectContaining({
+        id: 'op-local-stale',
+        attempts: 1,
+        lastError: expect.stringContaining('pending local mutation'),
+      }),
+    ]);
+    expect(result.state.lastSyncError).toMatch(/pending local mutation/i);
     expect(result.report.conflicts).toEqual([
-      expect.objectContaining({ recordId: 'wallet', winner: 'remote', reason: 'version' }),
+      expect.objectContaining({ recordId: 'wallet', winner: 'unresolved', reason: 'pending-local' }),
     ]);
     expect(await remote.pull('user-a')).toEqual([{ entity: 'accounts', record: remoteNewer }]);
   });
 
-  it('retires a stale operation when the real adapter rejects it but pull proves the remote clock won', async () => {
+  it('does not silently resurrect a locally deleted record when the remote clock is newer', async () => {
     const remoteNewer = {
       ...account('wallet', 'user-a', 3, 'op-remote-newer'),
       name: 'remote current value',
     };
     const localStale = {
       ...remoteNewer,
-      name: 'local stale value',
       version: 2,
       lastOperationId: 'op-local-stale',
+      deletedAt: NOW,
     };
     const rejectingRemote: RemoteAdapter = {
       apply: async () => { throw new Error('persisted conflict clock does not match operation'); },
@@ -515,12 +739,14 @@ describe('offline sync engine', () => {
       () => NOW,
     );
 
-    expect(result.state.data.accounts).toEqual([remoteNewer]);
-    expect(result.state.outbox).toEqual([]);
-    expect(result.state.lastSyncError).toBeUndefined();
-    expect(result.report).toMatchObject({ status: 'synced', pending: [], failures: [] });
+    expect(result.state.data.accounts).toEqual([localStale]);
+    expect(result.state.outbox).toEqual([
+      expect.objectContaining({ id: 'op-local-stale', attempts: 1 }),
+    ]);
+    expect(result.state.lastSyncError).toMatch(/pending local mutation/i);
+    expect(result.report).toMatchObject({ status: 'partial' });
     expect(result.report.conflicts).toEqual([
-      expect.objectContaining({ recordId: 'wallet', winner: 'remote', reason: 'version' }),
+      expect.objectContaining({ recordId: 'wallet', winner: 'unresolved', reason: 'pending-local' }),
     ]);
   });
 
@@ -631,5 +857,82 @@ describe('offline sync engine', () => {
       }),
     ]);
     expect(result.state.lastSyncError).toContain('missing category_id');
+  });
+
+  it('does not persist a mixed local and remote graph that violates category kind references', async () => {
+    const cash = account('cash', 'user-a', 1, 'op-cash');
+    const localCategory: Category = {
+      id: 'food',
+      ownerId: 'user-a',
+      version: 1,
+      updatedAt: '2026-08-21T09:00:00.000Z',
+      lastOperationId: 'op-food-expense',
+      kind: 'expense',
+      name: '餐飲',
+      icon: { type: 'emoji', value: '🍜' },
+      isActive: true,
+      sortOrder: 0,
+    };
+    const localTransaction: Transaction = {
+      id: 'lunch',
+      ownerId: 'user-a',
+      version: 1,
+      updatedAt: '2026-08-21T09:30:00.000Z',
+      lastOperationId: 'op-lunch',
+      type: 'expense',
+      amount: 120,
+      accountId: cash.id,
+      accountName: cash.name,
+      categoryId: localCategory.id,
+      categoryName: localCategory.name,
+      occurredAt: '2026-08-21 09:30',
+    };
+    const original: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: {
+        ...emptyData(),
+        accounts: [cash],
+        categories: [localCategory],
+        transactions: [localTransaction],
+      },
+      outbox: [{
+        id: localTransaction.lastOperationId,
+        entity: 'transactions',
+        recordId: localTransaction.id,
+        record: localTransaction,
+        attempts: 0,
+        queuedAt: NOW,
+      }],
+    };
+    const remoteCategory: Category = {
+      ...localCategory,
+      version: 2,
+      updatedAt: '2026-08-21T10:00:00.000Z',
+      lastOperationId: 'op-food-income',
+      kind: 'income',
+    };
+    const remote: RemoteAdapter = {
+      apply: async () => {},
+      pull: async () => ({
+        records: [{ entity: 'categories', record: remoteCategory }],
+        issues: [{
+          stage: 'validation',
+          entity: 'transactions',
+          recordId: localTransaction.id,
+          message: 'Skipped inconsistent transactions/lunch: references a category with the wrong kind',
+        }],
+      }),
+    };
+
+    const result = await syncFinanceState(original, 'user-a', remote, () => NOW);
+
+    expect(result.state.data).toEqual(original.data);
+    expect(result.state.outbox).toEqual(original.outbox);
+    expect(result.state.lastSyncedAt).toBeUndefined();
+    expect(result.report).toMatchObject({ status: 'partial', applied: 0 });
+    expect(result.report.failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stage: 'validation', message: expect.stringContaining('final reconciled graph') }),
+    ]));
   });
 });

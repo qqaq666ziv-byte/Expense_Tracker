@@ -19,4 +19,11 @@ describe('financial formatting', () => {
     expect(parseRequiredNumberInput('1.234')).toBeNull();
     expect(parseRequiredNumberInput(String(Number.MAX_SAFE_INTEGER + 1))).toBeNull();
   });
+
+  it('rejects two-decimal text when Number would silently change its exact minor units', () => {
+    expect(parseRequiredNumberInput('9007199254740991.01')).toBeNull();
+    expect(parseRequiredNumberInput('00012.30')).toBe(12.3);
+    expect(parseRequiredNumberInput('0.1')).toBe(0.1);
+    expect(parseRequiredNumberInput('0.2')).toBe(0.2);
+  });
 });

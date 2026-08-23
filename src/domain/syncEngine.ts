@@ -5,6 +5,7 @@ import type {
   PendingOperation,
   PersistedFinanceState,
 } from './model';
+import { validateFinanceData } from './backup';
 
 export type SyncEntityRecord = FinanceData[FinanceEntityName][number];
 
@@ -222,11 +223,39 @@ function reconcileRecord(
   }
 
   const localWins = comparison > 0;
+  const hasPendingLocalMutation = pendingKeys.has(
+    recordKey(remoteRecord.entity, remoteRecord.record.id),
+  );
+  if (!localWins && hasPendingLocalMutation) {
+    conflicts.push({
+      entity: remoteRecord.entity,
+      recordId: remoteRecord.record.id,
+      winner: 'unresolved',
+      reason: 'pending-local',
+      local: {
+        version: localRecord.version,
+        lastOperationId: localRecord.lastOperationId,
+      },
+      remote: {
+        version: remoteRecord.record.version,
+        lastOperationId: remoteRecord.record.lastOperationId,
+      },
+    });
+    failures.push({
+      stage: 'conflict',
+      message: `pending local mutation for ${remoteRecord.entity}/${remoteRecord.record.id} was superseded by the remote clock; the local edit or deletion remains pending for explicit review`,
+      entity: remoteRecord.entity,
+      recordId: remoteRecord.record.id,
+    });
+    // A queued edit/delete is user intent. Keep both its local snapshot and
+    // outbox entry instead of silently replacing it with the remote record.
+    return data;
+  }
   conflicts.push({
     entity: remoteRecord.entity,
     recordId: remoteRecord.record.id,
     winner: localWins ? 'local' : 'remote',
-    reason: localWins && pendingKeys.has(recordKey(remoteRecord.entity, remoteRecord.record.id))
+    reason: localWins && hasPendingLocalMutation
       ? 'pending-local'
       : localRecord.version === remoteRecord.record.version
         ? 'operation-id'
@@ -252,6 +281,20 @@ function pendingReport(outbox: readonly PendingOperation[]): SyncPending[] {
     attempts: operation.attempts,
     ...(operation.lastError === undefined ? {} : { lastError: operation.lastError }),
   }));
+}
+
+function emptyRemoteData(settings: FinanceData['settings']): FinanceData {
+  return {
+    accounts: [],
+    categories: [],
+    transactions: [],
+    adjustments: [],
+    goals: [],
+    allocations: [],
+    budgets: [],
+    recurringRules: [],
+    settings: structuredClone(settings),
+  };
 }
 
 function validateOwnership(
@@ -315,7 +358,139 @@ function validateOwnership(
       });
     }
   }
+  const bootstrap = state.legacyBootstrap;
+  if (bootstrap !== undefined) {
+    try {
+      validateFinanceData(bootstrap.candidate, 'authenticated legacy candidate');
+    } catch (error) {
+      failures.push({
+        stage: 'validation',
+        message: `Invalid authenticated legacy candidate: ${errorMessage(error)}`,
+      });
+    }
+    for (const entity of ENTITY_NAMES) {
+      for (const record of bootstrap.candidate[entity] as SyncEntityRecord[]) {
+        if (record.ownerId !== state.ownerId) {
+          failures.push({
+            stage: 'validation',
+            message: `authenticated legacy candidate ${entity}/${record.id} belongs to ${record.ownerId}, not ${state.ownerId}`,
+            entity,
+            recordId: record.id,
+          });
+        }
+      }
+    }
+    const candidateTransactionIds = new Set(
+      bootstrap.candidate.transactions.map((record) => record.id),
+    );
+    const seenUnsyncedIds = new Set<string>();
+    for (const id of bootstrap.unsyncedTransactionIds) {
+      if (!candidateTransactionIds.has(id) || seenUnsyncedIds.has(id)) {
+        failures.push({
+          stage: 'validation',
+          message: `authenticated legacy candidate has invalid unsynced transaction ${id}`,
+          entity: 'transactions',
+          recordId: id,
+        });
+      }
+      seenUnsyncedIds.add(id);
+    }
+    if (bootstrap.status === 'pending' && state.outbox.length > 0) {
+      failures.push({
+        stage: 'validation',
+        message: 'pending authenticated legacy bootstrap cannot contain remote operations',
+      });
+    }
+  }
   return failures;
+}
+
+async function syncAuthenticatedLegacyBootstrap(
+  state: PersistedFinanceState,
+  authenticatedOwnerId: string,
+  remote: RemoteAdapter,
+  now: () => string,
+): Promise<SyncResult> {
+  const bootstrap = state.legacyBootstrap;
+  if (bootstrap?.status !== 'pending') {
+    throw new Error('authenticated legacy bootstrap is not pending');
+  }
+
+  let pulled = 0;
+  const failures: SyncFailure[] = [];
+  let remoteData = emptyRemoteData(state.data.settings);
+  try {
+    const pullResult = normalizePullResponse(await remote.pull(authenticatedOwnerId));
+    pulled = pullResult.records.length;
+    failures.push(...pullResult.issues.map((issue) => ({ ...issue })));
+    for (const remoteRecord of pullResult.records) {
+      if (remoteRecord.record.ownerId !== authenticatedOwnerId) {
+        failures.push({
+          stage: 'validation',
+          message: `${remoteRecord.entity}/${remoteRecord.record.id} belongs to ${remoteRecord.record.ownerId}, not ${authenticatedOwnerId}`,
+          entity: remoteRecord.entity,
+          recordId: remoteRecord.record.id,
+        });
+        continue;
+      }
+      remoteData = replaceRecord(remoteData, remoteRecord);
+    }
+  } catch (error) {
+    failures.push({
+      stage: 'pull',
+      message: errorMessage(error),
+    });
+  }
+  if (failures.length === 0) {
+    try {
+      validateFinanceData(remoteData, 'authenticated legacy remote bootstrap graph');
+    } catch (error) {
+      failures.push({
+        stage: 'validation',
+        message: errorMessage(error),
+      });
+    }
+  }
+
+  if (failures.length > 0) {
+    const lastSyncError = failures.map((failure) => failure.message).join('; ');
+    return {
+      state: {
+        ...state,
+        lastSyncedAt: undefined,
+        lastSyncError,
+      },
+      report: {
+        ownerId: state.ownerId,
+        status: 'partial',
+        applied: 0,
+        pulled,
+        pending: [],
+        failures,
+        conflicts: [],
+      },
+    };
+  }
+
+  return {
+    state: {
+      ...state,
+      data: remoteData,
+      outbox: [],
+      legacyBootstrap: { ...bootstrap, status: 'ready' },
+      lastSyncedAt: now(),
+      lastSyncError: undefined,
+    },
+    report: {
+      ownerId: state.ownerId,
+      status: 'synced',
+      applied: 0,
+      pulled,
+      pending: [],
+      failures: [],
+      conflicts: [],
+    },
+  };
 }
 
 /**
@@ -330,6 +505,9 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
 ): PersistedFinanceState {
   if (state.ownerId === 'guest') {
     throw new Error('guest state is local-only and cannot enqueue remote sync operations');
+  }
+  if (state.legacyBootstrap?.status === 'pending') {
+    throw new Error('authenticated legacy bootstrap must finish its remote pull before local mutations');
   }
   if (record.ownerId !== state.ownerId) {
     throw new Error(`record ${record.id} belongs to ${record.ownerId}, not ${state.ownerId}`);
@@ -381,6 +559,9 @@ export async function syncFinanceState(
       },
     };
   }
+  if (state.legacyBootstrap?.status === 'pending') {
+    return syncAuthenticatedLegacyBootstrap(state, authenticatedOwnerId, remote, now);
+  }
 
   let failures: SyncFailure[] = [];
   const conflicts: SyncConflict[] = [];
@@ -420,7 +601,7 @@ export async function syncFinanceState(
     pulled = remoteRecords.length;
     pullSucceeded = true;
     const pendingKeys = new Set(
-      remaining.map((operation) => recordKey(operation.entity, operation.recordId)),
+      state.outbox.map((operation) => recordKey(operation.entity, operation.recordId)),
     );
     for (const remoteRecord of remoteRecords) {
       if (remoteRecord.record.ownerId !== authenticatedOwnerId) {
@@ -434,23 +615,27 @@ export async function syncFinanceState(
       }
       data = reconcileRecord(data, remoteRecord, pendingKeys, conflicts, failures);
     }
-    const unresolvedPayloadKeys = new Set(
+    const unresolvedByKey = new Map(
       conflicts
-        .filter((conflict) => conflict.winner === 'unresolved' && conflict.reason === 'payload')
-        .map((conflict) => recordKey(conflict.entity, conflict.recordId)),
+        .filter((conflict) => conflict.winner === 'unresolved')
+        .map((conflict) => [recordKey(conflict.entity, conflict.recordId), conflict] as const),
     );
-    if (unresolvedPayloadKeys.size > 0) {
+    if (unresolvedByKey.size > 0) {
       const retainedByKey = new Map(
         remaining.map((operation) => [recordKey(operation.entity, operation.recordId), operation]),
       );
       let requeuedSuccessful = 0;
       for (const operation of state.outbox) {
         const key = recordKey(operation.entity, operation.recordId);
-        if (!unresolvedPayloadKeys.has(key) || retainedByKey.has(key)) continue;
+        const conflict = unresolvedByKey.get(key);
+        if (!conflict || retainedByKey.has(key)) continue;
+        const lastError = conflict.reason === 'payload'
+          ? `unresolved same-clock payload conflict for ${operation.entity}/${operation.recordId}`
+          : `pending local mutation for ${operation.entity}/${operation.recordId} requires explicit review after the remote clock won`;
         retainedByKey.set(key, {
           ...operation,
           attempts: operation.attempts + 1,
-          lastError: `unresolved same-clock payload conflict for ${operation.entity}/${operation.recordId}`,
+          lastError,
         });
         requeuedSuccessful += 1;
       }
@@ -480,6 +665,24 @@ export async function syncFinanceState(
     }
   } catch (error) {
     failures.push({ stage: 'pull', message: errorMessage(error) });
+  }
+
+  if (pullSucceeded) {
+    try {
+      validateFinanceData(data, 'final reconciled graph');
+    } catch (error) {
+      failures.push({
+        stage: 'validation',
+        message: `Refused final reconciled graph: ${errorMessage(error)}`,
+      });
+      // A server write may already have succeeded, so retain every original
+      // operation for an idempotent retry instead of acknowledging a snapshot
+      // that cannot be safely loaded on the next launch.
+      data = state.data;
+      finalRemaining = state.outbox;
+      applied = 0;
+      pullSucceeded = false;
+    }
   }
 
   const lastSyncError = failures.map((failure) => failure.message).join('; ') || undefined;

@@ -113,7 +113,22 @@ async function verifyFreshAndRetry() {
       where schemaname = 'public'
         and policyname like 'finance_owner_%'
     `);
-    assert.equal(numeric(policyCount.count), 40, 'Expected four owner policies on each finance table');
+    assert.equal(
+      numeric(policyCount.count),
+      34,
+      'Expected owner CRUD policies plus DELETE only where a tombstone bridge exists',
+    );
+    const deletePolicyCount = await one(db, `
+      select count(*)::integer as count
+      from pg_policies
+      where schemaname = 'public'
+        and policyname = 'finance_owner_delete'
+    `);
+    assert.equal(
+      numeric(deletePolicyCount.count),
+      4,
+      'Only the four legacy tables may expose DELETE through a tombstone bridge',
+    );
 
     const triggerCount = await one(db, `
       select count(*)::integer as count
@@ -123,13 +138,67 @@ async function verifyFreshAndRetry() {
     `);
     assert.equal(numeric(triggerCount.count), 8, 'Expected one conflict-clock trigger per sync entity');
 
+    const allocationCapacityTriggerCount = await one(db, `
+      select count(*)::integer as count
+      from pg_trigger
+      where tgname = 'finance_v3_validate_allocation_capacity'
+        and not tgisinternal
+    `);
+    assert.equal(
+      numeric(allocationCapacityTriggerCount.count),
+      1,
+      'Expected one atomic capacity trigger on savings allocations',
+    );
+
+    const compatibilityTriggerCounts = await one(db, `
+      select
+        count(*) filter (where tgname = 'finance_v3_mirror_allocation_total')::integer
+          as allocation_mirror,
+        count(*) filter (where tgname = 'finance_v3_mirror_recurring_rule')::integer
+          as recurring_mirror,
+        count(*) filter (where tgname = 'finance_v3_pause_rules_on_parent_archive')::integer
+          as parent_pause,
+        count(*) filter (where tgname = 'finance_v3_validate_recurring_parents')::integer
+          as recurring_parent_guard
+      from pg_trigger
+      where not tgisinternal
+    `);
+    assert.deepEqual(
+      Object.fromEntries(
+        Object.entries(compatibilityTriggerCounts).map(([key, value]) => [key, numeric(value)]),
+      ),
+      {
+        allocation_mirror: 1,
+        recurring_mirror: 1,
+        parent_pause: 2,
+        recurring_parent_guard: 1,
+      },
+      'Expected one retry-safe compatibility trigger per invariant and parent table',
+    );
+
     const bridgeTriggerCount = await one(db, `
       select count(*)::integer as count
       from pg_trigger
       where tgname = 'finance_v3_00_legacy_bridge'
         and not tgisinternal
     `);
-    assert.equal(numeric(bridgeTriggerCount.count), 3, 'Expected legacy bridges on transactions, budgets, and goals');
+    assert.equal(
+      numeric(bridgeTriggerCount.count),
+      4,
+      'Expected legacy bridges on transactions, budgets, goals, and subscriptions',
+    );
+
+    const deleteTombstoneTriggerCount = await one(db, `
+      select count(*)::integer as count
+      from pg_trigger
+      where tgname = 'finance_v3_legacy_delete_tombstone'
+        and not tgisinternal
+    `);
+    assert.equal(
+      numeric(deleteTombstoneTriggerCount.count),
+      4,
+      'Expected one legacy DELETE tombstone bridge on each legacy finance table',
+    );
 
     const goalAuditTriggerCount = await one(db, `
       select count(*)::integer as count
@@ -204,9 +273,42 @@ async function verifyFreshAndRetry() {
         has_sequence_privilege('authenticated', 'public.future_private_sequence', 'usage') as authenticated_sequence,
         has_sequence_privilege('service_role', 'public.future_private_sequence', 'usage') as service_sequence,
         has_table_privilege('authenticated', 'public.accounts', 'select') as explicit_finance_grant,
+        has_table_privilege('authenticated', 'public.transactions', 'delete') as legacy_delete_grant,
+        has_table_privilege('authenticated', 'public.savings_allocations', 'delete') as allocation_delete_grant,
+        has_table_privilege('authenticated', 'public.recurring_rules', 'delete') as recurring_delete_grant,
         has_function_privilege('authenticated', 'finance_private.finance_v3_part(text)', 'execute') as stable_id_helper,
         has_function_privilege('authenticated', 'finance_private.bridge_legacy_finance_write()', 'execute') as mutation_helper,
-        has_function_privilege('authenticated', 'finance_private.set_goal_insert_statement_context()', 'execute') as context_helper
+        has_function_privilege('authenticated', 'finance_private.set_goal_insert_statement_context()', 'execute') as context_helper,
+        has_function_privilege(
+          'authenticated',
+          'finance_private.tombstone_legacy_finance_delete()',
+          'execute'
+        ) as delete_helper,
+        has_function_privilege(
+          'authenticated',
+          'finance_private.enforce_allocation_capacity()',
+          'execute'
+        ) as allocation_capacity_helper,
+        has_function_privilege(
+          'authenticated',
+          'finance_private.mirror_allocation_total_to_goal()',
+          'execute'
+        ) as allocation_mirror_helper,
+        has_function_privilege(
+          'authenticated',
+          'finance_private.mirror_recurring_rule_to_subscription()',
+          'execute'
+        ) as recurring_mirror_helper,
+        has_function_privilege(
+          'authenticated',
+          'finance_private.pause_rules_for_archived_parent()',
+          'execute'
+        ) as parent_pause_helper,
+        has_function_privilege(
+          'authenticated',
+          'finance_private.enforce_recurring_parent_active()',
+          'execute'
+        ) as recurring_parent_helper
     `);
     assert.deepEqual(futurePrivileges, {
       anon_table: false,
@@ -219,10 +321,454 @@ async function verifyFreshAndRetry() {
       authenticated_sequence: false,
       service_sequence: false,
       explicit_finance_grant: true,
+      legacy_delete_grant: true,
+      allocation_delete_grant: false,
+      recurring_delete_grant: false,
       stable_id_helper: true,
       mutation_helper: false,
       context_helper: false,
+      delete_helper: false,
+      allocation_capacity_helper: false,
+      allocation_mirror_helper: false,
+      recurring_mirror_helper: false,
+      parent_pause_helper: false,
+      recurring_parent_helper: false,
     }, 'Future public objects must be private until an explicit reviewed grant');
+
+    await db.query('insert into auth.users (id) values ($1)', [OWNER_A]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values ($1, 'capacity-cash', '現金', 'emoji', '💵', 100,
+        true, true, 0, 1, now(), 'capacity-account')
+    `, [OWNER_A]);
+    await db.query(`
+      insert into public.goals (
+        user_id, id, name, target_amount, current_amount, unit, is_active,
+        version, updated_at, last_operation_id
+      ) values ($1, 'capacity-goal', '併發配置', 1000, 0, '元', true,
+        1, now(), 'capacity-goal')
+    `, [OWNER_A]);
+
+    await db.exec('set role authenticated');
+    try {
+      await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+      const insertAllocation = (id, operationId) => db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at, version,
+          updated_at, last_operation_id
+        ) values ($1, $2, 'capacity-goal', 80, '2026-08-23 11:00', 1,
+          now(), $3)
+      `, [OWNER_A, id, operationId]);
+
+      await insertAllocation('capacity-device-a', 'capacity-op-a');
+      const goalAfterFirstAllocation = await one(db, `
+        select current_amount, version
+        from public.goals
+        where user_id = $1 and id = 'capacity-goal'
+      `, [OWNER_A]);
+      assert.deepEqual(
+        {
+          currentAmount: numeric(goalAfterFirstAllocation.current_amount),
+          version: numeric(goalAfterFirstAllocation.version),
+        },
+        { currentAmount: 80, version: 1 },
+        'A v3 allocation must update only the rollback-readable total, not the goal sync clock',
+      );
+
+      const offlineGoalEditAfterAllocation = await one(db, `
+        update public.goals
+        set name = '配置後的離線目標編輯', version = 2,
+          updated_at = now(), last_operation_id = 'capacity-goal-edit-2'
+        where user_id = $1 and id = 'capacity-goal'
+        returning name, current_amount, version, last_operation_id
+      `, [OWNER_A]);
+      assert.deepEqual(
+        {
+          name: offlineGoalEditAfterAllocation.name,
+          currentAmount: numeric(offlineGoalEditAfterAllocation.current_amount),
+          version: numeric(offlineGoalEditAfterAllocation.version),
+          lastOperationId: offlineGoalEditAfterAllocation.last_operation_id,
+        },
+        {
+          name: '配置後的離線目標編輯',
+          currentAmount: 80,
+          version: 2,
+          lastOperationId: 'capacity-goal-edit-2',
+        },
+        'Allocation projection must not make a later legitimate goal edit look stale',
+      );
+      await assert.rejects(
+        insertAllocation('capacity-device-b', 'capacity-op-b'),
+        /new savings allocation exceeds available assets/i,
+        'A second offline device must not atomically over-allocate the same available assets',
+      );
+
+      const afterRejectedWrite = await one(db, `
+        select count(*)::integer as count, sum(amount_delta) as total
+        from public.savings_allocations
+        where user_id = $1 and deleted_at is null
+      `, [OWNER_A]);
+      assert.deepEqual(
+        { count: numeric(afterRejectedWrite.count), total: numeric(afterRejectedWrite.total) },
+        { count: 1, total: 80 },
+        'A rejected concurrent allocation must leave the accepted server state unchanged',
+      );
+
+      await db.query(`
+        update public.savings_allocations
+        set deleted_at = now(), version = 2, last_operation_id = 'capacity-release-a'
+        where user_id = $1 and id = 'capacity-device-a'
+      `, [OWNER_A]);
+      await insertAllocation('capacity-device-b', 'capacity-op-b');
+
+      const goalAfterReleaseAndRetry = await one(db, `
+        select current_amount, version
+        from public.goals
+        where user_id = $1 and id = 'capacity-goal'
+      `, [OWNER_A]);
+      assert.deepEqual(
+        {
+          currentAmount: numeric(goalAfterReleaseAndRetry.current_amount),
+          version: numeric(goalAfterReleaseAndRetry.version),
+        },
+        { currentAmount: 80, version: 2 },
+        'Allocation changes must keep the legacy total equal without consuming the goal clock',
+      );
+
+      const legacyGoalEdit = await one(db, `
+        update public.goals
+        set current_amount = 70
+        where user_id = $1 and id = 'capacity-goal'
+        returning current_amount, version, last_operation_id
+      `, [OWNER_A]);
+      assert.equal(numeric(legacyGoalEdit.current_amount), 70);
+      assert.equal(numeric(legacyGoalEdit.version), 3);
+      assert.match(legacyGoalEdit.last_operation_id, /^legacy-update-/);
+      const afterLegacyGoalEdit = await one(db, `
+        select count(*) filter (where deleted_at is null)::integer as live_count,
+          sum(amount_delta) filter (where deleted_at is null) as live_total
+        from public.savings_allocations
+        where user_id = $1 and goal_id = 'capacity-goal'
+      `, [OWNER_A]);
+      assert.deepEqual(
+        {
+          liveCount: numeric(afterLegacyGoalEdit.live_count),
+          liveTotal: numeric(afterLegacyGoalEdit.live_total),
+        },
+        { liveCount: 2, liveTotal: 70 },
+        'A legacy goal edit must append only the delta and never double-count the mirrored total',
+      );
+
+      const exactLegacyGoalRetry = await one(db, `
+        update public.goals
+        set current_amount = 70
+        where user_id = $1 and id = 'capacity-goal'
+        returning version, last_operation_id
+      `, [OWNER_A]);
+      assert.deepEqual(
+        exactLegacyGoalRetry,
+        { version: 3, last_operation_id: legacyGoalEdit.last_operation_id },
+        'An exact legacy goal retry must not append another allocation delta',
+      );
+
+      await assert.rejects(
+        db.query(`
+          update public.savings_allocations
+          set amount_delta = 79, version = 2,
+            updated_at = now(), last_operation_id = 'capacity-rewrite-economic-event'
+          where user_id = $1 and id = 'capacity-device-b'
+        `, [OWNER_A]),
+        /savings allocation economic fields are immutable/i,
+        'A persisted allocation must be corrected with a new delta, not rewritten in place',
+      );
+      await assert.rejects(
+        db.query(`
+          insert into public.savings_allocations (
+            user_id, id, goal_id, amount_delta, occurred_at, version,
+            updated_at, last_operation_id
+          ) values ($1, 'capacity-over-release', 'capacity-goal', -71,
+            '2026-08-23 12:00', 1, now(), 'capacity-over-release-op')
+        `, [OWNER_A]),
+        /savings allocation cannot make a goal total negative/i,
+        'A new release delta must not make one goal allocation total negative',
+      );
+      const totalAfterRejectedAllocationRewrites = await one(db, `
+        select current_amount
+        from public.goals
+        where user_id = $1 and id = 'capacity-goal'
+      `, [OWNER_A]);
+      assert.equal(
+        numeric(totalAfterRejectedAllocationRewrites.current_amount),
+        70,
+        'Rejected allocation rewrites must leave the rollback-readable goal total unchanged',
+      );
+
+      await db.query(`
+        insert into public.categories (
+          user_id, id, kind, name, icon_type, icon_value, is_active,
+          sort_order, version, updated_at, last_operation_id
+        ) values ($1, 'capacity-category', 'expense', '訂閱', 'vector', 'tag', true,
+          0, 1, now(), 'capacity-category')
+      `, [OWNER_A]);
+      await db.query(`
+        insert into public.recurring_rules (
+          user_id, id, name, type, amount, category_id, category_name,
+          account_id, account_name, frequency, start_date, anchor_day,
+          next_occurrence_date, is_active, version, updated_at, last_operation_id
+        ) values (
+          $1, 'capacity-rule', '月費', 'expense', 10,
+          'capacity-category', '訂閱', 'capacity-cash', '現金',
+          'monthly', '2026-09-01', 1, '2026-09-01', true,
+          1, now(), 'capacity-rule-op-1'
+        )
+      `, [OWNER_A]);
+      const initialLegacyRuleMirror = await one(db, `
+        select is_active, deleted_at, version
+        from public.subscriptions
+        where user_id = $1 and id = 'capacity-rule'
+      `, [OWNER_A]);
+      assert.deepEqual(
+        {
+          isActive: initialLegacyRuleMirror.is_active,
+          deletedAt: initialLegacyRuleMirror.deleted_at,
+          version: numeric(initialLegacyRuleMirror.version),
+        },
+        { isActive: true, deletedAt: null, version: 1 },
+        'A v3 monthly rule must materialize as one legacy-visible subscription',
+      );
+
+      await assert.rejects(
+        db.query(`
+          update public.categories
+          set kind = 'income', version = 2,
+            updated_at = now(), last_operation_id = 'capacity-category-kind-drift-2'
+          where user_id = $1 and id = 'capacity-category'
+        `, [OWNER_A]),
+        /finance category kind is immutable/i,
+        'A category kind change must not strand an active recurring rule with a mismatched type',
+      );
+      const ruleAfterRejectedCategoryKindDrift = await one(db, `
+        select is_active, type
+        from public.recurring_rules
+        where user_id = $1 and id = 'capacity-rule'
+      `, [OWNER_A]);
+      assert.deepEqual(ruleAfterRejectedCategoryKindDrift, { is_active: true, type: 'expense' });
+
+      await assert.rejects(
+        db.query(`delete from public.savings_allocations
+          where user_id = $1 and id = 'capacity-device-b'`, [OWNER_A]),
+        /permission denied/i,
+        'Authenticated v3 callers must tombstone allocations instead of physically deleting them',
+      );
+      await assert.rejects(
+        db.query(`delete from public.recurring_rules
+          where user_id = $1 and id = 'capacity-rule'`, [OWNER_A]),
+        /permission denied/i,
+        'Authenticated v3 callers must tombstone recurring rules instead of bypassing their mirror',
+      );
+
+      await db.query(`
+        update public.accounts
+        set is_active = false, version = 2,
+          updated_at = now(), last_operation_id = 'capacity-account-archive-2'
+        where user_id = $1 and id = 'capacity-cash'
+      `, [OWNER_A]);
+      const pausedRule = await one(db, `
+        select is_active, deleted_at, version, last_operation_id
+        from public.recurring_rules
+        where user_id = $1 and id = 'capacity-rule'
+      `, [OWNER_A]);
+      assert.equal(pausedRule.is_active, false);
+      assert.equal(pausedRule.deleted_at, null);
+      assert.equal(numeric(pausedRule.version), 2);
+      assert.match(pausedRule.last_operation_id, /^parent-archive-pause-/);
+      const legacyHiddenAfterParentArchive = await one(db, `
+        select count(*)::integer as count
+        from public.subscriptions
+        where user_id = $1 and id = 'capacity-rule'
+      `, [OWNER_A]);
+      assert.equal(
+        numeric(legacyHiddenAfterParentArchive.count),
+        0,
+        'Archiving a recurrence parent must atomically hide the paused rule from old clients',
+      );
+
+      await db.query(
+        "select set_config('request.headers', '{\"x-shiba-finance-client\":\"v3\"}', false)",
+      );
+      const pausedMirror = await one(db, `
+        select is_active, deleted_at, version, last_operation_id
+        from public.subscriptions
+        where user_id = $1 and id = 'capacity-rule'
+      `, [OWNER_A]);
+      assert.equal(pausedMirror.is_active, false);
+      assert.equal(pausedMirror.deleted_at, null);
+      assert.equal(numeric(pausedMirror.version), 2);
+      assert.match(pausedMirror.last_operation_id, /^parent-archive-subscription-pause-/);
+
+      await db.query(`
+        update public.accounts
+        set is_active = false, version = 2,
+          last_operation_id = 'capacity-account-archive-2'
+        where user_id = $1 and id = 'capacity-cash'
+      `, [OWNER_A]);
+      const exactParentRetrySnapshot = await one(db, `
+        select
+          (select version from public.recurring_rules
+            where user_id = $1 and id = 'capacity-rule') as rule_version,
+          (select version from public.subscriptions
+            where user_id = $1 and id = 'capacity-rule') as subscription_version
+      `, [OWNER_A]);
+      assert.deepEqual(
+        {
+          ruleVersion: numeric(exactParentRetrySnapshot.rule_version),
+          subscriptionVersion: numeric(exactParentRetrySnapshot.subscription_version),
+        },
+        { ruleVersion: 2, subscriptionVersion: 2 },
+        'Retrying a parent archive must not manufacture recurring compatibility clocks',
+      );
+
+      await assert.rejects(
+        db.query(`
+          update public.recurring_rules
+          set is_active = true, version = 3,
+            updated_at = now(), last_operation_id = 'capacity-rule-resume-blocked-3'
+          where user_id = $1 and id = 'capacity-rule'
+        `, [OWNER_A]),
+        /active recurring rule requires an active account/i,
+        'An active rule must not be resumable while its account is archived',
+      );
+
+      await db.query(`
+        update public.accounts
+        set is_active = true, version = 3,
+          updated_at = now(), last_operation_id = 'capacity-account-resume-3'
+        where user_id = $1 and id = 'capacity-cash'
+      `, [OWNER_A]);
+      await db.query(`
+        update public.recurring_rules
+        set is_active = true, version = 3,
+          updated_at = now(), last_operation_id = 'capacity-rule-resume-3'
+        where user_id = $1 and id = 'capacity-rule'
+      `, [OWNER_A]);
+      await db.query("select set_config('request.headers', '{}', false)");
+      const legacyVisibleAfterRuleResume = await one(db, `
+        select is_active, deleted_at, version
+        from public.subscriptions
+        where user_id = $1 and id = 'capacity-rule'
+      `, [OWNER_A]);
+      assert.deepEqual(
+        {
+          isActive: legacyVisibleAfterRuleResume.is_active,
+          deletedAt: legacyVisibleAfterRuleResume.deleted_at,
+          version: numeric(legacyVisibleAfterRuleResume.version),
+        },
+        { isActive: true, deletedAt: null, version: 3 },
+        'Restoring the parent and rule must restore exactly one old-client-visible mirror',
+      );
+
+      await db.query(`
+        insert into public.goals (
+          user_id, id, name, target_amount, current_amount, unit,
+          is_active, version, updated_at, last_operation_id
+        ) values ($1, 'archived-goal', '封存目標', 100, 0, '元',
+          true, 1, now(), 'archived-goal-op-1')
+      `, [OWNER_A]);
+      await db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'archived-goal-allocation', 'archived-goal', 10,
+          '2026-08-23 15:00', 1, now(), 'archived-goal-allocation-op-1')
+      `, [OWNER_A]);
+      await db.query(
+        "select set_config('request.headers', '{\"x-shiba-finance-client\":\"v3\"}', false)",
+      );
+      await db.query(`
+        update public.goals
+        set is_active = false, version = 2,
+          updated_at = now(), last_operation_id = 'archived-goal-op-2'
+        where user_id = $1 and id = 'archived-goal'
+      `, [OWNER_A]);
+      await db.query("select set_config('request.headers', '{}', false)");
+      await assert.rejects(
+        db.query(`
+          insert into public.savings_allocations (
+            user_id, id, goal_id, amount_delta, occurred_at,
+            version, updated_at, last_operation_id
+          ) values ($1, 'archived-goal-new-allocation', 'archived-goal', 1,
+            '2026-08-23 15:01', 1, now(), 'archived-goal-new-allocation-op-1')
+        `, [OWNER_A]),
+        /new savings allocation requires an active goal/i,
+        'A newly increased allocation must not target an archived goal',
+      );
+      await db.query(`
+        update public.savings_allocations
+        set deleted_at = now(), version = 2,
+          updated_at = now(), last_operation_id = 'archived-goal-allocation-release-2'
+        where user_id = $1 and id = 'archived-goal-allocation'
+      `, [OWNER_A]);
+      await db.query(`
+        insert into public.budgets (
+          user_id, id, scope, category_id, category_name, period, amount,
+          is_active, version, updated_at, last_operation_id
+        ) values ($1, 'archived-budget', 'overall', null, null, 'monthly', 100,
+          false, 1, now(), 'archived-budget-op-1')
+      `, [OWNER_A]);
+      const headerlessArchivedRows = await one(db, `
+        select
+          (select count(*)::integer from public.goals
+            where user_id = $1 and id = 'archived-goal') as goals,
+          (select count(*)::integer from public.budgets
+            where user_id = $1 and id = 'archived-budget') as budgets
+      `, [OWNER_A]);
+      assert.deepEqual(
+        Object.fromEntries(
+          Object.entries(headerlessArchivedRows).map(([key, value]) => [key, numeric(value)]),
+        ),
+        { goals: 0, budgets: 0 },
+        'Headerless old clients must not reload archived planning rows as active data',
+      );
+      await db.query(
+        "select set_config('request.headers', '{\"x-shiba-finance-client\":\"v3\"}', false)",
+      );
+      const v3ArchivedRows = await one(db, `
+        select
+          (select count(*)::integer from public.goals
+            where user_id = $1 and id = 'archived-goal' and not is_active) as goals,
+          (select count(*)::integer from public.budgets
+            where user_id = $1 and id = 'archived-budget' and not is_active) as budgets,
+          (select current_amount from public.goals
+            where user_id = $1 and id = 'archived-goal') as goal_current_amount,
+          (select version from public.goals
+            where user_id = $1 and id = 'archived-goal') as goal_version,
+          (select last_operation_id from public.goals
+            where user_id = $1 and id = 'archived-goal') as goal_operation
+      `, [OWNER_A]);
+      assert.deepEqual(
+        {
+          goals: numeric(v3ArchivedRows.goals),
+          budgets: numeric(v3ArchivedRows.budgets),
+          goalCurrentAmount: numeric(v3ArchivedRows.goal_current_amount),
+          goalVersion: numeric(v3ArchivedRows.goal_version),
+          goalOperation: v3ArchivedRows.goal_operation,
+        },
+        {
+          goals: 1,
+          budgets: 1,
+          goalCurrentAmount: 0,
+          goalVersion: 2,
+          goalOperation: 'archived-goal-op-2',
+        },
+        'v3 retains archived rows while an internal allocation tombstone updates only the legacy total',
+      );
+      await db.query("select set_config('request.headers', '{}', false)");
+    } finally {
+      await db.exec('reset role');
+    }
   } finally {
     await db.close();
   }
@@ -302,7 +848,8 @@ async function createLegacyFixture(db) {
       (id, user_id, name, amount, category, account, recurring_date)
     values
       ('sub-31', $1, '串流娛樂', 399, '娛樂', '街口支付', 31),
-      ('sub-invalid', $1, '待人工檢查', -1, '', '', 32)
+      ('sub-invalid', $1, '待人工檢查', -1, '', '', 32),
+      ('sub-null-date', $1, '缺少扣款日', 199, '娛樂', '現金', null)
   `, [OWNER_A]);
 
   await db.query(`
@@ -311,6 +858,123 @@ async function createLegacyFixture(db) {
   `, [OWNER_A]);
 
   return { longAccountName };
+}
+
+async function verifyLegacyOwnerScopedPrimaryKeys(db, exerciseCollision = false) {
+  const result = await db.query(`
+    select table_class.relname as table_name, attribute.attname as column_name,
+      key_column.ordinality::integer as position
+    from pg_constraint as constraint_record
+    join pg_class as table_class on table_class.oid = constraint_record.conrelid
+    join pg_namespace as table_schema on table_schema.oid = table_class.relnamespace
+    cross join lateral unnest(constraint_record.conkey)
+      with ordinality as key_column(attnum, ordinality)
+    join pg_attribute as attribute
+      on attribute.attrelid = table_class.oid
+      and attribute.attnum = key_column.attnum
+    where constraint_record.contype = 'p'
+      and table_schema.nspname = 'public'
+      and table_class.relname in ('transactions', 'budgets', 'goals', 'subscriptions')
+    order by table_class.relname, key_column.ordinality
+  `);
+  const primaryKeys = Object.fromEntries(
+    ['transactions', 'budgets', 'goals', 'subscriptions'].map((table) => [
+      table,
+      result.rows
+        .filter((row) => row.table_name === table)
+        .map((row) => row.column_name),
+    ]),
+  );
+  assert.deepEqual(primaryKeys, {
+    transactions: ['user_id', 'id'],
+    budgets: ['user_id', 'id'],
+    goals: ['user_id', 'id'],
+    subscriptions: ['user_id', 'id'],
+  }, 'Every migrated legacy primary key must be owner-scoped');
+
+  if (!exerciseCollision) return;
+
+  await db.exec('set role authenticated');
+  try {
+    for (const [ownerId, note] of [
+      [OWNER_A, 'owner A shared ID'],
+      [OWNER_B, 'owner B shared ID'],
+    ]) {
+      await db.query("select set_config('request.jwt.claim.sub', $1, false)", [ownerId]);
+      await db.query(`
+        insert into public.transactions
+          (id, user_id, amount, type, category, note, date, account, icon)
+        values
+          ('same-id-across-owners', $1, 1, 'expense', '測試', $2,
+            '2026-08-23', '現金', 'SPARKLES')
+      `, [ownerId, note]);
+    }
+  } finally {
+    await db.exec('reset role');
+  }
+
+  const collisionRows = await one(db, `
+    select count(*)::integer as count, count(distinct user_id)::integer as owners
+    from public.transactions
+    where id = 'same-id-across-owners'
+  `);
+  assert.deepEqual(
+    { count: numeric(collisionRows.count), owners: numeric(collisionRows.owners) },
+    { count: 2, owners: 2 },
+    'Two owners must be able to reuse the same legacy client-generated ID',
+  );
+}
+
+async function verifyUnexpectedIncomingLegacyForeignKeyFailsClosed() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseAuth(db);
+    await createLegacyFixture(db);
+    await db.exec(`
+      create table public.external_transaction_links (
+        id text primary key,
+        transaction_id text not null references public.transactions (id)
+      );
+      insert into public.external_transaction_links (id, transaction_id)
+      values ('external-link', 'txn-a');
+    `);
+
+    try {
+      await assert.rejects(
+        db.exec(migrationSql),
+        /cannot owner-scope public\.transactions primary key while incoming foreign keys exist: public\.external_transaction_links/i,
+        'An unknown incoming FK must stop owner-scoping instead of being dropped or cascaded',
+      );
+    } finally {
+      await db.exec('rollback');
+    }
+
+    const preserved = await one(db, `
+      select
+        (select count(*)::integer from public.transactions) as transaction_count,
+        (select count(*)::integer from public.external_transaction_links) as external_link_count,
+        (select array_agg(attribute.attname order by key_column.ordinality)
+          from pg_constraint as constraint_record
+          cross join lateral unnest(constraint_record.conkey)
+            with ordinality as key_column(attnum, ordinality)
+          join pg_attribute as attribute
+            on attribute.attrelid = constraint_record.conrelid
+            and attribute.attnum = key_column.attnum
+          where constraint_record.conrelid = 'public.transactions'::regclass
+            and constraint_record.contype = 'p') as primary_key_columns
+    `);
+    assert.deepEqual(
+      {
+        transactionCount: numeric(preserved.transaction_count),
+        externalLinkCount: numeric(preserved.external_link_count),
+        primaryKeyColumns: preserved.primary_key_columns,
+      },
+      { transactionCount: 4, externalLinkCount: 1, primaryKeyColumns: ['id'] },
+      'A blocked conversion must roll back without changing legacy data or dependencies',
+    );
+  } finally {
+    if (!db.closed) await db.close();
+  }
 }
 
 async function verifyLegacyBackfill(db, longAccountName) {
@@ -397,6 +1061,20 @@ async function verifyLegacyBackfill(db, longAccountName) {
   `, [OWNER_A]);
   assert.equal(invalidSubscription.requires_review, true);
   assert.equal(numeric(invalidSubscription.rule_count), 0, 'Invalid legacy data must be preserved for review, not reinterpreted');
+
+  const nullDateSubscription = await one(db, `
+    select requires_review,
+      (select count(*)::integer from public.recurring_rules as rule
+        where rule.user_id = subscription.user_id and rule.id = subscription.id) as rule_count
+    from public.subscriptions as subscription
+    where user_id = $1 and id = 'sub-null-date'
+  `, [OWNER_A]);
+  assert.equal(nullDateSubscription.requires_review, true);
+  assert.equal(
+    numeric(nullDateSubscription.rule_count),
+    0,
+    'A NULL legacy recurrence date must be preserved for review without aborting migration',
+  );
 
   const settings = await one(db, `
     select currency, locale, active_goal_id
@@ -550,6 +1228,384 @@ async function verifyPostMigrationLegacyWrites(db) {
       'Legacy goal totals must become atomic, auditable allocation deltas',
     );
 
+    const insertedSubscription = await one(db, `
+      insert into public.subscriptions
+        (id, user_id, name, amount, category, account, recurring_date)
+      values
+        ('legacy-subscription-after-migration', $1, '新版前固定開銷', 299, '娛樂', '街口支付', 31)
+      returning requires_review, version, last_operation_id
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        requiresReview: insertedSubscription.requires_review,
+        version: numeric(insertedSubscription.version),
+      },
+      { requiresReview: false, version: 1 },
+    );
+    assert.match(insertedSubscription.last_operation_id, /^legacy-insert-/);
+
+    const bridgedSubscriptionRule = await one(db, `
+      select name, amount, type, category_id, category_name, account_id,
+        account_name, frequency, anchor_day, start_date, next_occurrence_date,
+        is_active, version, last_operation_id,
+        next_occurrence_date > current_date as starts_in_future
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        name: bridgedSubscriptionRule.name,
+        amount: numeric(bridgedSubscriptionRule.amount),
+        type: bridgedSubscriptionRule.type,
+        categoryId: bridgedSubscriptionRule.category_id,
+        categoryName: bridgedSubscriptionRule.category_name,
+        accountId: bridgedSubscriptionRule.account_id,
+        accountName: bridgedSubscriptionRule.account_name,
+        frequency: bridgedSubscriptionRule.frequency,
+        anchorDay: numeric(bridgedSubscriptionRule.anchor_day),
+        sameCursor: String(bridgedSubscriptionRule.start_date)
+          === String(bridgedSubscriptionRule.next_occurrence_date),
+        isActive: bridgedSubscriptionRule.is_active,
+        version: numeric(bridgedSubscriptionRule.version),
+        startsInFuture: bridgedSubscriptionRule.starts_in_future,
+      },
+      {
+        name: '新版前固定開銷',
+        amount: 299,
+        type: 'expense',
+        categoryId: stableLegacyId('category', OWNER_A, 'expense', '娛樂'),
+        categoryName: '娛樂',
+        accountId: stableLegacyId('account', OWNER_A, '街口支付'),
+        accountName: '街口支付',
+        frequency: 'monthly',
+        anchorDay: 31,
+        sameCursor: true,
+        isActive: true,
+        version: 1,
+        startsInFuture: true,
+      },
+      'A post-migration legacy subscription insert must become one owner-scoped v3 rule',
+    );
+    assert.match(bridgedSubscriptionRule.last_operation_id, /^legacy-subscription-rule-/);
+
+    const v3AdvancedSubscriptionRule = await one(db, `
+      update public.recurring_rules
+      set name = 'v3 裝置上的名稱', next_occurrence_date = '2027-01-31',
+        version = 2, updated_at = '2026-08-23T12:00:00Z',
+        last_operation_id = 'v3-subscription-rule-clock-2'
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning version, last_operation_id, next_occurrence_date
+    `, [OWNER_A]);
+    assert.equal(numeric(v3AdvancedSubscriptionRule.version), 2);
+
+    const updatedSubscription = await one(db, `
+      update public.subscriptions
+      set amount = 349
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning amount, version, last_operation_id
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        amount: numeric(updatedSubscription.amount),
+        version: numeric(updatedSubscription.version),
+      },
+      { amount: 349, version: 3 },
+      'A real legacy subscription edit must advance its own conflict clock',
+    );
+    assert.match(updatedSubscription.last_operation_id, /^legacy-update-/);
+
+    const selectivelyUpdatedRule = await one(db, `
+      select name, amount,
+        to_char(next_occurrence_date, 'YYYY-MM-DD') as next_occurrence_date,
+        version, last_operation_id
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        name: selectivelyUpdatedRule.name,
+        amount: numeric(selectivelyUpdatedRule.amount),
+        nextOccurrenceDate: String(selectivelyUpdatedRule.next_occurrence_date),
+        version: numeric(selectivelyUpdatedRule.version),
+      },
+      {
+        name: 'v3 裝置上的名稱',
+        amount: 349,
+        nextOccurrenceDate: '2027-01-31',
+        version: 3,
+      },
+      'A legacy partial edit must not rewind the cursor or overwrite unrelated newer v3 fields',
+    );
+    assert.match(selectivelyUpdatedRule.last_operation_id, /^legacy-subscription-rule-/);
+
+    const exactSubscriptionRetry = await one(db, `
+      update public.subscriptions
+      set amount = 349
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning version, last_operation_id
+    `, [OWNER_A]);
+    const ruleAfterExactSubscriptionRetry = await one(db, `
+      select version, last_operation_id
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        subscriptionVersion: numeric(exactSubscriptionRetry.version),
+        subscriptionOperation: exactSubscriptionRetry.last_operation_id,
+        ruleVersion: numeric(ruleAfterExactSubscriptionRetry.version),
+        ruleOperation: ruleAfterExactSubscriptionRetry.last_operation_id,
+      },
+      {
+        subscriptionVersion: 3,
+        subscriptionOperation: updatedSubscription.last_operation_id,
+        ruleVersion: 3,
+        ruleOperation: selectivelyUpdatedRule.last_operation_id,
+      },
+      'An exact legacy subscription retry must not manufacture another rule version',
+    );
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
+    const otherOwnerSubscription = await one(db, `
+      insert into public.subscriptions
+        (id, user_id, name, amount, category, account, recurring_date)
+      values
+        ('legacy-subscription-after-migration', $1, '另一位使用者', 88, '娛樂', '銀行', 8)
+      returning version, last_operation_id
+    `, [OWNER_B]);
+    const otherOwnerRuleBeforeInvalidation = await one(db, `
+      select version, last_operation_id, is_active, deleted_at
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_B]);
+    assert.equal(numeric(otherOwnerSubscription.version), 1);
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    const pausedV3Rule = await one(db, `
+      update public.recurring_rules
+      set is_active = false, version = 4,
+        updated_at = '2026-08-23T13:00:00Z',
+        last_operation_id = 'v3-subscription-rule-paused-clock-4'
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning version, is_active, last_operation_id
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        version: numeric(pausedV3Rule.version),
+        isActive: pausedV3Rule.is_active,
+      },
+      { version: 4, isActive: false },
+    );
+
+    const hiddenPausedSubscription = await one(db, `
+      select count(*)::integer as count
+      from public.subscriptions
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.equal(
+      numeric(hiddenPausedSubscription.count),
+      0,
+      'A paused v3 recurring rule must disappear from headerless legacy subscription reads',
+    );
+    await db.query(
+      "select set_config('request.headers', '{\"x-shiba-finance-client\":\"v3\"}', false)",
+    );
+    const v3VisiblePausedSubscription = await one(db, `
+      select count(*)::integer as count
+      from public.subscriptions
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+        and not is_active
+    `, [OWNER_A]);
+    assert.equal(
+      numeric(v3VisiblePausedSubscription.count),
+      1,
+      'The v3 capability must retain the paused legacy mirror for reconciliation',
+    );
+
+    const invalidatedSubscription = await one(db, `
+      update public.subscriptions
+      set account = '   '
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning requires_review, version, last_operation_id
+    `, [OWNER_A]);
+    const ruleAfterInvalidation = await one(db, `
+      select name, amount,
+        to_char(next_occurrence_date, 'YYYY-MM-DD') as next_occurrence_date,
+        is_active, deleted_at is not null as deleted, version, last_operation_id
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        requiresReview: invalidatedSubscription.requires_review,
+        subscriptionVersion: numeric(invalidatedSubscription.version),
+        ruleName: ruleAfterInvalidation.name,
+        ruleAmount: numeric(ruleAfterInvalidation.amount),
+        nextOccurrenceDate: String(ruleAfterInvalidation.next_occurrence_date),
+        ruleActive: ruleAfterInvalidation.is_active,
+        ruleDeleted: ruleAfterInvalidation.deleted,
+        ruleVersion: numeric(ruleAfterInvalidation.version),
+      },
+      {
+        requiresReview: true,
+        subscriptionVersion: 5,
+        ruleName: 'v3 裝置上的名稱',
+        ruleAmount: 349,
+        nextOccurrenceDate: '2027-01-31',
+        ruleActive: false,
+        ruleDeleted: true,
+        ruleVersion: 5,
+      },
+      'Invalid legacy subscription data must be preserved for review while its rule fails closed',
+    );
+    assert.match(invalidatedSubscription.last_operation_id, /^legacy-update-/);
+    assert.match(ruleAfterInvalidation.last_operation_id, /^legacy-subscription-invalid-paused-/);
+
+    const invalidRetry = await one(db, `
+      update public.subscriptions
+      set account = '   '
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning version, last_operation_id
+    `, [OWNER_A]);
+    const ruleAfterInvalidRetry = await one(db, `
+      select version, last_operation_id
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        subscriptionVersion: numeric(invalidRetry.version),
+        subscriptionOperation: invalidRetry.last_operation_id,
+        ruleVersion: numeric(ruleAfterInvalidRetry.version),
+        ruleOperation: ruleAfterInvalidRetry.last_operation_id,
+      },
+      {
+        subscriptionVersion: 5,
+        subscriptionOperation: invalidatedSubscription.last_operation_id,
+        ruleVersion: 5,
+        ruleOperation: ruleAfterInvalidation.last_operation_id,
+      },
+      'Retrying the same invalid legacy payload must not advance either clock',
+    );
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
+    const otherOwnerRuleAfterInvalidation = await one(db, `
+      select version, last_operation_id, is_active, deleted_at
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_B]);
+    assert.deepEqual(
+      otherOwnerRuleAfterInvalidation,
+      otherOwnerRuleBeforeInvalidation,
+      'Invalidating one owner subscription must not touch a same-ID rule owned by another user',
+    );
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    const repairedSubscription = await one(db, `
+      update public.subscriptions
+      set account = '街口支付'
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning requires_review, version, last_operation_id
+    `, [OWNER_A]);
+    const repairedRule = await one(db, `
+      select account_id, account_name,
+        to_char(next_occurrence_date, 'YYYY-MM-DD') as next_occurrence_date,
+        is_active, deleted_at, version, last_operation_id
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        requiresReview: repairedSubscription.requires_review,
+        subscriptionVersion: numeric(repairedSubscription.version),
+        accountId: repairedRule.account_id,
+        accountName: repairedRule.account_name,
+        nextOccurrenceDate: String(repairedRule.next_occurrence_date),
+        isActive: repairedRule.is_active,
+        deletedAt: repairedRule.deleted_at,
+        ruleVersion: numeric(repairedRule.version),
+      },
+      {
+        requiresReview: false,
+        subscriptionVersion: 6,
+        accountId: stableLegacyId('account', OWNER_A, '街口支付'),
+        accountName: '街口支付',
+        nextOccurrenceDate: '2027-01-31',
+        isActive: false,
+        deletedAt: null,
+        ruleVersion: 6,
+      },
+      'Repairing invalid legacy data must restore the rule without reviving a newer v3 pause',
+    );
+    assert.match(repairedRule.last_operation_id, /^legacy-subscription-rule-/);
+
+    const repairedRetry = await one(db, `
+      update public.subscriptions
+      set account = '街口支付'
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning version, last_operation_id
+    `, [OWNER_A]);
+    const ruleAfterRepairedRetry = await one(db, `
+      select version, last_operation_id
+      from public.recurring_rules
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        subscriptionVersion: numeric(repairedRetry.version),
+        subscriptionOperation: repairedRetry.last_operation_id,
+        ruleVersion: numeric(ruleAfterRepairedRetry.version),
+        ruleOperation: ruleAfterRepairedRetry.last_operation_id,
+      },
+      {
+        subscriptionVersion: 6,
+        subscriptionOperation: repairedSubscription.last_operation_id,
+        ruleVersion: 6,
+        ruleOperation: repairedRule.last_operation_id,
+      },
+      'Retrying a repaired legacy payload must remain clock-idempotent',
+    );
+
+    const resumedV3Rule = await one(db, `
+      update public.recurring_rules
+      set is_active = true, version = 7,
+        updated_at = '2026-08-23T14:00:00Z',
+        last_operation_id = 'v3-subscription-rule-resumed-clock-7'
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+      returning version, is_active, deleted_at
+    `, [OWNER_A]);
+    const resumedLegacyMirror = await one(db, `
+      select version, is_active, deleted_at
+      from public.subscriptions
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        ruleVersion: numeric(resumedV3Rule.version),
+        ruleActive: resumedV3Rule.is_active,
+        ruleDeletedAt: resumedV3Rule.deleted_at,
+        subscriptionVersion: numeric(resumedLegacyMirror.version),
+        subscriptionActive: resumedLegacyMirror.is_active,
+        subscriptionDeletedAt: resumedLegacyMirror.deleted_at,
+      },
+      {
+        ruleVersion: 7,
+        ruleActive: true,
+        ruleDeletedAt: null,
+        subscriptionVersion: 7,
+        subscriptionActive: true,
+        subscriptionDeletedAt: null,
+      },
+      'Resuming a monthly v3 rule must restore exactly one legacy-visible subscription mirror',
+    );
+    await db.query("select set_config('request.headers', '{}', false)");
+    const legacyVisibleResumedSubscription = await one(db, `
+      select count(*)::integer as count
+      from public.subscriptions
+      where user_id = $1 and id = 'legacy-subscription-after-migration'
+    `, [OWNER_A]);
+    assert.equal(numeric(legacyVisibleResumedSubscription.count), 1);
+
     await assert.rejects(
       db.query(`
         insert into public.transactions
@@ -678,6 +1734,202 @@ async function verifyV3GoalUpsertPreservesLegacyTotal(db) {
   }
 }
 
+async function legacyDeleteSnapshot(db) {
+  const snapshot = await one(db, `
+    select
+      (select version from public.transactions
+        where user_id = $1 and id = 'legacy-after-migration') as transaction_version,
+      (select last_operation_id from public.transactions
+        where user_id = $1 and id = 'legacy-after-migration') as transaction_operation,
+      (select deleted_at is not null from public.transactions
+        where user_id = $1 and id = 'legacy-after-migration') as transaction_deleted,
+      (select version from public.budgets
+        where user_id = $1 and id = 'legacy-budget-after-migration') as budget_version,
+      (select last_operation_id from public.budgets
+        where user_id = $1 and id = 'legacy-budget-after-migration') as budget_operation,
+      (select deleted_at is not null from public.budgets
+        where user_id = $1 and id = 'legacy-budget-after-migration') as budget_deleted,
+      (select version from public.goals
+        where user_id = $1 and id = 'legacy-goal-after-migration') as goal_version,
+      (select last_operation_id from public.goals
+        where user_id = $1 and id = 'legacy-goal-after-migration') as goal_operation,
+      (select deleted_at is not null and not is_active from public.goals
+        where user_id = $1 and id = 'legacy-goal-after-migration') as goal_deleted,
+      (select count(*)::integer from public.savings_allocations
+        where user_id = $1 and goal_id = 'legacy-goal-after-migration') as allocation_count,
+      (select count(*)::integer from public.savings_allocations
+        where user_id = $1 and goal_id = 'legacy-goal-after-migration'
+          and deleted_at is null) as live_allocation_count,
+      (select min(version) from public.savings_allocations
+        where user_id = $1 and goal_id = 'legacy-goal-after-migration') as allocation_min_version,
+      (select version from public.subscriptions
+        where user_id = $1 and id = 'legacy-subscription-after-migration') as subscription_version,
+      (select last_operation_id from public.subscriptions
+        where user_id = $1 and id = 'legacy-subscription-after-migration') as subscription_operation,
+      (select deleted_at is not null and not is_active from public.subscriptions
+        where user_id = $1 and id = 'legacy-subscription-after-migration') as subscription_deleted,
+      (select version from public.recurring_rules
+        where user_id = $1 and id = 'legacy-subscription-after-migration') as rule_version,
+      (select last_operation_id from public.recurring_rules
+        where user_id = $1 and id = 'legacy-subscription-after-migration') as rule_operation,
+      (select deleted_at is not null and not is_active from public.recurring_rules
+        where user_id = $1 and id = 'legacy-subscription-after-migration') as rule_deleted,
+      (select deleted_at is null from public.transactions
+        where user_id = $2 and id = 'txn-b') as other_owner_transaction_live
+  `, [OWNER_A, OWNER_B]);
+  return {
+    transactionVersion: numeric(snapshot.transaction_version),
+    transactionOperation: snapshot.transaction_operation,
+    transactionDeleted: snapshot.transaction_deleted,
+    budgetVersion: numeric(snapshot.budget_version),
+    budgetOperation: snapshot.budget_operation,
+    budgetDeleted: snapshot.budget_deleted,
+    goalVersion: numeric(snapshot.goal_version),
+    goalOperation: snapshot.goal_operation,
+    goalDeleted: snapshot.goal_deleted,
+    allocationCount: numeric(snapshot.allocation_count),
+    liveAllocationCount: numeric(snapshot.live_allocation_count),
+    allocationMinVersion: numeric(snapshot.allocation_min_version),
+    subscriptionVersion: numeric(snapshot.subscription_version),
+    subscriptionOperation: snapshot.subscription_operation,
+    subscriptionDeleted: snapshot.subscription_deleted,
+    ruleVersion: numeric(snapshot.rule_version),
+    ruleOperation: snapshot.rule_operation,
+    ruleDeleted: snapshot.rule_deleted,
+    otherOwnerTransactionLive: snapshot.other_owner_transaction_live,
+  };
+}
+
+async function verifyPostMigrationLegacyDeletes(db) {
+  await db.exec('set role authenticated');
+  try {
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
+    const foreignDelete = await db.query(`
+      delete from public.transactions
+      where user_id = $1 and id = 'legacy-after-migration'
+      returning id
+    `, [OWNER_A]);
+    assert.deepEqual(
+      foreignDelete.rows,
+      [],
+      'RLS must prevent another owner from invoking the legacy delete bridge',
+    );
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    for (const [table, id] of [
+      ['transactions', 'legacy-after-migration'],
+      ['budgets', 'legacy-budget-after-migration'],
+      ['goals', 'legacy-goal-after-migration'],
+      ['subscriptions', 'legacy-subscription-after-migration'],
+    ]) {
+      await db.query(`delete from public.${table} where user_id = $1 and id = $2`, [OWNER_A, id]);
+    }
+
+    const legacyVisibleAfterDelete = await one(db, `
+      select
+        (select count(*)::integer from public.transactions
+          where user_id = $1 and id = 'legacy-after-migration') as transactions,
+        (select count(*)::integer from public.budgets
+          where user_id = $1 and id = 'legacy-budget-after-migration') as budgets,
+        (select count(*)::integer from public.goals
+          where user_id = $1 and id = 'legacy-goal-after-migration') as goals,
+        (select count(*)::integer from public.subscriptions
+          where user_id = $1 and id = 'legacy-subscription-after-migration') as subscriptions
+    `, [OWNER_A]);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(legacyVisibleAfterDelete).map(([key, value]) => [key, numeric(value)])),
+      { transactions: 0, budgets: 0, goals: 0, subscriptions: 0 },
+      'A legacy client without the v3 capability header must not reload tombstones as live rows',
+    );
+
+    await db.query(
+      "select set_config('request.headers', '{\"x-shiba-finance-client\":\"v3\"}', false)",
+    );
+    const v3VisibleTombstones = await one(db, `
+      select
+        (select count(*)::integer from public.transactions
+          where user_id = $1 and id = 'legacy-after-migration' and deleted_at is not null) as transactions,
+        (select count(*)::integer from public.budgets
+          where user_id = $1 and id = 'legacy-budget-after-migration' and deleted_at is not null) as budgets,
+        (select count(*)::integer from public.goals
+          where user_id = $1 and id = 'legacy-goal-after-migration' and deleted_at is not null) as goals,
+        (select count(*)::integer from public.subscriptions
+          where user_id = $1 and id = 'legacy-subscription-after-migration' and deleted_at is not null) as subscriptions
+    `, [OWNER_A]);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(v3VisibleTombstones).map(([key, value]) => [key, numeric(value)])),
+      { transactions: 1, budgets: 1, goals: 1, subscriptions: 1 },
+      'The v3 capability header must retain owner-scoped tombstones for reconciliation',
+    );
+    await db.query("select set_config('request.headers', '{}', false)");
+
+    await db.exec('reset role');
+    const first = await legacyDeleteSnapshot(db);
+    assert.deepEqual(
+      {
+        transactionVersion: first.transactionVersion,
+        transactionDeleted: first.transactionDeleted,
+        budgetVersion: first.budgetVersion,
+        budgetDeleted: first.budgetDeleted,
+        goalVersion: first.goalVersion,
+        goalDeleted: first.goalDeleted,
+        allocationCount: first.allocationCount,
+        liveAllocationCount: first.liveAllocationCount,
+        allocationMinVersion: first.allocationMinVersion,
+        subscriptionVersion: first.subscriptionVersion,
+        subscriptionDeleted: first.subscriptionDeleted,
+        ruleVersion: first.ruleVersion,
+        ruleDeleted: first.ruleDeleted,
+        otherOwnerTransactionLive: first.otherOwnerTransactionLive,
+      },
+      {
+        transactionVersion: 3,
+        transactionDeleted: true,
+        budgetVersion: 3,
+        budgetDeleted: true,
+        goalVersion: 3,
+        goalDeleted: true,
+        allocationCount: 2,
+        liveAllocationCount: 0,
+        allocationMinVersion: 2,
+        subscriptionVersion: 8,
+        subscriptionDeleted: true,
+        ruleVersion: 8,
+        ruleDeleted: true,
+        otherOwnerTransactionLive: true,
+      },
+      'Legacy deletes must become auditable tombstones without crossing owners',
+    );
+    assert.match(first.transactionOperation, /^legacy-delete-/);
+    assert.match(first.budgetOperation, /^legacy-delete-/);
+    assert.match(first.goalOperation, /^legacy-delete-/);
+    assert.match(first.subscriptionOperation, /^legacy-delete-/);
+    assert.match(first.ruleOperation, /^legacy-delete-rule-/);
+
+    await db.exec('set role authenticated');
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    for (const [table, id] of [
+      ['transactions', 'legacy-after-migration'],
+      ['budgets', 'legacy-budget-after-migration'],
+      ['goals', 'legacy-goal-after-migration'],
+      ['subscriptions', 'legacy-subscription-after-migration'],
+    ]) {
+      await db.query(`delete from public.${table} where user_id = $1 and id = $2`, [OWNER_A, id]);
+    }
+    await db.exec('reset role');
+
+    const exactRetry = await legacyDeleteSnapshot(db);
+    assert.deepEqual(
+      exactRetry,
+      first,
+      'Retrying an already tombstoned legacy delete must preserve every conflict clock',
+    );
+    return first;
+  } finally {
+    await db.exec('reset role');
+  }
+}
+
 async function verifyOwnerRlsAndConflictClock(db) {
   await db.exec('set role authenticated');
   await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
@@ -756,7 +2008,21 @@ async function verifyLegacyRetryRlsAndClock() {
     await bootstrapSupabaseAuth(db);
     const { longAccountName } = await createLegacyFixture(db);
     await db.exec(migrationSql);
+    await verifyLegacyOwnerScopedPrimaryKeys(db);
     await verifyLegacyBackfill(db, longAccountName);
+
+    // The legacy fixture intentionally starts with no authoritative opening
+    // balances. Give the mixed-version write exercises real available assets;
+    // preserved legacy over-allocation itself remains covered by the backfill
+    // assertions above, while future increases are subject to the new gate.
+    await db.query(`
+      update public.accounts
+      set opening_balance = 20000,
+        version = version + 1,
+        updated_at = clock_timestamp(),
+        last_operation_id = 'fixture-fund-mixed-version-writes'
+      where user_id = $1 and legacy_key = '現金'
+    `, [OWNER_A]);
 
     await db.exec(migrationSql);
     const repeatCounts = await one(db, `
@@ -774,14 +2040,17 @@ async function verifyLegacyRetryRlsAndClock() {
       { allocations: 1, recurringRules: 1, settings: 1 },
       'Retrying the migration must not duplicate deterministic data',
     );
+    await verifyLegacyOwnerScopedPrimaryKeys(db, true);
 
     await verifyV3GoalUpsertPreservesLegacyTotal(db);
     await verifyPostMigrationLegacyWrites(db);
+    const deleteSnapshot = await verifyPostMigrationLegacyDeletes(db);
 
     // A reviewed migration may be retried after old clients have continued to
     // write. The one-time backfill must not duplicate bridge-created goal
     // allocations or rewrite their conflict clocks.
     await db.exec(migrationSql);
+    await verifyLegacyOwnerScopedPrimaryKeys(db);
     const bridgeRetry = await one(db, `
       select
         (select count(*)::integer from public.savings_allocations
@@ -815,8 +2084,8 @@ async function verifyLegacyRetryRlsAndClock() {
       {
         allocationCount: 2,
         allocationTotal: 350,
-        transactionVersion: 2,
-        budgetVersion: 2,
+        transactionVersion: deleteSnapshot.transactionVersion,
+        budgetVersion: deleteSnapshot.budgetVersion,
         goalACurrentAmount: 1600,
         goalAVersion: 3,
         goalAAllocationCount: 2,
@@ -831,10 +2100,107 @@ async function verifyLegacyRetryRlsAndClock() {
   }
 }
 
+async function verifyLegacyNegativeGoalDeleteTombstonesAtomically() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseAuth(db);
+    await db.exec(`
+      insert into auth.users (id) values ('${OWNER_A}');
+      create table public.goals (
+        id text primary key,
+        user_id uuid not null references auth.users (id) on delete cascade,
+        name text not null,
+        target_amount numeric not null,
+        current_amount numeric not null,
+        unit text not null,
+        target_date text
+      );
+      insert into public.goals (
+        id, user_id, name, target_amount, current_amount, unit, target_date
+      ) values (
+        'legacy-negative-goal', '${OWNER_A}', '舊版負配置目標', 100, -50, '元', null
+      );
+    `);
+    await db.exec(migrationSql);
+
+    await db.exec('set role authenticated');
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values (
+        $1, 'legacy-negative-cash', '現金', 'vector', 'wallet', 50,
+        true, true, 0, 1, now(), 'legacy-negative-cash-op-1'
+      )
+    `, [OWNER_A]);
+    await db.query(`
+      insert into public.savings_allocations (
+        user_id, id, goal_id, amount_delta, occurred_at,
+        version, updated_at, last_operation_id
+      ) values (
+        $1, 'legacy-negative-positive-allocation', 'legacy-negative-goal', 100,
+        '2026-08-23', 1, now(), 'legacy-negative-positive-allocation-op-1'
+      )
+    `, [OWNER_A]);
+
+    await db.query(`
+      delete from public.goals
+      where user_id = $1 and id = 'legacy-negative-goal'
+    `, [OWNER_A]);
+
+    await db.query(
+      "select set_config('request.headers', '{\"x-shiba-finance-client\":\"v3\"}', false)",
+    );
+    const tombstoned = await one(db, `
+      select goal.deleted_at is not null as goal_deleted,
+        goal.current_amount, goal.version, goal.last_operation_id,
+        count(allocation.id)::integer as allocation_count,
+        count(allocation.id) filter (where allocation.deleted_at is null)::integer
+          as live_allocation_count
+      from public.goals as goal
+      left join public.savings_allocations as allocation
+        on allocation.user_id = goal.user_id and allocation.goal_id = goal.id
+      where goal.user_id = $1 and goal.id = 'legacy-negative-goal'
+      group by goal.user_id, goal.id, goal.deleted_at, goal.current_amount,
+        goal.version, goal.last_operation_id
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        goalDeleted: tombstoned.goal_deleted,
+        currentAmount: numeric(tombstoned.current_amount),
+        version: numeric(tombstoned.version),
+        allocationCount: numeric(tombstoned.allocation_count),
+        liveAllocationCount: numeric(tombstoned.live_allocation_count),
+      },
+      {
+        goalDeleted: true,
+        currentAmount: 0,
+        version: 2,
+        allocationCount: 2,
+        liveAllocationCount: 0,
+      },
+      'Deleting a migrated negative goal must atomically tombstone every allocation without an order-dependent capacity failure',
+    );
+    assert.match(
+      tombstoned.last_operation_id,
+      /^legacy-delete-/,
+      'The compatibility projection must not consume or replace the goal tombstone clock',
+    );
+  } finally {
+    await db.exec('reset role');
+    await db.close();
+  }
+}
+
 await verifyFreshAndRetry();
 console.log('[pass] fresh schema and retry-safe DDL');
 console.log('[pass] future public objects require explicit grants');
 console.log('[pass] NOT VALID checks protect future writes');
+
+await verifyUnexpectedIncomingLegacyForeignKeyFailsClosed();
+console.log('[pass] unexpected legacy FK dependencies fail closed without partial migration');
 
 await verifyLegacyRetryRlsAndClock();
 console.log('[pass] deterministic legacy backfill and retry safety');
@@ -843,4 +2209,7 @@ console.log('[pass] post-migration legacy write bridges and goal allocation audi
 console.log('[pass] authenticated owner RLS isolation');
 console.log('[pass] stale UPSERT conflict-clock retention');
 console.log('[pass] exact retry accepted and same-clock divergent payload rejected');
+
+await verifyLegacyNegativeGoalDeleteTombstonesAtomically();
+console.log('[pass] legacy negative goal delete tombstones allocations atomically');
 console.log('Supabase migration verification passed without an external database.');

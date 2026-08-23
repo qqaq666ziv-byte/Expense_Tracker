@@ -116,6 +116,18 @@ export interface FinanceData {
 
 export type FinanceEntityName = Exclude<keyof FinanceData, 'settings'>;
 
+/**
+ * An authenticated v2 localStorage snapshot is only a cache, not a durable
+ * mutation log. Keep its validated graph available for explicit review while
+ * the active v3 graph performs a remote-authoritative first pull.
+ */
+export interface LegacyAuthenticatedBootstrap {
+  status: 'pending' | 'ready';
+  candidate: FinanceData;
+  /** Legacy transactions whose last acknowledged UI state was `synced:false`. */
+  unsyncedTransactionIds: string[];
+}
+
 export interface PendingOperation {
   id: string;
   entity: FinanceEntityName;
@@ -134,4 +146,5 @@ export interface PersistedFinanceState {
   lastSyncedAt?: string;
   lastSyncError?: string;
   migratedFromLegacy?: boolean;
+  legacyBootstrap?: LegacyAuthenticatedBootstrap;
 }
