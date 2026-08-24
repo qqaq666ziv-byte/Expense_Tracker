@@ -380,12 +380,17 @@ export function useFinanceApp(): FinanceAppController {
       setSafetyNotice('本機快照仍在復原保護中；完成有效備份還原前，本次帳本修改未執行。');
       return false;
     }
-    commitState((current) => applyFinanceMutationUnlessRecovering(
-      current,
-      storageRecoveryRef.current,
-      (recoverable) => putRecord(recoverable, entity, record),
-    ));
-    return true;
+    try {
+      commitState((current) => applyFinanceMutationUnlessRecovering(
+        current,
+        storageRecoveryRef.current,
+        (recoverable) => putRecord(recoverable, entity, record),
+      ));
+      return true;
+    } catch (error) {
+      setSafetyNotice(`資料未儲存：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
   }, [assertRenderedOwnerContext, commitState]);
 
   const softDelete = useCallback(<E extends FinanceEntityName>(

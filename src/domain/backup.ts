@@ -1,4 +1,10 @@
 import type { FinanceData, OwnerId } from './model';
+import {
+  MAX_LEGACY_MONEY_DECIMAL_PLACES,
+  MAX_SAFE_MONEY,
+  moneyDecimalPlaces,
+  moneyLexemeDecimalPlaces,
+} from './money';
 
 export const FINANCE_BACKUP_SCHEMA_VERSION = 1 as const;
 export const MAX_BACKUP_BYTES = 5_000_000;
@@ -129,8 +135,9 @@ export function parseFinanceBackup(input: string | unknown): FinanceBackup {
   }
   let parsed: unknown;
   try {
-    parsed = typeof input === 'string' ? JSON.parse(input) : input;
-  } catch {
+    parsed = typeof input === 'string' ? parseFinanceJson(input) : input;
+  } catch (error) {
+    if (error instanceof BackupValidationError) throw error;
     throw new BackupValidationError('Invalid backup JSON.');
   }
 
@@ -146,6 +153,37 @@ export function parseFinanceBackup(input: string | unknown): FinanceBackup {
   validateFinanceData(parsed.data, 'data');
 
   return clone(parsed) as unknown as FinanceBackup;
+}
+
+const MONEY_JSON_KEYS = new Set(['amount', 'amountDelta', 'openingBalance', 'targetAmount']);
+
+interface JsonParseSourceContext {
+  source?: string;
+}
+
+function parseFinanceJson(input: string): unknown {
+  const parser = JSON.parse as (
+    text: string,
+    reviver: (this: unknown, key: string, value: unknown, context?: JsonParseSourceContext) => unknown,
+  ) => unknown;
+  return parser(input, (_key, value, context) => {
+    if (typeof value !== 'number' || !MONEY_JSON_KEYS.has(_key)) return value;
+    if (context?.source === undefined) {
+      throw new BackupValidationError(
+        'This browser cannot validate raw monetary precision; update it before restoring JSON.',
+      );
+    }
+    if (moneyLexemeDecimalPlaces(context.source) > MAX_LEGACY_MONEY_DECIMAL_PLACES) {
+      throw new BackupValidationError(
+        `${_key} must use at most ${MAX_LEGACY_MONEY_DECIMAL_PLACES} legacy decimal places.`,
+      );
+    }
+    const exactValue = Number(context.source);
+    if (!Number.isFinite(exactValue) || Math.abs(exactValue) > MAX_SAFE_MONEY) {
+      throw new BackupValidationError(`${_key} must be within the safe monetary range.`);
+    }
+    return value;
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -187,13 +225,21 @@ function assertFiniteNumber(value: unknown, path: string): asserts value is numb
   if (Math.abs(value) > Number.MAX_SAFE_INTEGER) fail(path, 'must be within the safe numeric range');
 }
 
-function assertPositiveAmount(value: unknown, path: string): asserts value is number {
+function assertMoneyAmount(value: unknown, path: string): asserts value is number {
   assertFiniteNumber(value, path);
+  if (Math.abs(value) > MAX_SAFE_MONEY) fail(path, 'must be within the safe monetary range');
+  if (moneyDecimalPlaces(value) > MAX_LEGACY_MONEY_DECIMAL_PLACES) {
+    fail(path, `must use at most ${MAX_LEGACY_MONEY_DECIMAL_PLACES} legacy decimal places`);
+  }
+}
+
+function assertPositiveAmount(value: unknown, path: string): asserts value is number {
+  assertMoneyAmount(value, path);
   if (value <= 0) fail(path, 'must be greater than zero');
 }
 
 function assertNonZeroAmount(value: unknown, path: string): asserts value is number {
-  assertFiniteNumber(value, path);
+  assertMoneyAmount(value, path);
   if (value === 0) fail(path, 'must not be zero');
 }
 
@@ -326,7 +372,7 @@ export function validateFinanceData(value: unknown, path: string): asserts value
     const itemPath = `${path}.accounts[${index}]`;
     assertString(account.name, `${itemPath}.name`);
     validateIcon(account.icon, `${itemPath}.icon`);
-    assertFiniteNumber(account.openingBalance, `${itemPath}.openingBalance`);
+    assertMoneyAmount(account.openingBalance, `${itemPath}.openingBalance`);
     assertBoolean(account.includeInTotalAssets, `${itemPath}.includeInTotalAssets`);
     assertBoolean(account.isActive, `${itemPath}.isActive`);
     assertInteger(account.sortOrder, `${itemPath}.sortOrder`);

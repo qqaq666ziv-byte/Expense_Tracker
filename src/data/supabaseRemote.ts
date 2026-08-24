@@ -19,6 +19,12 @@ import type {
   RemoteRecord,
   SyncEntityRecord,
 } from '../domain/syncEngine';
+import {
+  MAX_LEGACY_MONEY_DECIMAL_PLACES,
+  MAX_SAFE_MONEY,
+  moneyDecimalPlaces,
+  moneyLexemeDecimalPlaces,
+} from '../domain/money';
 
 type DatabaseRow = Record<string, unknown>;
 
@@ -37,6 +43,23 @@ const TABLE_BY_ENTITY: Record<FinanceEntityName, string> = {
 };
 
 const ENTITY_NAMES = Object.keys(TABLE_BY_ENTITY) as FinanceEntityName[];
+
+const MONEY_COLUMN_BY_ENTITY: Partial<Record<FinanceEntityName, string>> = {
+  accounts: 'opening_balance',
+  transactions: 'amount',
+  adjustments: 'amount_delta',
+  goals: 'target_amount',
+  allocations: 'amount_delta',
+  budgets: 'amount',
+  recurringRules: 'amount',
+};
+
+const MONEY_TEXT_ALIAS = '__finance_money_text';
+
+function selectProjection(entity: FinanceEntityName): string {
+  const column = MONEY_COLUMN_BY_ENTITY[entity];
+  return column === undefined ? '*' : `*,${MONEY_TEXT_ALIAS}:${column}::text`;
+}
 
 interface SupabaseErrorDiagnostic {
   code?: string;
@@ -107,8 +130,24 @@ function requiredNumber(row: DatabaseRow, column: string): number {
   return value;
 }
 
-function requiredPositiveNumber(row: DatabaseRow, column: string): number {
+function requiredMoney(row: DatabaseRow, column: string): number {
+  const source = row[MONEY_TEXT_ALIAS];
+  if (typeof source !== 'string'
+    || moneyLexemeDecimalPlaces(source) > MAX_LEGACY_MONEY_DECIMAL_PLACES) {
+    throw new Error(`Supabase row has unsupported monetary precision in column ${column}`);
+  }
   const value = requiredNumber(row, column);
+  if (Math.abs(value) > MAX_SAFE_MONEY) {
+    throw new Error(`Supabase row has invalid monetary column ${column}`);
+  }
+  if (moneyDecimalPlaces(value) > MAX_LEGACY_MONEY_DECIMAL_PLACES) {
+    throw new Error(`Supabase row has unsupported monetary precision in column ${column}`);
+  }
+  return value;
+}
+
+function requiredPositiveNumber(row: DatabaseRow, column: string): number {
+  const value = requiredMoney(row, column);
   if (value <= 0) {
     throw new Error(`Supabase row requires positive numeric column ${column}`);
   }
@@ -116,7 +155,7 @@ function requiredPositiveNumber(row: DatabaseRow, column: string): number {
 }
 
 function requiredNonZeroNumber(row: DatabaseRow, column: string): number {
-  const value = requiredNumber(row, column);
+  const value = requiredMoney(row, column);
   if (value === 0) {
     throw new Error(`Supabase row requires non-zero numeric column ${column}`);
   }
@@ -222,7 +261,7 @@ function decodeAccount(row: DatabaseRow): AssetAccount {
     ...commonRecord(row),
     name: requiredString(row, 'name'),
     icon: { type: iconType, value: requiredString(row, 'icon_value') },
-    openingBalance: requiredNumber(row, 'opening_balance'),
+    openingBalance: requiredMoney(row, 'opening_balance'),
     includeInTotalAssets: requiredBoolean(row, 'include_in_total_assets'),
     isActive: requiredBoolean(row, 'is_active'),
     sortOrder: requiredInteger(row, 'sort_order'),
@@ -549,12 +588,12 @@ async function pullEntity(
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const { data, error } = await client
       .from(table)
-      .select('*')
+      .select(selectProjection(entity))
       .eq('user_id', ownerId)
       .order('id', { ascending: true })
       .range(offset, offset + PAGE_SIZE - 1);
     if (error) throw new Error(errorText(error, `Unable to pull ${entity} from Supabase`));
-    const rows = (data ?? []) as DatabaseRow[];
+    const rows = (data ?? []) as unknown as DatabaseRow[];
     for (const row of rows) {
       const recordId = typeof row.id === 'string' && row.id.length > 0 ? row.id : undefined;
       try {
@@ -727,7 +766,7 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
       const { data, error } = await client
         .from(table)
         .upsert(row, { onConflict: 'user_id,id', ignoreDuplicates: false })
-        .select('*')
+        .select(selectProjection(operation.entity))
         .single();
       if (error) {
         throw new Error(applyErrorText(error, operation));

@@ -1,5 +1,5 @@
 import { parseLocalDateTime } from '../domain/dateRange';
-import { toMinorUnits } from '../domain/money';
+import { MAX_SAFE_MONEY, toMinorUnits } from '../domain/money';
 
 export const money = new Intl.NumberFormat('zh-TW', {
   style: 'currency',
@@ -22,7 +22,7 @@ export function parseRequiredNumberInput(value: string): number | null {
   const normalized = value.trim();
   if (!/^-?(?:\d+|\d*\.\d{1,2})$/.test(normalized)) return null;
   const parsed = Number(normalized);
-  if (!Number.isFinite(parsed) || Math.abs(parsed) > Number.MAX_SAFE_INTEGER) return null;
+  if (!Number.isFinite(parsed) || Math.abs(parsed) > MAX_SAFE_MONEY) return null;
 
   const negative = normalized.startsWith('-');
   const [whole, fraction = ''] = (negative ? normalized.slice(1) : normalized).split('.');

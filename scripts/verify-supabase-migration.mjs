@@ -1,18 +1,22 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
-const migrationPath = resolve(
+const migrationDirectory = resolve(
   scriptDirectory,
   '..',
   'supabase',
   'migrations',
-  '20260821103249_finance_v3_additive_schema.sql',
 );
-const migrationSql = await readFile(migrationPath, 'utf8');
+const migrationFiles = (await readdir(migrationDirectory))
+  .filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name))
+  .sort();
+const migrationSql = (await Promise.all(
+  migrationFiles.map((name) => readFile(resolve(migrationDirectory, name), 'utf8')),
+)).join('\n\n');
 
 const OWNER_A = '11111111-1111-4111-8111-111111111111';
 const OWNER_B = '22222222-2222-4222-8222-222222222222';
@@ -229,6 +233,23 @@ async function verifyFreshAndRetry() {
       where conname ~ '^finance_v3_.*_operation_check$'
     `);
     assert.equal(numeric(operationCheckCount.count), 10, 'Expected a stable operation check on every finance table');
+
+    const resourceGuardCounts = await one(db, `
+      select
+        (select count(*)::integer
+          from pg_trigger
+          where tgname = 'finance_v3_10_owner_resource_limit'
+            and not tgisinternal) as triggers,
+        (select count(*)::integer
+          from pg_constraint
+          where conname ~ '^finance_v3_.*_numeric_chk$') as numeric_checks,
+        (select count(*)::integer
+          from pg_constraint
+          where conname ~ '^finance_v3_.*_len_chk$') as text_checks
+    `);
+    assert.equal(numeric(resourceGuardCounts.triggers), 9, 'Expected one row quota trigger per owner-scoped entity table');
+    assert.equal(numeric(resourceGuardCounts.numeric_checks), 9, 'Expected one future-write check per finance numeric column');
+    assert.equal(numeric(resourceGuardCounts.text_checks), 70, 'Expected a future-write check on every persisted text field');
 
     const domainCheckCount = await one(db, `
       select count(*)::integer as count
@@ -2194,6 +2215,173 @@ async function verifyLegacyNegativeGoalDeleteTombstonesAtomically() {
   }
 }
 
+async function verifyServerResourceAbuseGuards() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseAuth(db);
+    await db.exec(`
+      insert into auth.users (id) values ('${OWNER_A}'), ('${OWNER_B}');
+    `);
+    await db.exec(migrationSql);
+    await db.exec('set role authenticated');
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+
+    await assert.rejects(
+      db.query(`
+        insert into public.accounts (
+          user_id, id, name, icon_type, icon_value, opening_balance,
+          include_in_total_assets, is_active, sort_order, version,
+          updated_at, last_operation_id
+        ) values (
+          $1, 'oversized-name', repeat('x', 513), 'vector', 'wallet', 0,
+          true, true, 0, 1, now(), 'oversized-name-op'
+        )
+      `, [OWNER_A]),
+      /text length|check constraint/i,
+      'Server-side text limits must reject oversized authenticated writes',
+    );
+
+    await assert.rejects(
+      db.query(`
+        insert into public.accounts (
+          user_id, id, name, icon_type, icon_value, opening_balance,
+          include_in_total_assets, is_active, sort_order, version,
+          updated_at, last_operation_id
+        ) values (
+          $1, 'oversized-numeric', 'Oversized numeric', 'vector', 'wallet',
+          1e1000, true, true, 0, 1, now(), 'oversized-numeric-op'
+        )
+      `, [OWNER_A]),
+      /numeric magnitude|check constraint/i,
+      'Server-side numeric limits must reject values the client cannot safely decode',
+    );
+
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values (
+        $1, 'legacy-precision', 'Legacy precision', 'vector', 'wallet',
+        1.234, true, true, 0, 1, now(), 'legacy-precision-op'
+      )
+    `, [OWNER_A]);
+
+    await assert.rejects(
+      db.query(`
+        insert into public.accounts (
+          user_id, id, name, icon_type, icon_value, opening_balance,
+          include_in_total_assets, is_active, sort_order, version,
+          updated_at, last_operation_id
+        ) values (
+          $1, 'unsafe-money-bound', 'Unsafe money bound', 'vector', 'wallet',
+          100000000.01, true, true, 0, 1, now(), 'unsafe-money-bound-op'
+        )
+      `, [OWNER_A]),
+      /numeric magnitude|check constraint/i,
+      'Server-side numeric limits must share the client safe monetary bound',
+    );
+
+    await assert.rejects(
+      db.query(`
+        insert into public.accounts (
+          user_id, id, name, icon_type, icon_value, opening_balance,
+          include_in_total_assets, is_active, sort_order, version,
+          updated_at, last_operation_id
+        ) values (
+          $1, 'unsupported-precision', 'Unsupported precision', 'vector', 'wallet',
+          1.2345678, true, true, 0, 1, now(), 'unsupported-precision-op'
+        )
+      `, [OWNER_A]),
+      /numeric precision|check constraint/i,
+      'Server-side numeric limits must reject values the client cannot decode losslessly',
+    );
+
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      )
+      select $1, 'quota-account-' || item, 'Account ' || item, 'vector', 'wallet', 0,
+        true, true, item, 1, now(), 'quota-account-op-' || item
+      from generate_series(1, 249) as item
+    `, [OWNER_A]);
+
+    await assert.rejects(
+      db.query(`
+        insert into public.accounts (
+          user_id, id, name, icon_type, icon_value, opening_balance,
+          include_in_total_assets, is_active, sort_order, version,
+          updated_at, last_operation_id
+        ) values (
+          $1, 'quota-account-251', 'Account 251', 'vector', 'wallet', 0,
+          true, true, 251, 1, now(), 'quota-account-op-251'
+        )
+      `, [OWNER_A]),
+      /owner resource limit/i,
+      'One authenticated owner must not consume unbounded database rows',
+    );
+
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values (
+        $1, 'quota-account-249', 'Updated Account 249', 'vector', 'wallet', 0,
+        true, true, 249, 2, now(), 'quota-account-op-249-update'
+      ) on conflict (user_id, id) do update set
+        name = excluded.name,
+        version = excluded.version,
+        last_operation_id = excluded.last_operation_id
+    `, [OWNER_A]);
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values (
+        $1, 'owner-b-first-account', 'Owner B', 'vector', 'wallet', 0,
+        true, true, 0, 1, now(), 'owner-b-first-account-op'
+      )
+    `, [OWNER_B]);
+
+    await db.exec('reset role');
+    await db.exec(`
+      alter table public.budgets disable trigger finance_v3_10_owner_resource_limit;
+      insert into public.budgets (
+        user_id, id, scope, period, amount, is_active, version,
+        updated_at, last_operation_id, deleted_at
+      )
+      select '${OWNER_A}', 'hidden-budget-' || item, 'overall', 'monthly', 1,
+        false, 1, now(), 'hidden-budget-op-' || item, now()
+      from generate_series(1, 2000) as item;
+      alter table public.budgets enable trigger finance_v3_10_owner_resource_limit;
+      set role authenticated;
+      select set_config('request.jwt.claim.sub', '${OWNER_A}', false);
+    `);
+    await assert.rejects(
+      db.query(`
+        insert into public.budgets (
+          user_id, id, scope, period, amount, is_active, version,
+          updated_at, last_operation_id
+        ) values (
+          $1, 'hidden-budget-2001', 'overall', 'monthly', 1, true, 1,
+          now(), 'hidden-budget-op-2001'
+        )
+      `, [OWNER_A]),
+      /owner resource limit/i,
+      'Quota counts must include tombstones hidden by legacy headerless RLS',
+    );
+  } finally {
+    await db.exec('reset role');
+    await db.close();
+  }
+}
+
 await verifyFreshAndRetry();
 console.log('[pass] fresh schema and retry-safe DDL');
 console.log('[pass] future public objects require explicit grants');
@@ -2212,4 +2400,7 @@ console.log('[pass] exact retry accepted and same-clock divergent payload reject
 
 await verifyLegacyNegativeGoalDeleteTombstonesAtomically();
 console.log('[pass] legacy negative goal delete tombstones allocations atomically');
+
+await verifyServerResourceAbuseGuards();
+console.log('[pass] server-side text, numeric, and RLS-complete per-owner resource abuse guards');
 console.log('Supabase migration verification passed without an external database.');

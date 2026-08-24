@@ -84,6 +84,45 @@ describe('owner-scoped local state', () => {
     expect(() => putRecord(state, 'accounts', foreign)).toThrow(/其他使用者/);
   });
 
+  it('rejects an oversized multibyte record before it can enter the authenticated outbox', () => {
+    const state = createInitialState('user-a');
+    const oversized = {
+      ...state.data.accounts[0],
+      name: '中'.repeat(171),
+      version: 2,
+      lastOperationId: 'oversized-name-operation',
+    };
+
+    expect(() => putRecord(state, 'accounts', oversized)).toThrow(/512 UTF-8 bytes/i);
+    expect(state.outbox.some((operation) => operation.id === oversized.lastOperationId)).toBe(false);
+  });
+
+  it('rejects a new record at the owner ceiling while still allowing an existing record update', () => {
+    const state = createInitialState('user-a');
+    const template = state.data.accounts[0];
+    state.data.accounts = Array.from({ length: 250 }, (_, index) => ({
+      ...template,
+      id: `account-${index}`,
+      name: `Account ${index}`,
+      lastOperationId: `account-${index}-create`,
+    }));
+    state.outbox = [];
+
+    expect(() => putRecord(state, 'accounts', {
+      ...template,
+      id: 'account-251',
+      name: 'Account 251',
+      lastOperationId: 'account-251-create',
+    })).toThrow(/owner row limit.*250/i);
+
+    expect(() => putRecord(state, 'accounts', {
+      ...state.data.accounts[249],
+      name: 'Updated account 250',
+      version: 2,
+      lastOperationId: 'account-250-update',
+    })).not.toThrow();
+  });
+
   it('keeps authenticated legacy data as a pull-only candidate without importing guest data', () => {
     const storage = memoryStorage();
     storage.setItem('guest_transactions', JSON.stringify([{ id: 'guest-tx', amount: 99, type: 'expense', category: '餐飲', account: '現金', date: '2026-08-20 12:00' }]));
@@ -420,6 +459,30 @@ describe('owner-scoped local state', () => {
     });
     expect(result.outbox).toEqual([
       expect.objectContaining({ id: 'op-restore-10', entity: 'accounts', recordId: cloudCurrent.id }),
+    ]);
+  });
+
+  it('preserves supported legacy precision through authenticated restore and outbox enqueue', () => {
+    const current = createInitialState('user-a');
+    current.outbox = [];
+    const restored = structuredClone(current.data);
+    restored.accounts[0] = { ...restored.accounts[0], openingBalance: 1.234567 };
+
+    const result = applyRestoredData(
+      current,
+      restored,
+      new Date('2026-08-21T12:00:00.000Z'),
+      () => 'op-legacy-precision-restore',
+    );
+
+    expect(result.data.accounts[0].openingBalance).toBe(1.234567);
+    expect(result.outbox).toEqual([
+      expect.objectContaining({
+        id: 'op-legacy-precision-restore',
+        entity: 'accounts',
+        recordId: current.data.accounts[0].id,
+        record: expect.objectContaining({ openingBalance: 1.234567 }),
+      }),
     ]);
   });
 });

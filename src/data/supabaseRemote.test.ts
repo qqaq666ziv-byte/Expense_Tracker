@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { MAX_SAFE_MONEY } from '../domain/money';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AssetAccount, PendingOperation, SavingsAllocation } from '../domain/model';
 import type { RemotePullResult } from '../domain/syncEngine';
@@ -223,12 +224,30 @@ class FakeSupabaseClient {
 
   from(table: string) {
     let upserted: Record<string, unknown> | undefined;
+    let projection = '*';
+    const moneyColumn = new Map([
+      ['accounts', 'opening_balance'],
+      ['transactions', 'amount'],
+      ['adjustments', 'amount_delta'],
+      ['goals', 'target_amount'],
+      ['savings_allocations', 'amount_delta'],
+      ['budgets', 'amount'],
+      ['recurring_rules', 'amount'],
+    ]).get(table);
+    const project = (row: Record<string, unknown>) => (
+      moneyColumn !== undefined && projection.includes('__finance_money_text')
+        ? {
+          ...row,
+          __finance_money_text: row.__finance_money_text ?? String(row[moneyColumn]),
+        }
+        : row
+    );
     const builder = {
-      select: () => builder,
+      select: (value = '*') => { projection = value; return builder; },
       eq: () => builder,
       order: () => builder,
       range: async (from: number, to: number) => ({
-        data: (this.tables.get(table) ?? []).slice(from, to + 1),
+        data: (this.tables.get(table) ?? []).slice(from, to + 1).map(project),
         error: null,
       }),
       upsert: (row: Record<string, unknown>) => {
@@ -242,7 +261,7 @@ class FakeSupabaseClient {
         return {
           data: error || upserted === undefined
             ? null
-            : (this.applyResponse?.(table, upserted) ?? upserted),
+            : project(this.applyResponse?.(table, upserted) ?? upserted),
           error,
         };
       },
@@ -375,18 +394,33 @@ describe('Supabase remote adapter', () => {
       transactionRow('zero-amount', { amount: 0 }),
       transactionRow('negative-amount', { amount: -1 }),
       transactionRow('unsafe-amount', { amount: Number.MAX_SAFE_INTEGER + 1 }),
+      transactionRow('unsafe-money-magnitude', { amount: MAX_SAFE_MONEY + 1 }),
+      transactionRow('legacy-precision', { amount: 1.234 }),
+      transactionRow('unsupported-precision', { amount: '1.234567890123456789' }),
+      transactionRow('collapsed-precision', {
+        amount: 0.1,
+        __finance_money_text: '0.1000000000000000000001',
+      }),
       transactionRow('valid-after-invalid', { amount: 80 }),
     ]);
     const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
 
     const result = await remote.pull('user-a') as RemotePullResult;
 
-    expect(result.records.map(({ record }) => record.id)).toEqual(['cash', 'food', 'valid-after-invalid']);
+    expect(result.records.map(({ record }) => record.id)).toEqual([
+      'cash',
+      'food',
+      'legacy-precision',
+      'valid-after-invalid',
+    ]);
     expect(result.issues.map(({ entity, recordId, message }) => ({ entity, recordId, message })))
       .toEqual([
         expect.objectContaining({ entity: 'transactions', recordId: 'zero-amount', message: expect.stringContaining('amount') }),
         expect.objectContaining({ entity: 'transactions', recordId: 'negative-amount', message: expect.stringContaining('amount') }),
         expect.objectContaining({ entity: 'transactions', recordId: 'unsafe-amount', message: expect.stringContaining('amount') }),
+        expect.objectContaining({ entity: 'transactions', recordId: 'unsafe-money-magnitude', message: expect.stringContaining('amount') }),
+        expect.objectContaining({ entity: 'transactions', recordId: 'unsupported-precision', message: expect.stringContaining('precision') }),
+        expect.objectContaining({ entity: 'transactions', recordId: 'collapsed-precision', message: expect.stringContaining('precision') }),
       ]);
   });
 

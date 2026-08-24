@@ -1,24 +1,25 @@
 # Expense Tracker v3 — 品質認證
 
-- 日期：2026-08-23
+- 日期：2026-08-24
 - 分支：`codex/expense-tracker-autonomous-build`
 - 任務前復原點：`checkpoint/20260821-180842-before-autonomous-build` / `56df3f31d2a3c7b93954faef9c352859c8f1f3d5`
 - 中斷續作復原點：`checkpoint/20260823-105721-before-resume-interrupted-build` / `ba3e5de15a83cf314c3a3a64a7fc3580fd625fee`
+- Production E2E release gate 復原點：`checkpoint/20260824-101753-before-production-e2e-release-gate` / `5fb688f32cdaa54d0734de6b28d1b59cbde6516f`
 
 ## 結論
 
-目前評分：**9.2 / 10**。這不是 10/10：已審查的 Supabase migration 尚未在真實 staging／PostgREST 執行，登入後的雙裝置同步也尚未做瀏覽器端端到端觀察。領域邏輯、本機遷移 harness、訪客產品流程、PWA 離線殼層、復原保護與資料完整性規則已有可重現證據。
+目前 release candidate 評分：**9.3 / 10**。這不是 10/10：第一支 Supabase migration、獨立 backup 與 production 資料完整性核對已完成，但第二支 server resource guard 尚未獲授權套用；最新 Preview 的真實 Google OAuth CRUD、等價第二 session、live headers 與最終 Codex Security Standard Scan 仍是 release gates。領域邏輯、本機 migration harness、production v3 schema、訪客產品流程、PWA 離線殼層、復原保護與資料完整性規則已有可重現證據。
 
 | 項目 | 權重 | 得分 | 證據／缺口 |
 | --- | ---: | ---: | --- |
 | 功能與產品正確性 | 25 | 24 | 規格內帳戶、分類、分析、目標、預算、週期、備份與同步介面均完成；核心行動版流程已實測。 |
 | 財務與資料完整性 | 20 | 19 | 共用日曆引擎、帳本餘額、校正、配置不變量、穩定 legacy ID、還原驗證及 mixed-version bridge 均有測試。 |
 | 同步與離線可靠性 | 15 | 13.5 | CRUD retry、tombstone、完整 payload 衝突、malformed row 隔離與 PWA 離線重載已驗證；缺真實雙裝置 E2E。 |
-| 安全、隱私與遷移 | 15 | 13 | owner-scoped adapter、RLS／grants migration 與 PGlite RLS 測試通過；production migration 等待獨立 DB 備份與 staging。 |
+| 安全、隱私與遷移 | 15 | 13.5 | owner-scoped adapter、production RLS／grants migration、PGlite RLS、保留式登出、CSP 與 resource guard 測試通過；第二支 guard 待授權及正式 scan。 |
 | 自動測試與 CI | 10 | 9 | 乾淨安裝與所有本機門檻通過，GitHub Actions 已加入；Draft PR 的遠端結果列於本任務最終報告。 |
 | UX、行動版與 PWA | 10 | 9 | 390×844 核心流程、無水平溢位、manifest、受控 Service Worker、離線重載與一般流程零 console 訊息通過；裝置矩陣有限。 |
 | 維護性與文件 | 5 | 4.5 | 深層 domain seams、版本化 migration、README、CI 與 rollback 手冊齊全；部分 UI panel 仍偏大，日期驗證內仍有可整理的低風險重複。 |
-| **合計** | **100** | **92** | **9.2 / 10** |
+| **合計** | **100** | **93** | **9.3 / 10** |
 
 ## 自動化證據
 
@@ -26,9 +27,9 @@
 
 - `npm ci`：394 packages 成功安裝；audit 結果 0 vulnerabilities。
 - `npm run lint`：TypeScript `--noEmit` 通過。
-- `npm test`：26 個 test files、179 個 tests 全數通過；包含兩台離線裝置同時釋放同一來源配置後收斂為單一 tombstone、reconcile 最終 graph、authenticated legacy cache 雲端優先 gate、stale owner callback、復原鎖對 UI mutation／週期／遠端零套用、成功還原提示收斂、UTF-8 備份容量、複合 Emoji 與金額精度邊界案例。
-- `npm run verify:migration`：11 組 PGlite 驗證全數通過，涵蓋 fresh/retry-safe DDL、future default grants、future-write checks、未知 FK fail-closed、owner-scoped legacy PK、deterministic backfill、v3 goal UPSERT／allocation clock 保護、兩裝置配置容量鎖、不可改寫與不得負配置、active parent、mixed-version I/U/D bridge、goal allocation／recurrence tombstone audit、負值 legacy allocation 的原子目標刪除、v3 實體刪除拒絕、RLS owner isolation、stale clock，以及 exact retry／same-clock divergent payload 拒絕。
-- `npm run build`：Vite 8.2.2 production PWA build 通過且沒有 chunk-size warning；app 主 chunk 307.77 kB（gzip 96.57 kB）、Supabase vendor 208.11 kB（gzip 53.77 kB），PWA precache 14 entries／598.14 KiB。
+- `npm test`：28 個 test files、189 個 tests 全數通過；除既有財務／日期／同步／復原案例外，新增 UTF-8 multibyte、safe monetary／legacy precision write limits、精確聚合 fail-closed、authenticated restore、owner quotas 與 security header config。
+- `npm run verify:migration`：12 組 PGlite 驗證全數通過；除既有 fresh/retry-safe DDL、backfill、mixed-version、RLS 與 conflict clock 外，新增 70 個 text checks、9 個 numeric checks、9 個 quota triggers、unsafe numeric 拒絕、滿額精確 UPSERT、跨 owner 配額及 legacy RLS 隱藏 tombstone 仍計入 quota。
+- `npm run build`：Vite 8.2.2 production PWA build 通過且沒有 chunk-size warning；app 主 chunk 312.93 kB（gzip 97.82 kB）、Supabase vendor 208.11 kB（gzip 53.77 kB），PWA precache 14 entries／603.19 KiB。
 - `npm audit --audit-level=moderate`：0 vulnerabilities；因此亦滿足 CI 的 `--audit-level=high` gate。
 
 ## 瀏覽器與 PWA 證據
@@ -53,8 +54,10 @@
 - 已知現金／電子錢包會納入資產；無法確認的 `Card` 類舊付款方式仍保留關聯，但標記待確認且預設排除總資產。
 - 舊 goal `current_amount` 轉為單一 deterministic allocation；retry 不會重複累計，v3 UPSERT 不會抹除 legacy total/unit。
 - 舊 subscription 只從 migration cutover 當日後建立週期規則，不捏造過往發生紀錄。
-- SQL 採資料保留、向後相容演進，保留 rollback 所需 legacy fields，並把 legacy 全域 `id` 主鍵改為 owner 複合主鍵；未知 incoming FK 會整筆 rollback。Production 執行刻意未做，因 Git checkpoint 不是資料庫備份。
-- 2026-08-23 唯讀核對正式 Supabase：仍是 RLS 已啟用的四表 legacy schema、migration history 為空、沒有 development branch，因此沒有部分 migration；Security Advisor 僅回報既存的 leaked-password protection 未啟用警告。
+- SQL 採資料保留、向後相容演進，保留 rollback 所需 legacy fields，並把 legacy 全域 `id` 主鍵改為 owner 複合主鍵；未知 incoming FK 會整筆 rollback。第一支 production migration 在 repository 外獨立 backup 後完成。
+- 2026-08-24 production 核對：migration history 含 `20260821103249 finance_v3_additive_schema`；43 transactions、1 goal、5 accounts、12 categories，missing relation／orphan 均為 0，10 張 user-scoped table 全部 RLS enabled、34 owner policies；舊 production frontend 仍可運作。
+- 第二支 resource guard 未套 production。正式唯讀 preflight 對目前非空表的 text/numeric checks 得到 0 violations，各 owner count 低於 quota；它仍需另行授權與套用後 PostgREST rejection smoke。
+- 即使 client 先檢查 owner ceiling，兩台裝置在配額邊界同時離線新增仍可能讓後到者收到 server `54000` 並永久 pending；tombstone 列也計 quota，因此使用者端刪除不是安全復原。README 已記錄先備份、唯讀核對與經審查的 server-side recovery 路徑；目前沒有會靜默丟棄 local-only 財務列的按鈕。
 
 ## 獨立審查與修補
 
@@ -66,18 +69,25 @@
 - 中斷續作最終安全審查修正：以 minor units 消除衍生金額浮點尾差；週期補登 500 筆整批上限與失效 parent fail-closed；authenticated 舊版快取先做 0-apply 雲端拉取且不得自動排入 outbox；localStorage 讀取例外、超大備份、跨 owner stale callback 與同步中的本機新操作皆維持 fail-closed／可恢復狀態。
 - Database 對抗式複審修正：配置容量改用 owner advisory lock 與 server ledger sum；allocation 經濟欄位不可改寫、不得產生負目標總額且不竄改 goal conflict clock；封存 parent 原子暫停排程；分類型別不可變；只有 legacy bridge 可做受控實體 `DELETE`，v3-only 表沒有 `DELETE` policy／grant。
 - 最後 fixed-point 修正：正負 legacy allocation 的目標刪除不再受列順序誤擋，刪除後 legacy total 歸零且只消耗一次 clock；復原保護封鎖 UI mutation 與週期實體化並以 boolean applied contract 防止表單假成功；主題 storage denial 可安全 fallback；備份匯出／匯入／File gate 統一 UTF-8 位元組；支援長 ZWJ Emoji，極大金額以精確 cents 對照拒絕靜默 rounding。
-- 上述修補後已重跑完整自動化與 production browser smoke；目前沒有已知可在此範圍合理修復的 blocking finding。
+- Release-gate red-team 修正：client/server UTF-8 write limits 對齊；單筆 1 億 safe monetary magnitude、最多六位 legacy 精度與 owner quotas fail-closed，確保八個滿額 backup collections 的跨集合 minor-unit 聚合仍精確；新 UI 輸入維持兩位小數，backup 以 raw JSON token、remote 以 `numeric::text` projection 在轉 `number` 前驗證精度，越界聚合也會 round-trip 驗證並拋錯而不回傳錯一分結果；quota 使用固定 allowlist 的 private `SECURITY DEFINER` trigger 讀取 RLS 隱藏 tombstone；撤回有跨分頁競態的登出清快取功能，登出一律保留 owner cache；CSP 移除 Preview Toolbar third-party script、pin 正式 Supabase host。
+- 收尾階段唯一一次 Codex Security Standard Scan 已依正式技能啟動；即使 target 改為指向相同工作樹的 ASCII junction，Windows launcher 讀取 Git metadata 時仍發生 `UnicodeDecodeError: cp950`，因此沒有 scan ID 或 sealed report；未改用其他模式或重複嘗試冒充成功。獨立 security reviewer 最終 P0／P1／P2 均為 0，人工 attack-path pass 亦完成，正式掃描器缺口保留為工具限制。
+- 上述修補後完整自動化綠燈；程式碼層目前沒有已知 blocking finding，外部 Preview／OAuth／scan gates 仍列於下節，未以「完成」掩蓋。
 
 ## 剩餘限制與發布門檻
 
-1. 取得獨立 production database backup，並證明可還原。
-2. 在 Supabase branch／staging 套用 migration，核對 owner/row counts，走 PostgREST HTTP 整合並重跑 security/performance advisors。
-3. 經另行授權後才可套用 production migration；完成後再做真實 Google OAuth 與兩裝置同步 smoke。
-4. Draft PR GitHub Actions 必須綠燈後才符合 merge gate；PR 與目前 commit 的實際狀態以本任務最終報告及 GitHub check 為準。
-5. CSV import、轉帳、多幣別、信用卡／債務模型皆是明確非目標。
+1. 將目前 release-candidate commit push，確認 Vercel Preview 重新 build 且 Supabase env、CSP／headers live 生效。
+2. 完成真實 Google OAuth、production Supabase CRUD、離線 outbox 重連、edit/delete 不復活與等價第二 session smoke，並清理可辨識測試資料。
+3. 取得使用者另行授權後才可套用第二支 production resource guard migration；未授權前只保留 reviewed migration/preflight，不做 DDL。
+4. Codex Security launcher 的 `cp950` 中文路徑錯誤仍待工具端修復；本 release 沒有可封存的正式 scan artifact，已以獨立 reviewer 與人工 attack-path 審查降級替代，不再於本 Goal 重試。
+5. 更新 Draft PR 後確認最新 commit 的 GitHub Actions／Vercel checks 綠燈；不得自行 merge。
+6. CSV import、轉帳、多幣別、信用卡／債務模型皆是明確非目標。
+
+### 非阻斷 follow-up
+
+- `moneyLexemeDecimalPlaces` 對可用整數 coefficient 尾零抵銷負 exponent 的科學記號表示較保守，例如 `10000000e-7` 會被當成七位小數而拒絕；此路徑 fail-closed、不會改寫資料。App 自身 `JSON.stringify` 不會為目前合法一般金額產生這種等價表示，後續可在不影響本 release 的情況下正規化 coefficient 再判定 scale。
 
 ## 回滾
 
-- 程式碼：若只需撤銷中斷後修補，從 `checkpoint/20260823-105721-before-resume-interrupted-build`（`ba3e5de15a83cf314c3a3a64a7fc3580fd625fee`）建立 recovery branch；若要回到整個建置前，使用 `checkpoint/20260821-180842-before-autonomous-build`（`56df3f31d2a3c7b93954faef9c352859c8f1f3d5`）。兩者均已推送；不可 force-push 或刪除 checkpoint tag。
+- 程式碼：本次 release-gate 從 `checkpoint/20260824-101753-before-production-e2e-release-gate`（`5fb688f32cdaa54d0734de6b28d1b59cbde6516f`）建立 recovery branch；若要回到整個建置前，使用 `checkpoint/20260821-180842-before-autonomous-build`。所有 checkpoint 均已推送；不可 force-push 或刪除 tag。
 - 本機使用者資料：使用管理頁的版本化 JSON backup；replace 必須明確選擇並輸入 `REPLACE`。
-- Supabase：本次未執行 production migration。未來 rollout 應使用獨立的 migration 前 DB backup，或採 `supabase/ROLLBACK.md` 的 additive forward-fix；不得臨時採用 destructive down migration。
+- Supabase：第一支 v3 migration 的 exact rollback 是 repository 外獨立 backup／PITR；第二支 guard 尚未執行。未來 rollout 優先 additive forward-fix，任何 guard removal 都需 fresh backup、另行授權與 reviewed transaction；不得臨時採 destructive down migration。

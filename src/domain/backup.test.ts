@@ -10,6 +10,7 @@ import {
   parseFinanceBackup,
   restoreFinanceBackup,
 } from './backup';
+import { MAX_SAFE_MONEY } from './money';
 
 const fixture: FinanceData = {
   accounts: [{
@@ -165,6 +166,27 @@ describe('versioned finance backup', () => {
     const unsafe = structuredClone(fixture);
     unsafe.transactions[0].amount = Number.MAX_SAFE_INTEGER + 1;
     expect(() => createFinanceBackup(unsafe)).toThrow(/safe numeric range/i);
+
+    const unsafeMoney = structuredClone(fixture);
+    unsafeMoney.transactions[0].amount = MAX_SAFE_MONEY + 1;
+    expect(() => createFinanceBackup(unsafeMoney)).toThrow(/safe monetary range/i);
+  });
+
+  it('round-trips legacy amounts with more than two decimals without rewriting them', () => {
+    const legacy = structuredClone(fixture);
+    legacy.transactions[0].amount = 1.234567;
+    const restored = restoreFinanceBackup(emptyData(), exportFinanceBackup(legacy), { ownerId: 'guest' });
+    expect(restored.transactions[0].amount).toBe(1.234567);
+
+    const unsupportedPrecision = structuredClone(fixture);
+    unsupportedPrecision.transactions[0].amount = 1.2345678;
+    expect(() => createFinanceBackup(unsupportedPrecision)).toThrow(/6 legacy decimal places/i);
+
+    const collapsedPrecision = exportFinanceBackup(fixture).replace(
+      `"amount": ${fixture.transactions[0].amount}`,
+      '"amount": 99999999.123456004',
+    );
+    expect(() => parseFinanceBackup(collapsedPrecision)).toThrow(/6 legacy decimal places/i);
   });
 
   it('rejects non-finite or invalid amounts and impossible calendar dates', () => {

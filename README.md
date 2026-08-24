@@ -14,6 +14,7 @@
 - 週期收支：收入或支出、每週／每月／每年、開始日、暫停／恢復、截至今日補齊及嚴格冪等去重；單次補登上限 500 筆，超過會整批 fail-closed，不建立交易也不推進游標。
 - 可攜資料：完整版本化 JSON 備份、安全合併／明確確認取代還原、匯入容量／筆數防護，以及具穩定欄位的交易 CSV。
 - 離線與同步：每位 owner 獨立快照、原子 outbox、重連／手動重試、完整 payload 與最終跨表 graph 驗證、刪除 tombstone 與可見同步錯誤。
+- 寫入邊界：client 在建立 outbox 前依 UTF-8 bytes 拒絕無法被 server 接受的欄位；待套用的 additive guard migration 另限制文字、safe monetary magnitude 與每 owner 列數，tombstone 也計入 quota。
 - 復原保護：本機快照驗證失敗時停止本機覆寫、所有 UI 新增／修改／刪除、週期補登及遠端 pull/apply，保留原始內容並提供下載；被封鎖的表單會保留輸入且明示未執行，只有整份有效備份完成驗證且新的 owner snapshot 已成功持久化後才解除保護。
 - PWA：可安裝 manifest、192/512/maskable icons、Service Worker 預快取與離線殼層。
 
@@ -30,7 +31,7 @@
 - 配置到儲蓄目標只是 earmark，不會降低總資產。
 - 封存使用 `isActive=false`；有歷史的帳戶／分類不會被實體刪除。
 - 本版本只建模資產帳戶。舊資料中無法確定為資產的 `Card` 等付款方式會保留、標示待確認，且預設不納入總資產。
-- 新輸入金額支援至小數點後兩位，且拒絕非有限值與超出 JavaScript 安全數值範圍的值；所有衍生財務加總／比較會先換成兩位小數 minor units 運算，避免 `0.1 + 0.2` 浮點尾差，舊紀錄本身不會被靜默改寫。
+- 新輸入金額支援至小數點後兩位，且拒絕非有限值或絕對值超過 `100,000,000` 的值；八個 backup collections 各自最多 50,000 筆，因此即使跨所有集合聚合，換算成 minor units 後仍在精確整數範圍內。所有衍生財務加總／比較會先換成兩位小數 minor units 運算，避免 `0.1 + 0.2` 浮點尾差；若內部呼叫端越過完整 domain ceiling，則明確 fail-closed，不會回傳差一分的結果。既有備份／legacy 紀錄支援最多六位小數原值 round-trip，只在衍生計算時四捨五入；更多精度會在還原／remote pull 時隔離並回報，而非靜默改寫。
 
 ## 本機開發
 
@@ -62,6 +63,8 @@ npm.cmd run dev
 
 Google OAuth 的 Site URL／Redirect URLs 需在 Supabase Dashboard 對應實際預覽與正式網域設定。
 
+Vercel 的兩個 `VITE_SUPABASE_*` 變數必須同時啟用 **Production and Preview**；只設 Production 會讓 Preview build 在編譯時移除登入／同步能力。Repository 的 `vercel.json` 會為所有部署路由設定 CSP、`nosniff`、referrer、permissions 與 anti-framing headers；CSP 的 Supabase host 已 pin 到本專案，若要部署到另一個 Supabase project，必須同步更新該 allowlist 與測試。
+
 ## 驗證命令
 
 ```bash
@@ -90,11 +93,14 @@ CI 位於 `.github/workflows/ci.yml`，在 pull request、`main` 與 `codex/**` 
 
 若升級時發現舊版的 authenticated owner cache，App 會先以 **0 apply** 拉取並驗證完整雲端 graph；候選快取不會被自動排入 outbox。遠端讀取成功後，使用者可先下載候選 JSON，再明確選擇「匯入舊版本機資料」或「保留雲端資料」。遠端 pull 有錯、owner 不符或 graph 不完整時會維持 pending gate，期間禁止本機 mutation，但保留手動重試同步。
 
-離線 create/update/delete 會把最新 record snapshot 與 operation ID 一起寫入 owner 快照。刪除保留 tombstone；雲端 trigger 和 client 都先以 `(version, lastOperationId)` 檢查 stale write，再比較完整 app-owned payload。相同 clock 但內容不同、或遠端在仍有 pending local edit/delete 時勝出，會成為可見且保留待處理的衝突，不會假裝成功；單筆 malformed、foreign-owner、非正交易金額、不安全數值、跨表引用遺失／型別不符或其他違反 domain 契約的 remote row 會被隔離並回報，其他合法 rows 仍能同步。同步等待期間的新本機操作會 rebase 到結果上，登出或切換 owner 後回來的舊同步結果會被丟棄。v3 Data API 請求會送出非秘密的 `x-shiba-finance-client: v3` capability header，以便 owner 在 RLS 下拉取 tombstone／封存列；此 header 不是身分驗證邊界。
+離線 create/update/delete 會把最新 record snapshot 與 operation ID 一起寫入 owner 快照。刪除保留 tombstone；雲端 trigger 和 client 都先以 `(version, lastOperationId)` 檢查 stale write，再比較完整 app-owned payload。相同 clock 但內容不同、或遠端在仍有 pending local edit/delete 時勝出，會成為可見且保留待處理的衝突，不會假裝成功；單筆 malformed、foreign-owner、非正交易金額、不安全數值、跨表引用遺失／型別不符或其他違反 domain 契約的 remote row 會被隔離並回報，其他合法 rows 仍能同步。每個 monetary column 會另外以 PostgREST `numeric::text` projection 取得原始 decimal，再轉成 JavaScript number，避免 JSON parser 先降精度後逃過檢查。同步等待期間的新本機操作會 rebase 到結果上，登出或切換 owner 後回來的舊同步結果會被丟棄；登出只切換驗證狀態，不會刪除 owner cache 或訪客資料，避免跨分頁競態造成未同步資料遺失。v3 Data API 請求會送出非秘密的 `x-shiba-finance-client: v3` capability header，以便 owner 在 RLS 下拉取 tombstone／封存列；此 header 不是身分驗證邊界。
 
 ## Supabase migration
 
-Migration：`supabase/migrations/20260821103249_finance_v3_additive_schema.sql`
+Migrations（依時間順序）：
+
+1. `supabase/migrations/20260821103249_finance_v3_additive_schema.sql` — v3 additive schema／backfill／RLS／mixed-version bridge；已套用 production。
+2. `supabase/migrations/20260824023801_finance_resource_abuse_guards.sql` — future-write UTF-8 text、safe numeric 與 per-owner row guards；已在本機驗證，尚未獲授權套用 production。
 
 它會：
 
@@ -109,15 +115,19 @@ Migration：`supabase/migrations/20260821103249_finance_v3_additive_schema.sql`
 9. 以 owner-scoped advisory transaction lock 與 server ledger sum 阻止兩台裝置合計超額配置；allocation 的目標／金額／發生日是不可改寫的稽核事件，修正以新 delta 表示，且新操作不得讓單一目標淨配置變成負數；active recurring rule 只有在同 owner 的 active account 與相符 category 存在時才可建立／恢復，既有分類的收入／支出型別也不可直接改寫而破壞規則語義。
 10. 重建所有財務表 policy 為 `TO authenticated`、`(select auth.uid()) = user_id`，撤銷 anon/public table privileges，再按用途明確授權：四張 legacy 表保留受 trigger 保護的 `DELETE` 以建立 tombstone，v3-only 表只開放 `SELECT/INSERT/UPDATE`，不可用實體刪除繞過稽核資料；headerless 舊 client 不會把 tombstone／封存列重載成 live data，v3 owner 仍可完整 reconcile；未來 public table/function/sequence 預設採 opt-in grants。
 
-### 正式套用前必要步驟
+第二支 migration 另外以 revoke-execute 的 `SECURITY DEFINER` trigger 計算完整 owner row count，避免 headerless legacy RLS 隱藏 tombstone 後繞過 quota；dynamic table target 是固定 allowlist。所有 checks 採 `NOT VALID`，不會掃描或重寫既有列，但會限制之後 INSERT／UPDATE。若 preflight 發現既有超限列，必須先備份並建立明確縮短／保留規則；不可直接套用後讓該列無法更新。
 
-目前 repository 只包含已驗證 migration，**尚未套用 production**。正式執行前必須：
+### Production 狀態與下一支 migration gate
 
-1. 取得獨立、可還原的 production database backup（不可只依賴 Git tag）。
-2. 先在 staging／Supabase branch 以 production-like schema 驗證並記錄 row counts。
+2026-08-24 已確認 production 外部備份位於 repository 之外，並已套用第一支 `finance_v3_additive_schema`。套用後證據：43 筆 transactions、1 筆 goal，v3 tables／34 owner policies／RLS 存在，missing relation 與 orphan count 均為 0，舊 production frontend 仍可運作。未執行資料刪除或 reinterpretation。
+
+第二支 guard migration **尚未套用 production**。2026-08-24 唯讀 preflight 對目前非空表的所有對應文字與 numeric 欄得到 0 violations，owner row maxima 也低於 quota；正式套用仍需要使用者另行授權。獲授權後必須：
+
+1. 確認現有外部 backup／PITR 仍是可用 restore point，並記錄 migration 前 row counts。
+2. 再跑文字、numeric、quota preflight；任何 violation 都先停止並設計資料保留修復。
 3. 執行 `npm run verify:migration` 與 migration review。
-4. 透過 Supabase CLI 的 reviewed migration workflow 套用；不要把 DB 密碼寫入 repository。
-5. 套用後比對 owner/row counts、抽樣 legacy 關聯，並重新跑 Supabase security/performance advisors。
+4. 只透過 reviewed Supabase migration workflow 套用；不要把 DB 密碼寫入 repository。
+5. 套用後重跑 row/orphan/RLS、PostgREST authenticated write rejection 與 Supabase security/performance advisors。
 
 詳細 schema rollback／前向修復流程見 `supabase/ROLLBACK.md`。Migration 以資料保留及向後相容為原則：舊版 client 所需欄位仍在，但會把 legacy 全域主鍵改為 owner-scoped 複合主鍵並收緊權限。若新 client 需緊急回退，可先回退前端而不立即刪除 v3 欄表或撤回安全 constraint。不要在沒有 backup 的情況下執行 destructive down migration。
 
@@ -127,14 +137,16 @@ Migration：`supabase/migrations/20260821103249_finance_v3_additive_schema.sql`
 - 預設「安全合併」依 ID、version、時間與 operation identity 決定，不會重複加入相同紀錄。
 - 「取代目前資料」必須選擇 replace 並輸入 `REPLACE`；整份資料會先驗證，失敗不會部分修改。登入狀態下的還原會把舊備份 rebase 成高於目前本機 clock 的新 mutations，而非重送過期版本。
 - 還原會驗證 owner、所有 stable references、分類型別、正數／非零 delta／安全範圍金額、date-only recurrence/occurrence、唯一 ID、週期 anchor、單一 collection 最多 50,000 筆，以及最多 5,000,000 UTF-8 位元組的 JSON 輸入。匯出也使用相同位元組上限；若現有資料已大到無法產生可重新匯入的備份，會明確拒絕而不是下載一份無法 round-trip 的檔案，中文與 Emoji 也不會因字元／檔案大小單位不同而產生假成功。
+- JSON 字串匯入會使用標準 `JSON.parse` reviver 的 raw `context.source` 驗證 monetary token；不支援此 2025 baseline API 的舊瀏覽器會明確拒絕還原並要求更新，不會先轉成 `number` 後靜默接受已降精度值。
 - CSV 是匯出用途，會做 RFC 4180 escaping 與 spreadsheet formula neutralization；本版本不提供 CSV import。
 
 ## 已知限制與非目標
 
-- Production schema migration 尚未執行；在套用前，這個分支的 v3 雲端同步不能對舊 schema 完整運作。
-- 未在真實登入的兩台裝置執行 browser E2E；owner 隔離、retry、衝突與 tombstone 由自動化 adapter／engine／RLS 測試覆蓋。
-- Migration 已在本機 PGlite 覆蓋 fresh、legacy、重跑、RLS、mixed-version bridge 與 conflict clock，但尚未在真實 Supabase/PostgREST staging 走 HTTP 整合。
-- 2026-08-23 唯讀核對顯示正式 Supabase 仍是 RLS 已啟用的 legacy schema、沒有 development branch，且本 migration 尚未套用；Security Advisor 另有「Leaked Password Protection Disabled」既存警告，應在正式 rollout 前依 [Supabase password security 指南](https://supabase.com/docs/guides/auth/password-security#password-strength-and-leaked-password-protection)於 Auth 設定啟用並重跑 advisor。
+- 第二支 server resource guard migration 尚未獲授權套用 production；目前正式 schema 已是 v3，但 server 端 text/numeric/quota 新防護仍以既有 PostgREST／平台限制為主。
+- 套用第二支 guard 後，兩台裝置若同時在相同 owner／entity 的配額前一筆離線新增，後到 server 的操作可能收到 `54000` 並保留在 pending outbox。由於 tombstone 也計入安全配額，刪除該本機紀錄不能自動釋放 server row；請先下載 JSON 備份並保留 pending snapshot，再由維護者唯讀核對該 ID 未上雲、建立獨立資料庫備份，最後以經審查的 quota 擴充或資料保留修復解除，不能直接清除 outbox 假裝同步成功。
+- 尚未完成最新 Preview 的真實 Google OAuth CRUD／重連不復活與等價第二 session browser E2E；owner 隔離、retry、衝突與 tombstone 已由 adapter／engine／PGlite RLS 測試覆蓋。
+- Migration 已在本機 PGlite 覆蓋 fresh、legacy、重跑、RLS、mixed-version bridge、conflict clock 與 resource guards；第一支已在真實 production schema 執行並通過 row/orphan/RLS 核對，第二支尚未執行真實 PostgREST rejection smoke。
+- Supabase Security Advisor 仍有「Leaked Password Protection Disabled」既存警告；應依 [Supabase password security 指南](https://supabase.com/docs/guides/auth/password-security#password-strength-and-leaked-password-protection)於 Auth 設定啟用並重跑 advisor。
 - 週期交易由 client 在開啟、回到前景或跨日後補齊，不是背景排程服務；長期不開 App 時會在下次開啟補齊。
 - 訪客資料使用 browser localStorage，仍受瀏覽器清除資料與 quota 影響；應定期下載 JSON 備份。
 - 柴犬／米克斯視覺主題是裝置本機偏好，不跨裝置同步。
@@ -144,6 +156,7 @@ Migration：`supabase/migrations/20260821103249_finance_v3_additive_schema.sql`
 
 - 任務前遠端 checkpoint：`checkpoint/20260821-180842-before-autonomous-build`，SHA `56df3f31d2a3c7b93954faef9c352859c8f1f3d5`。
 - 中斷續作前遠端 checkpoint：`checkpoint/20260823-105721-before-resume-interrupted-build`，SHA `ba3e5de15a83cf314c3a3a64a7fc3580fd625fee`。
-- 程式碼回復：只撤銷本次續作修補時從後者建立 recovery branch；回到整個建置前則使用前者。兩個 tag 均已推送；不要改寫／刪除 checkpoint history。
+- 本次 production E2E release gate 前 checkpoint：`checkpoint/20260824-101753-before-production-e2e-release-gate`，SHA `5fb688f32cdaa54d0734de6b28d1b59cbde6516f`。
+- 程式碼回復：只撤銷本次 release-gate 修補時從最新 checkpoint 建立 recovery branch；回到整個建置前則使用最早 checkpoint。三個 tag 均已推送；不要改寫／刪除 checkpoint history。
 - 使用者資料回復：優先使用管理頁的 JSON backup 安全合併／明確取代。
-- Database：目前沒有 production mutation；未來套用 migration 時，依 `supabase/ROLLBACK.md` 使用事前獨立備份或 additive forward-fix。
+- Database：第一支 v3 additive migration 已在外部 backup 後套用；第二支 guard migration未套用。Schema 回復與 additive forward-fix 依 `supabase/ROLLBACK.md`，不可把 Git tag 當作 database backup。

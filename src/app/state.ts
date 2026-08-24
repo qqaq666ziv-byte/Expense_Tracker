@@ -9,6 +9,10 @@ import type {
 import { enqueueSyncRecord } from '../domain/syncEngine';
 import { migrateLegacyData, stableLegacyId } from '../domain/legacyMigration';
 import { validateFinanceData } from '../domain/backup';
+import {
+  assertFinanceOwnerRowLimit,
+  assertFinanceRecordWithinWriteLimits,
+} from '../domain/resourceLimits';
 
 export const LOCAL_STATE_PREFIX = 'shiba-finance:v3:';
 
@@ -394,9 +398,11 @@ export function putRecord<E extends FinanceEntityName>(
   record: FinanceData[E][number],
 ): PersistedFinanceState {
   if (record.ownerId !== state.ownerId) throw new Error('拒絕寫入其他使用者的資料');
+  assertFinanceRecordWithinWriteLimits(entity, record);
+  const records = state.data[entity] as FinanceData[E][number][];
+  assertFinanceOwnerRowLimit(entity, records as FinanceData[E], record.id);
   if (state.ownerId !== 'guest') return enqueueSyncRecord(state, entity, record);
 
-  const records = state.data[entity] as FinanceData[E][number][];
   const index = records.findIndex((candidate) => candidate.id === record.id);
   const nextRecords = [...records];
   if (index < 0) nextRecords.push(record);

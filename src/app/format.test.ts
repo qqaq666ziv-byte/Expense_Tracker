@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { MAX_SAFE_MONEY } from '../domain/money';
 import { money, parseRequiredNumberInput, shortDate } from './format';
 
 describe('financial formatting', () => {
@@ -25,5 +26,7 @@ describe('financial formatting', () => {
     expect(parseRequiredNumberInput('00012.30')).toBe(12.3);
     expect(parseRequiredNumberInput('0.1')).toBe(0.1);
     expect(parseRequiredNumberInput('0.2')).toBe(0.2);
+    expect(parseRequiredNumberInput('100000000.00')).toBe(MAX_SAFE_MONEY);
+    expect(parseRequiredNumberInput('100000000.01')).toBeNull();
   });
 });

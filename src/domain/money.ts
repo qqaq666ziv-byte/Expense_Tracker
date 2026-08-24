@@ -1,7 +1,34 @@
 const MINOR_UNIT_SCALE = 100n;
 const MINOR_UNIT_DIGITS = 2;
 
+/**
+ * The per-record ceiling keeps every monetary field across all eight maximum
+ * 50,000-row backup collections below Number.MAX_SAFE_INTEGER when aggregated
+ * as minor units. Six decimal places preserve legacy inputs while remaining
+ * distinguishable at this bound; new UI input is stricter at two places.
+ */
+export const MAX_SAFE_MONEY = 100_000_000;
+export const MAX_LEGACY_MONEY_DECIMAL_PLACES = 6;
+
 export type MinorUnits = bigint;
+
+export function moneyDecimalPlaces(amount: number): number {
+  if (!Number.isFinite(amount)) return Number.POSITIVE_INFINITY;
+  const [coefficient, exponentText = '0'] = Math.abs(amount).toString().toLowerCase().split('e');
+  const fractionLength = coefficient.split('.')[1]?.length ?? 0;
+  return Math.max(0, fractionLength - Number(exponentText));
+}
+
+/** Returns the semantic decimal places in a JSON/Postgres numeric token. */
+export function moneyLexemeDecimalPlaces(source: string): number {
+  const match = /^-?(?:\d+)(?:\.(\d*))?(?:e([+-]?\d+))?$/i.exec(source.trim());
+  if (!match) return Number.POSITIVE_INFINITY;
+  const fraction = match[1] ?? '';
+  const significantFractionLength = fraction.replace(/0+$/, '').length;
+  const exponent = Number(match[2] ?? 0);
+  if (!Number.isSafeInteger(exponent)) return Number.POSITIVE_INFINITY;
+  return Math.max(0, significantFractionLength - exponent);
+}
 
 /**
  * Converts a persisted numeric amount to two-decimal minor units for arithmetic.
@@ -32,9 +59,16 @@ export function toMinorUnits(amount: number): MinorUnits {
 }
 
 export function fromMinorUnits(minorUnits: MinorUnits): number {
+  if (minorUnits < BigInt(Number.MIN_SAFE_INTEGER)
+    || minorUnits > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError('Money total exceeds the exact minor-unit range');
+  }
   const amount = Number(minorUnits) / Number(MINOR_UNIT_SCALE);
   if (!Number.isFinite(amount)) {
     throw new RangeError('Money total exceeds the supported numeric range');
+  }
+  if (toMinorUnits(amount) !== minorUnits) {
+    throw new RangeError('Money total cannot be represented as exact minor units');
   }
   return amount;
 }
