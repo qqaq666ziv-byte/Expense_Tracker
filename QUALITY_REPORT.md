@@ -8,15 +8,15 @@
 
 ## 結論
 
-目前 release candidate 評分：**9.3 / 10**。這不是 10/10：第一支 Supabase migration、獨立 backup 與 production 資料完整性核對已完成，但第二支 server resource guard 尚未獲授權套用；最新 Preview 的真實 Google OAuth CRUD、等價第二 session、live headers 與最終 Codex Security Standard Scan 仍是 release gates。領域邏輯、本機 migration harness、production v3 schema、訪客產品流程、PWA 離線殼層、復原保護與資料完整性規則已有可重現證據。
+目前 release candidate 評分：**9.3 / 10**，但發布判定是 **No-Go（外部 OAuth 設定 blocker）**。這不是 10/10：第一支 Supabase migration、獨立 backup、production 資料完整性核對、最新 Preview 本機 CRUD、兩個獨立 session 的真實 Google OAuth 唯讀同步與 live headers 均已完成；然而 production Supabase 尚未允許 Vercel Preview Redirect URL，Preview 登入會 fallback 到舊 Site URL。第二支 server resource guard 仍未獲授權套用，正式 Codex Security Standard Scan 也受 Windows `cp950` launcher 問題阻擋。領域邏輯、本機 migration harness、production v3 schema、PWA 離線殼層、復原保護與資料完整性規則已有可重現證據。
 
 | 項目 | 權重 | 得分 | 證據／缺口 |
 | --- | ---: | ---: | --- |
 | 功能與產品正確性 | 25 | 24 | 規格內帳戶、分類、分析、目標、預算、週期、備份與同步介面均完成；核心行動版流程已實測。 |
 | 財務與資料完整性 | 20 | 19 | 共用日曆引擎、帳本餘額、校正、配置不變量、穩定 legacy ID、還原驗證及 mixed-version bridge 均有測試。 |
-| 同步與離線可靠性 | 15 | 13.5 | CRUD retry、tombstone、完整 payload 衝突、malformed row 隔離與 PWA 離線重載已驗證；缺真實雙裝置 E2E。 |
+| 同步與離線可靠性 | 15 | 13.5 | CRUD retry、tombstone、完整 payload 衝突、malformed row 隔離、PWA 離線重載及兩個獨立 browser session 的真實 OAuth pull 已驗證；Preview Redirect allowlist 與真實雲端 edit/delete/reconnect 尚缺。 |
 | 安全、隱私與遷移 | 15 | 13.5 | owner-scoped adapter、production RLS／grants migration、PGlite RLS、保留式登出、CSP 與 resource guard 測試通過；第二支 guard 待授權及正式 scan。 |
-| 自動測試與 CI | 10 | 9 | 乾淨安裝與所有本機門檻通過，GitHub Actions 已加入；Draft PR 的遠端結果列於本任務最終報告。 |
+| 自動測試與 CI | 10 | 9 | 乾淨安裝與所有本機門檻通過；Draft PR 最新 commit 的兩個 GitHub Actions verify 與 Vercel checks 全數綠燈。 |
 | UX、行動版與 PWA | 10 | 9 | 390×844 核心流程、無水平溢位、manifest、受控 Service Worker、離線重載與一般流程零 console 訊息通過；裝置矩陣有限。 |
 | 維護性與文件 | 5 | 4.5 | 深層 domain seams、版本化 migration、README、CI 與 rollback 手冊齊全；部分 UI panel 仍偏大，日期驗證內仍有可整理的低風險重複。 |
 | **合計** | **100** | **93** | **9.3 / 10** |
@@ -46,6 +46,10 @@
 8. Service Worker scope 為 preview root 且控制頁面；強制離線後仍可重新載入並保留本機財務狀態。
 9. 將 `shiba-finance:v3:guest` 寫入損毀 JSON 後，App 顯示復原保護與原始快照下載，停止 autosave；重新讀取 key 仍是原始 `{broken-json`。此故障路徑為 0 errors、2 個預期 recovery warnings。
 10. 最終 production bundle 以 390×844 行動版 override 建立 $0.1 與 $0.2 餐飲支出，首頁／Insights 均精確顯示 $0.3／-$0.3，極大兩位小數輸入未新增交易；瀏覽內容區 `scrollWidth`／`clientWidth` 同為 375、無水平溢位，週期頁顯示 500 筆整批上限，Service Worker 受控，正常 console 0 errors／0 warnings，強制離線重載後仍保留帳本。另一個全新 session 另證明損毀 raw key 原樣保留，為 0 errors／2 個預期 warnings。
+11. 最新 Vercel Preview `shiba-expense-tracker-vcy7rrchl-ziv-s-projects3.vercel.app` 載入 production bundle，Supabase env 存在；實際 response 為 200，CSP pin 到正式 Supabase host，HSTS、`nosniff`、strict referrer、permissions policy 與 anti-framing headers 均生效。
+12. 該 Preview 的 guest origin 建立 $1.23 測試支出、重新載入後保留，再編輯為 $2.34；首頁餘額與分析的今日／期間／分類／趨勢數值同步更新。這筆 synthetic record 只存在於該 ephemeral Preview origin 的本機儲存，未送入 production Supabase。
+13. Preview Google OAuth 實測會導向舊 Site URL；程式已送 `redirectTo: window.location.origin`，根因是 Supabase production Redirect URL allowlist 未包含 Preview hostname。依官方 wildcard 規則，需加入 `https://shiba-expense-tracker-*-ziv-s-projects3.vercel.app/**` 後重測。
+14. 相同 release candidate 透過已允許的 `http://127.0.0.1:8888`，分別在 Codex in-app Browser 與 Chrome 兩個獨立 session 完成 Google OAuth；兩者都明確選擇保持訪客資料分離，從待同步收斂到「已同步」，並讀到相同 43 筆 production transaction rows；UI 顯示 39 筆 active 帳本項目，第一批之後可再載入其餘 9 筆 active 歷史。交易、目標與配置筆數前後未變；console 無 error，僅有 `gotrue-js` 對約 1–2 秒時鐘差的非阻斷 warning。
 
 ## 資料遷移認證
 
@@ -71,20 +75,21 @@
 - 最後 fixed-point 修正：正負 legacy allocation 的目標刪除不再受列順序誤擋，刪除後 legacy total 歸零且只消耗一次 clock；復原保護封鎖 UI mutation 與週期實體化並以 boolean applied contract 防止表單假成功；主題 storage denial 可安全 fallback；備份匯出／匯入／File gate 統一 UTF-8 位元組；支援長 ZWJ Emoji，極大金額以精確 cents 對照拒絕靜默 rounding。
 - Release-gate red-team 修正：client/server UTF-8 write limits 對齊；單筆 1 億 safe monetary magnitude、最多六位 legacy 精度與 owner quotas fail-closed，確保八個滿額 backup collections 的跨集合 minor-unit 聚合仍精確；新 UI 輸入維持兩位小數，backup 以 raw JSON token、remote 以 `numeric::text` projection 在轉 `number` 前驗證精度，越界聚合也會 round-trip 驗證並拋錯而不回傳錯一分結果；quota 使用固定 allowlist 的 private `SECURITY DEFINER` trigger 讀取 RLS 隱藏 tombstone；撤回有跨分頁競態的登出清快取功能，登出一律保留 owner cache；CSP 移除 Preview Toolbar third-party script、pin 正式 Supabase host。
 - 收尾階段唯一一次 Codex Security Standard Scan 已依正式技能啟動；即使 target 改為指向相同工作樹的 ASCII junction，Windows launcher 讀取 Git metadata 時仍發生 `UnicodeDecodeError: cp950`，因此沒有 scan ID 或 sealed report；未改用其他模式或重複嘗試冒充成功。獨立 security reviewer 最終 P0／P1／P2 均為 0，人工 attack-path pass 亦完成，正式掃描器缺口保留為工具限制。
-- 上述修補後完整自動化綠燈；程式碼層目前沒有已知 blocking finding，外部 Preview／OAuth／scan gates 仍列於下節，未以「完成」掩蓋。
+- 上述修補後完整自動化綠燈；程式碼層目前沒有已知 blocking finding。Preview OAuth allowlist 是本次 E2E 新發現的 High 外部設定 blocker；依收尾指示不再展開新 fixed-point loop，其餘 scan／migration 與非阻斷項目列於下節。
 
 ## 剩餘限制與發布門檻
 
-1. 將目前 release-candidate commit push，確認 Vercel Preview 重新 build 且 Supabase env、CSP／headers live 生效。
-2. 完成真實 Google OAuth、production Supabase CRUD、離線 outbox 重連、edit/delete 不復活與等價第二 session smoke，並清理可辨識測試資料。
+1. **High／發布 blocker：**在 Supabase Auth URL Configuration 新增 `https://shiba-expense-tracker-*-ziv-s-projects3.vercel.app/**`，再由最新 Preview 重跑 Google OAuth。程式端 `redirectTo` 已正確，現有權限可查 production DB 但不能改 Auth 設定，控制台另要求使用者登入，因此未安全繞過。
+2. allowlist 修正後完成 Preview 上的真實雲端 edit/delete、離線 outbox 重連與不復活 smoke；本次已完成 Preview guest CRUD／reload／analytics，以及兩個獨立 session 的 localhost 真實 OAuth pull。為避免污染財務帳本，本次沒有建立 production 測試交易。
 3. 取得使用者另行授權後才可套用第二支 production resource guard migration；未授權前只保留 reviewed migration/preflight，不做 DDL。
 4. Codex Security launcher 的 `cp950` 中文路徑錯誤仍待工具端修復；本 release 沒有可封存的正式 scan artifact，已以獨立 reviewer 與人工 attack-path 審查降級替代，不再於本 Goal 重試。
-5. 更新 Draft PR 後確認最新 commit 的 GitHub Actions／Vercel checks 綠燈；不得自行 merge。
+5. Draft PR 已更新，最新 release-candidate commit 的兩個 GitHub Actions verify、Vercel deployment 與 Preview Comments checks 均綠燈；PR 保持 Draft，不得自行 merge。
 6. CSV import、轉帳、多幣別、信用卡／債務模型皆是明確非目標。
 
 ### 非阻斷 follow-up
 
 - `moneyLexemeDecimalPlaces` 對可用整數 coefficient 尾零抵銷負 exponent 的科學記號表示較保守，例如 `10000000e-7` 會被當成七位小數而拒絕；此路徑 fail-closed、不會改寫資料。App 自身 `JSON.stringify` 不會為目前合法一般金額產生這種等價表示，後續可在不影響本 release 的情況下正規化 coefficient 再判定 scale。
+- 兩個 OAuth E2E session 均出現 `gotrue-js` 對約 1–2 秒 client/server clock 差的 warning，但 token 可正常建立、資料可完整拉取且狀態收斂為「已同步」；目前沒有正確性影響，後續可在平台／依賴更新時再核對。
 
 ## 回滾
 

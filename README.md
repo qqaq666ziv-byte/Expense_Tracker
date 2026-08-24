@@ -61,7 +61,7 @@ npm.cmd run dev
 
 任何 `VITE_` 變數都會進入瀏覽器 bundle；絕對不要使用 `service_role`、資料庫密碼或 OAuth client secret。`.env` 與 `.env.local` 已被忽略，只追蹤無秘密的 `.env.example`。
 
-Google OAuth 的 Site URL／Redirect URLs 需在 Supabase Dashboard 對應實際預覽與正式網域設定。
+Google OAuth 的 Site URL／Redirect URLs 需在 Supabase Dashboard 對應實際預覽與正式網域設定。正式 Site URL 應使用穩定正式網域；本專案的 Vercel Preview 應另加入 project-scoped allowlist `https://shiba-expense-tracker-*-ziv-s-projects3.vercel.app/**`。若缺少這條規則，`redirectTo: window.location.origin` 會被 Supabase 拒絕並 fallback 到 Site URL，使 Preview 登入後跳到舊正式站。
 
 Vercel 的兩個 `VITE_SUPABASE_*` 變數必須同時啟用 **Production and Preview**；只設 Production 會讓 Preview build 在編譯時移除登入／同步能力。Repository 的 `vercel.json` 會為所有部署路由設定 CSP、`nosniff`、referrer、permissions 與 anti-framing headers；CSP 的 Supabase host 已 pin 到本專案，若要部署到另一個 Supabase project，必須同步更新該 allowlist 與測試。
 
@@ -144,7 +144,7 @@ Migrations（依時間順序）：
 
 - 第二支 server resource guard migration 尚未獲授權套用 production；目前正式 schema 已是 v3，但 server 端 text/numeric/quota 新防護仍以既有 PostgREST／平台限制為主。
 - 套用第二支 guard 後，兩台裝置若同時在相同 owner／entity 的配額前一筆離線新增，後到 server 的操作可能收到 `54000` 並保留在 pending outbox。由於 tombstone 也計入安全配額，刪除該本機紀錄不能自動釋放 server row；請先下載 JSON 備份並保留 pending snapshot，再由維護者唯讀核對該 ID 未上雲、建立獨立資料庫備份，最後以經審查的 quota 擴充或資料保留修復解除，不能直接清除 outbox 假裝同步成功。
-- 尚未完成最新 Preview 的真實 Google OAuth CRUD／重連不復活與等價第二 session browser E2E；owner 隔離、retry、衝突與 tombstone 已由 adapter／engine／PGlite RLS 測試覆蓋。
+- 最新 Preview 已完成本機資料的新增、編輯、重新載入持久化與分析聚合 E2E，live CSP／HSTS／anti-framing 等 headers 亦已確認；但 production Supabase 尚未加入上述 Preview Redirect URL allowlist，因此 Preview Google OAuth 仍會 fallback 到舊 Site URL，是發布前 High 外部設定 blocker。相同 release candidate 已透過已允許的 `http://127.0.0.1:8888` 在兩個獨立瀏覽器 session 完成真實 Google OAuth、保持訪客資料分離、拉取既有 43 筆 transactions 並收斂為「已同步」；未新增、編輯或刪除任何 production 財務紀錄。真實雲端 edit/delete、離線重連不復活仍留待 allowlist 修正後 smoke；owner 隔離、retry、衝突與 tombstone 已由 adapter／engine／PGlite RLS 測試覆蓋。
 - Migration 已在本機 PGlite 覆蓋 fresh、legacy、重跑、RLS、mixed-version bridge、conflict clock 與 resource guards；第一支已在真實 production schema 執行並通過 row/orphan/RLS 核對，第二支尚未執行真實 PostgREST rejection smoke。
 - Supabase Security Advisor 仍有「Leaked Password Protection Disabled」既存警告；應依 [Supabase password security 指南](https://supabase.com/docs/guides/auth/password-security#password-strength-and-leaked-password-protection)於 Auth 設定啟用並重跑 advisor。
 - 週期交易由 client 在開啟、回到前景或跨日後補齊，不是背景排程服務；長期不開 App 時會在下次開啟補齊。
