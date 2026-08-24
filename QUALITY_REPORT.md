@@ -5,6 +5,7 @@
 - 任務前復原點：`checkpoint/20260821-180842-before-autonomous-build` / `56df3f31d2a3c7b93954faef9c352859c8f1f3d5`
 - 中斷續作復原點：`checkpoint/20260823-105721-before-resume-interrupted-build` / `ba3e5de15a83cf314c3a3a64a7fc3580fd625fee`
 - Production E2E release gate 復原點：`checkpoint/20260824-101753-before-production-e2e-release-gate` / `5fb688f32cdaa54d0734de6b28d1b59cbde6516f`
+- v3 production release 前復原點：`checkpoint/20260824-1158-before-v3-production-release` / `a1d3ebfd45f9a9f4fb7451ee6dc123bfe18ef643`
 
 ## 結論
 
@@ -59,7 +60,7 @@
 - 舊 goal `current_amount` 轉為單一 deterministic allocation；retry 不會重複累計，v3 UPSERT 不會抹除 legacy total/unit。
 - 舊 subscription 只從 migration cutover 當日後建立週期規則，不捏造過往發生紀錄。
 - SQL 採資料保留、向後相容演進，保留 rollback 所需 legacy fields，並把 legacy 全域 `id` 主鍵改為 owner 複合主鍵；未知 incoming FK 會整筆 rollback。第一支 production migration 在 repository 外獨立 backup 後完成。
-- 2026-08-24 production 核對：migration history 含 `20260821103249 finance_v3_additive_schema`；43 transactions、1 goal、5 accounts、12 categories，missing relation／orphan 均為 0，10 張 user-scoped table 全部 RLS enabled、34 owner policies；舊 production frontend 仍可運作。
+- 2026-08-24 production 最新核對：migration history 只含 `20260821103249 finance_v3_additive_schema`；43 transactions、1 goal、5 accounts、16 categories、2 settings，transaction account/category orphan 均為 0，10 張 user-scoped table 全部 RLS enabled、34 owner policies；舊 production frontend 仍可運作。
 - 第二支 resource guard 未套 production。正式唯讀 preflight 對目前非空表的 text/numeric checks 得到 0 violations，各 owner count 低於 quota；它仍需另行授權與套用後 PostgREST rejection smoke。
 - 即使 client 先檢查 owner ceiling，兩台裝置在配額邊界同時離線新增仍可能讓後到者收到 server `54000` 並永久 pending；tombstone 列也計 quota，因此使用者端刪除不是安全復原。README 已記錄先備份、唯讀核對與經審查的 server-side recovery 路徑；目前沒有會靜默丟棄 local-only 財務列的按鈕。
 
@@ -93,6 +94,6 @@
 
 ## 回滾
 
-- 程式碼：本次 release-gate 從 `checkpoint/20260824-101753-before-production-e2e-release-gate`（`5fb688f32cdaa54d0734de6b28d1b59cbde6516f`）建立 recovery branch；若要回到整個建置前，使用 `checkpoint/20260821-180842-before-autonomous-build`。所有 checkpoint 均已推送；不可 force-push 或刪除 tag。
+- 程式碼：本次正式發布前的精確 RC 復原點是 `checkpoint/20260824-1158-before-v3-production-release`（`a1d3ebfd45f9a9f4fb7451ee6dc123bfe18ef643`）。若 production frontend 發生 release-blocking regression，Vercel 應先 rollback 到上一個已知正常的 production deployment `dpl_6ejsiuY1gFcGne5F7U44kuUeFdWj`（main `5fcebebe4b924b94929a4e0c638437796ef2ef9c`），保留已套用且向後相容的 v3 additive schema；若要回到整個建置前，再使用 `checkpoint/20260821-180842-before-autonomous-build`。所有 checkpoint 均已推送；不可 force-push 或刪除 tag。
 - 本機使用者資料：使用管理頁的版本化 JSON backup；replace 必須明確選擇並輸入 `REPLACE`。
 - Supabase：第一支 v3 migration 的 exact rollback 是 repository 外獨立 backup／PITR；第二支 guard 尚未執行。未來 rollout 優先 additive forward-fix，任何 guard removal 都需 fresh backup、另行授權與 reviewed transaction；不得臨時採 destructive down migration。

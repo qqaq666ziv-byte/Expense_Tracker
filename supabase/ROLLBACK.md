@@ -13,6 +13,8 @@ The first migration preserves legacy financial rows and columns while expanding 
 - resume SHA: `ba3e5de15a83cf314c3a3a64a7fc3580fd625fee`
 - release-gate tag: `checkpoint/20260824-101753-before-production-e2e-release-gate`
 - release-gate SHA: `5fb688f32cdaa54d0734de6b28d1b59cbde6516f`
+- final-release tag: `checkpoint/20260824-1158-before-v3-production-release`
+- final-release SHA: `a1d3ebfd45f9a9f4fb7451ee6dc123bfe18ef643`
 
 Git can restore application/migration source only. The verified external `roles.sql`, `schema.sql`, and `data.sql` backup is deliberately outside this repository and remains the database restore path for the first production migration.
 
@@ -33,7 +35,7 @@ For `finance_resource_abuse_guards`, also record aggregate-only preflight result
 
 The preferred rollback is code-only:
 
-1. Stop or roll back the v3 frontend deployment to the checkpointed application commit.
+1. Stop or roll back the v3 frontend deployment to the previous known-good production deployment `dpl_6ejsiuY1gFcGne5F7U44kuUeFdWj`, built from main SHA `5fcebebe4b924b94929a4e0c638437796ef2ef9c` and previously serving `https://pure-finance-pi.vercel.app/`.
 2. Leave the v3 tables/columns, owner-scoped legacy primary keys, tightened RLS policies, and legacy columns in place.
 3. Do not delete v3 records. The legacy columns on `transactions`, `goals`, `subscriptions`, and `budgets` were intentionally retained for this path.
 4. Diagnose and repair forward in a new reviewed migration.

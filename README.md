@@ -61,7 +61,7 @@ npm.cmd run dev
 
 任何 `VITE_` 變數都會進入瀏覽器 bundle；絕對不要使用 `service_role`、資料庫密碼或 OAuth client secret。`.env` 與 `.env.local` 已被忽略，只追蹤無秘密的 `.env.example`。
 
-Google OAuth 的 Site URL／Redirect URLs 需在 Supabase Dashboard 對應實際預覽與正式網域設定。正式 Site URL 應使用穩定正式網域；本專案的 Vercel Preview 應另加入 project-scoped allowlist `https://shiba-expense-tracker-*-ziv-s-projects3.vercel.app/**`。若缺少這條規則，`redirectTo: window.location.origin` 會被 Supabase 拒絕並 fallback 到 Site URL，使 Preview 登入後跳到舊正式站。
+Google OAuth 的 Site URL／Redirect URLs 需在 Supabase Dashboard 對應實際預覽與正式網域設定。正式 Site URL 應使用穩定正式網域；Preview 優先加入受保護、可信任分支的精確 origin，只有所有相符部署都受 Deployment Protection 保護且不會部署不受信任程式碼時，才使用 project-scoped wildcard `https://shiba-expense-tracker-*-ziv-s-projects3.vercel.app/**`。若缺少對應規則，`redirectTo: window.location.origin` 會被 Supabase 拒絕並 fallback 到 Site URL，使 Preview 登入後跳到舊正式站。
 
 Vercel 的兩個 `VITE_SUPABASE_*` 變數必須同時啟用 **Production and Preview**；只設 Production 會讓 Preview build 在編譯時移除登入／同步能力。Repository 的 `vercel.json` 會為所有部署路由設定 CSP、`nosniff`、referrer、permissions 與 anti-framing headers；CSP 的 Supabase host 已 pin 到本專案，若要部署到另一個 Supabase project，必須同步更新該 allowlist 與測試。
 
@@ -119,7 +119,7 @@ Migrations（依時間順序）：
 
 ### Production 狀態與下一支 migration gate
 
-2026-08-24 已確認 production 外部備份位於 repository 之外，並已套用第一支 `finance_v3_additive_schema`。套用後證據：43 筆 transactions、1 筆 goal，v3 tables／34 owner policies／RLS 存在，missing relation 與 orphan count 均為 0，舊 production frontend 仍可運作。未執行資料刪除或 reinterpretation。
+2026-08-24 已確認 production 外部備份位於 repository 之外，並已套用第一支 `finance_v3_additive_schema`。最新唯讀證據：43 筆 transactions、1 筆 goal、5 筆 accounts、16 筆 categories、2 筆 settings，10 張 user-scoped tables／34 owner policies／RLS 存在，transaction account/category orphan 均為 0，舊 production frontend 仍可運作。未執行資料刪除或 reinterpretation。
 
 第二支 guard migration **尚未套用 production**。2026-08-24 唯讀 preflight 對目前非空表的所有對應文字與 numeric 欄得到 0 violations，owner row maxima 也低於 quota；正式套用仍需要使用者另行授權。獲授權後必須：
 
@@ -157,6 +157,7 @@ Migrations（依時間順序）：
 - 任務前遠端 checkpoint：`checkpoint/20260821-180842-before-autonomous-build`，SHA `56df3f31d2a3c7b93954faef9c352859c8f1f3d5`。
 - 中斷續作前遠端 checkpoint：`checkpoint/20260823-105721-before-resume-interrupted-build`，SHA `ba3e5de15a83cf314c3a3a64a7fc3580fd625fee`。
 - 本次 production E2E release gate 前 checkpoint：`checkpoint/20260824-101753-before-production-e2e-release-gate`，SHA `5fb688f32cdaa54d0734de6b28d1b59cbde6516f`。
-- 程式碼回復：只撤銷本次 release-gate 修補時從最新 checkpoint 建立 recovery branch；回到整個建置前則使用最早 checkpoint。三個 tag 均已推送；不要改寫／刪除 checkpoint history。
+- v3 production release 前 checkpoint：`checkpoint/20260824-1158-before-v3-production-release`，SHA `a1d3ebfd45f9a9f4fb7451ee6dc123bfe18ef643`。
+- 程式碼回復：production regression 優先將 Vercel rollback 到上一個已知正常 deployment `dpl_6ejsiuY1gFcGne5F7U44kuUeFdWj`（main `5fcebebe4b924b94929a4e0c638437796ef2ef9c`），並保留已套用的向後相容 v3 additive schema；只撤銷本次 release 文件或設定修補時可從最新 checkpoint 建立 recovery branch，回到整個建置前則使用最早 checkpoint。四個 tag 均已推送；不要改寫／刪除 checkpoint history。
 - 使用者資料回復：優先使用管理頁的 JSON backup 安全合併／明確取代。
 - Database：第一支 v3 additive migration 已在外部 backup 後套用；第二支 guard migration未套用。Schema 回復與 additive forward-fix 依 `supabase/ROLLBACK.md`，不可把 Git tag 當作 database backup。
