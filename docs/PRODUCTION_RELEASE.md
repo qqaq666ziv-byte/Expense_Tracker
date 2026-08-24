@@ -220,20 +220,47 @@ Do not stack speculative fixes across multiple layers at once.
 
 ## Release record
 
-Update this section after the current production incident is fully resolved.
-
 Canonical Vercel project ID:
 
-`TO_BE_VERIFIED`
+`prj_PDwYdTxA52vgkfRek2AzNofUJCHW`
 
 Latest known-good production commit:
 
-`TO_BE_VERIFIED`
+`3b36bc0d63a635ef66fe2aadb8eb52a610ffd0dd`
 
 Latest known-good production deployment:
 
-`TO_BE_VERIFIED`
+`dpl_14dFNW7J6LfgwLtuMtEuQufxi3KC`
 
 Last verified at:
 
-`TO_BE_VERIFIED`
+`2026-08-24T20:13:29+08:00`
+
+Verified production topology and evidence:
+
+- Vercel project metadata links the project above to
+  `qqaq666ziv-byte/Expense_Tracker`; this identity was not inferred from the
+  display name.
+- `shiba-expense-tracker.vercel.app` resolved to the deployment above, built
+  from `main` at the recorded commit.
+- The canonical URL returned HTTP 200 and served the intended production entry
+  bundle `/assets/index-D5mk4P_j.js`; its JavaScript, CSS, manifest, and Service
+  Worker resources returned HTTP 200 with the expected content types.
+- Two existing browser profiles initially received the prior PWA shell. Normal
+  Service Worker update and reload moved both to the recorded bundle without
+  deleting site data; the current React UI rendered and its main record,
+  insights, assets, and planning surfaces had no blocking console errors.
+- The earlier `READY` deployment/canonical mismatch was an alias-routing issue:
+  a newer project deployment was ready while the canonical alias still resolved
+  to an older deployment. The canonical alias was explicitly assigned to the
+  recorded deployment and then verified by hostname.
+- No production database migration or bulk financial-data mutation was part of
+  this release. In particular,
+  `20260824023801_finance_resource_abuse_guards.sql` was not deployed.
+- Source restore point:
+  `checkpoint/20260824-194448-before-auth-production-sync-incident` at
+  `ba2e4f282817d1056d38dcce389e5804c0c09ae1`.
+- Frontend rollback candidate: the previously canonical deployment
+  `dpl_85M2AYQZsnsS4XcZubTfEkBszXqS` at
+  `73a679940aa8444cd4cf3a1c5bbb821b699bbcc6`. Reassign only the canonical alias
+  for a frontend rollback; do not roll back or mutate production finance data.
