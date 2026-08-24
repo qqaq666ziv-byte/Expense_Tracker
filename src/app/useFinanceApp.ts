@@ -132,7 +132,11 @@ export function restoreFinanceStateUnlessLegacyBootstrap(
   data: FinanceData,
   persist: (next: PersistedFinanceState) => void,
   clearRecovery: () => void,
+  allowInitialBootstrapRecovery = false,
 ): PersistedFinanceState {
+  if (state.initialBootstrap && !allowInitialBootstrapRecovery) {
+    throw new Error('雲端帳本尚在初始化；完成 authoritative pull 前不會執行備份還原');
+  }
   if (state.legacyBootstrap) {
     throw new Error('請先完成舊版候選資料決策，再執行一般備份還原');
   }
@@ -158,7 +162,8 @@ export function materializeRecurringTransactionsUnlessRecovering(
   recovery: LocalStateRecovery | undefined,
 ): PersistedFinanceState {
   return applyFinanceMutationUnlessRecovering(state, recovery, (current) => {
-    if (current.legacyBootstrap?.status === 'pending') return current;
+    if (current.legacyBootstrap?.status === 'pending'
+      || current.initialBootstrap) return current;
     let next = current;
     let changed = false;
     for (const rule of current.data.recurringRules.filter((item) => !item.deletedAt && item.isActive)) {
@@ -376,6 +381,10 @@ export function useFinanceApp(): FinanceAppController {
       setLegacyBootstrapNotice('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
       return false;
     }
+    if (stateRef.current.initialBootstrap) {
+      setSafetyNotice('正在先讀取雲端帳本；完成前本次修改未執行。');
+      return false;
+    }
     if (storageRecoveryRef.current) {
       setSafetyNotice('本機快照仍在復原保護中；完成有效備份還原前，本次帳本修改未執行。');
       return false;
@@ -407,6 +416,10 @@ export function useFinanceApp(): FinanceAppController {
       setLegacyBootstrapNotice('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
       return false;
     }
+    if (stateRef.current.initialBootstrap) {
+      setSafetyNotice('正在先讀取雲端帳本；完成前本次刪除未執行。');
+      return false;
+    }
     if (storageRecoveryRef.current) {
       setSafetyNotice('本機快照仍在復原保護中；完成有效備份還原前，本次刪除未執行。');
       return false;
@@ -436,6 +449,9 @@ export function useFinanceApp(): FinanceAppController {
     if (stateRef.current.legacyBootstrap) {
       setLegacyBootstrapNotice('請先對舊版候選資料選擇「匯入候選」或「保留雲端」，本次一般備份還原未執行。');
     }
+    if (stateRef.current.initialBootstrap) {
+      setSafetyNotice('正在先讀取雲端帳本；完成前本次一般備份還原未執行。');
+    }
     const restored = restoreFinanceStateUnlessLegacyBootstrap(
       stateRef.current,
       data,
@@ -445,18 +461,21 @@ export function useFinanceApp(): FinanceAppController {
         setStorageRecovery,
         setSafetyNotice,
       ),
+      storageRecoveryRef.current !== undefined,
     );
     commitState(() => restored);
   }, [assertRenderedOwnerContext, commitState]);
 
   useEffect(() => {
-    if (storageRecovery || state.legacyBootstrap?.status === 'pending') return;
+    if (storageRecovery
+      || state.legacyBootstrap?.status === 'pending'
+      || state.initialBootstrap) return;
     commitState((current) => materializeRecurringTransactionsUnlessRecovering(
       current,
       calendarDay,
       storageRecoveryRef.current,
     ));
-  }, [state.ownerId, state.legacyBootstrap?.status, recurrenceCursorKey, calendarDay, commitState, storageRecovery]);
+  }, [state.ownerId, state.legacyBootstrap?.status, state.initialBootstrap?.status, recurrenceCursorKey, calendarDay, commitState, storageRecovery]);
 
   const guestLoad = useMemo(() => loadFinanceStateWithRecovery('guest'), [state.ownerId, state.data.transactions.length]);
   const guestFingerprint = guestSnapshotFingerprint(guestLoad.state.data);
@@ -472,6 +491,7 @@ export function useFinanceApp(): FinanceAppController {
     && !guestLoad.recovery
     && !storageRecovery
     && !state.legacyBootstrap
+    && !state.initialBootstrap
     && rememberedGuestFingerprint !== guestFingerprint
     && hasUserContent(guestLoad.state.data);
 
@@ -496,6 +516,10 @@ export function useFinanceApp(): FinanceAppController {
     setGuestImportNotice(undefined);
     if (stateRef.current.legacyBootstrap) {
       setGuestImportNotice('請先完成舊版帳本候選資料的匯入或保留雲端決定，再處理訪客資料。');
+      return;
+    }
+    if (stateRef.current.initialBootstrap) {
+      setGuestImportNotice('正在先讀取雲端帳本；完成前不會匯入訪客資料。');
       return;
     }
     if (storageRecovery) {

@@ -138,6 +138,18 @@ export interface PendingOperation {
   lastError?: string;
 }
 
+/**
+ * A missing authenticated v3 snapshot is provisional until a cloud-first pull
+ * proves whether this owner already has a finance graph. Exact pre-fix seed
+ * operations are quarantined here as well; genuine local operations remain
+ * durable and are replayed only after the authoritative pull succeeds.
+ */
+export interface InitialAuthenticatedBootstrap {
+  status: 'pending' | 'seeding';
+  candidate: FinanceData;
+  pendingOperations: PendingOperation[];
+}
+
 export interface PersistedFinanceState {
   schemaVersion: 3;
   ownerId: OwnerId;
@@ -147,4 +159,5 @@ export interface PersistedFinanceState {
   lastSyncError?: string;
   migratedFromLegacy?: boolean;
   legacyBootstrap?: LegacyAuthenticatedBootstrap;
+  initialBootstrap?: InitialAuthenticatedBootstrap;
 }

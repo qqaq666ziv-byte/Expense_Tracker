@@ -26,6 +26,7 @@ function corruptedGuestLoad() {
 
 function readyLegacyState() {
   const state = createInitialState('user-a');
+  state.initialBootstrap = undefined;
   state.outbox = [];
   const candidate = structuredClone(state.data);
   candidate.accounts[0] = {
@@ -129,6 +130,92 @@ describe('authenticated legacy bootstrap decisions', () => {
       expect(state.legacyBootstrap?.status).toBe(status);
     },
   );
+});
+
+describe('authenticated initial bootstrap gate', () => {
+  it('blocks ordinary mutations and backup restore until the cloud-first pull completes', () => {
+    const state = createInitialState('user-a');
+    const account = {
+      ...state.data.accounts[0],
+      id: 'blocked-before-pull',
+      lastOperationId: 'blocked-before-pull-create',
+    };
+    const persist = vi.fn();
+    const clearRecovery = vi.fn();
+
+    expect(() => putRecord(state, 'accounts', account)).toThrow(/initial bootstrap/i);
+    expect(() => restoreFinanceStateUnlessLegacyBootstrap(
+      state,
+      structuredClone(state.data),
+      persist,
+      clearRecovery,
+    )).toThrow(/authoritative pull/i);
+    expect(materializeRecurringTransactionsUnlessRecovering(
+      state,
+      '2026-08-24',
+      undefined,
+    )).toBe(state);
+    expect(persist).not.toHaveBeenCalled();
+    expect(clearRecovery).not.toHaveBeenCalled();
+    expect(state.outbox).toEqual([]);
+  });
+
+  it('allows an explicit valid backup to durably recover a malformed authenticated snapshot', () => {
+    const storage = {
+      getItem: (key: string) => key === storageKey('user-a') ? '{broken-json' : null,
+    };
+    const loaded = loadFinanceStateWithRecovery('user-a', storage);
+    const backup = structuredClone(createInitialState('user-a').data);
+    const order: string[] = [];
+
+    const restored = restoreFinanceStateUnlessLegacyBootstrap(
+      loaded.state,
+      backup,
+      () => order.push('persist'),
+      () => order.push('clear-recovery'),
+      true,
+    );
+
+    expect(loaded.recovery).toBeDefined();
+    expect(order).toEqual(['persist', 'clear-recovery']);
+    expect(restored.initialBootstrap).toBeUndefined();
+    expect(restored.outbox).toHaveLength(15);
+    expect(restored.outbox.every(({ record }) => record.deletedAt === undefined)).toBe(true);
+    expect(restored.data.accounts).toHaveLength(1);
+    expect(restored.data.categories).toHaveLength(14);
+  });
+
+  it('keeps recurrence materialization blocked throughout partial default seeding', () => {
+    const state = createInitialState('user-a');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'income')!;
+    state.data.recurringRules = [{
+      id: 'seeding-weekly-income',
+      ownerId: 'user-a',
+      version: 1,
+      updatedAt: '2026-08-01T00:00:00.000Z',
+      lastOperationId: 'seeding-weekly-income-create',
+      name: '每週收入',
+      type: 'income',
+      amount: 1_000,
+      categoryId: category.id,
+      categoryName: category.name,
+      accountId: account.id,
+      accountName: account.name,
+      frequency: 'weekly',
+      startDate: '2026-08-03',
+      nextOccurrenceDate: '2026-08-03',
+      isActive: true,
+    }];
+    state.initialBootstrap = { ...state.initialBootstrap!, status: 'seeding' };
+
+    expect(materializeRecurringTransactionsUnlessRecovering(
+      state,
+      '2026-08-24',
+      undefined,
+    )).toBe(state);
+    expect(state.outbox).toEqual([]);
+  });
 });
 
 describe('owner-bound controller actions', () => {
