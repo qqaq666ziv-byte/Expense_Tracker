@@ -7,6 +7,7 @@ import {
   calculateInsights,
   calculateSpendingTrend,
 } from './financeEngine';
+import { TUTORIAL_RECORD_NOTE } from '../app/tutorial';
 
 const baseData: FinanceData = {
   accounts: [
@@ -37,6 +38,32 @@ const baseData: FinanceData = {
 };
 
 describe('finance engine', () => {
+  it('keeps an active tutorial record out of the normal ledger, assets and analytics', () => {
+    const data: FinanceData = {
+      ...baseData,
+      transactions: [{
+        id: 'tutorial-record', ownerId: 'guest', amount: 100, type: 'expense',
+        categoryId: 'food', categoryName: '餐飲', accountId: 'cash', accountName: '現金',
+        occurredAt: '2026-08-21 12:00', note: TUTORIAL_RECORD_NOTE, version: 1,
+        updatedAt: '2026-08-21T04:00:00.000Z', lastOperationId: 'tutorial-create',
+      }],
+    };
+
+    expect(buildLedgerHistory(data)).toEqual([]);
+    expect(calculateFinancials(data)).toMatchObject({
+      totalAssets: 1_500,
+      allTime: { income: 0, expense: 0, net: 0 },
+    });
+    expect(calculateInsights(data, {
+      period: 'month',
+      reference: new Date(2026, 7, 21, 12),
+    }).today).toMatchObject({ income: 0, expense: 0, net: 0 });
+    expect(calculateSpendingTrend(
+      data,
+      getPeriodRange('month', new Date(2026, 7, 21, 12)),
+    )).toEqual([]);
+  });
+
   it('deducts an expense from its selected account and includes it in its category', () => {
     const data: FinanceData = {
       ...baseData,

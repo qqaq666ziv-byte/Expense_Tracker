@@ -9,6 +9,7 @@ import type {
 import { enqueueSyncRecord } from '../domain/syncEngine';
 import { migrateLegacyData, stableLegacyId } from '../domain/legacyMigration';
 import { validateFinanceData } from '../domain/backup';
+import { isTutorialTransaction } from '../domain/tutorialRecord';
 import {
   assertFinanceOwnerRowLimit,
   assertFinanceRecordWithinWriteLimits,
@@ -17,15 +18,19 @@ import {
 export const LOCAL_STATE_PREFIX = 'shiba-finance:v3:';
 
 const DEFAULT_CATEGORIES = [
-  ['expense', '餐飲', '🍜'],
-  ['expense', '交通', '🚌'],
+  ['expense', '餐飲', '🍖'],
+  ['expense', '交通', '🚗'],
   ['expense', '購物', '🛍️'],
-  ['expense', '娛樂', '🎮'],
-  ['expense', '生活', '🏠'],
+  ['expense', '娛樂', '✨'],
+  ['expense', '居家', '🏠'],
+  ['expense', '醫療', '🩹'],
+  ['expense', '學習', '📚'],
+  ['expense', '人情', '🎁'],
   ['expense', '其他支出', '🧾'],
-  ['income', '薪資', '💼'],
+  ['income', '薪資', '💰'],
   ['income', '零用錢', '🪙'],
   ['income', '獎金', '🎁'],
+  ['income', '投資', '📈'],
   ['income', '其他收入', '✨'],
 ] as const;
 
@@ -613,7 +618,7 @@ export function hasUserContent(data: FinanceData): boolean {
     sortOrder: record.sortOrder,
     legacyKey: record.legacyKey,
   }));
-  return data.transactions.length > 0
+  return data.transactions.some((transaction) => !isTutorialTransaction(transaction))
     || data.adjustments.length > 0
     || data.goals.length > 0
     || data.allocations.length > 0
@@ -653,7 +658,9 @@ export function remapOwner(data: FinanceData, ownerId: string): FinanceData {
     ...structuredClone(data),
     accounts: data.accounts.map((record) => remap(record, accountIds.get(record.id)!)),
     categories: data.categories.map((record) => remap(record, categoryIds.get(record.id)!)),
-    transactions: data.transactions.map((record) => {
+    transactions: data.transactions
+      .filter((record) => !isTutorialTransaction(record))
+      .map((record) => {
       const recurringRuleId = record.recurringRuleId ? recurringIds.get(record.recurringRuleId) : undefined;
       const id = recurringRuleId && record.occurrenceDate
         ? `rec-${recurringRuleId}-${record.occurrenceDate}`
@@ -664,7 +671,7 @@ export function remapOwner(data: FinanceData, ownerId: string): FinanceData {
         categoryId: categoryIds.get(record.categoryId)!,
         ...(recurringRuleId ? { recurringRuleId } : {}),
       }, id);
-    }),
+      }),
     adjustments: data.adjustments.map((record) => remap({
       ...record,
       accountId: accountIds.get(record.accountId)!,

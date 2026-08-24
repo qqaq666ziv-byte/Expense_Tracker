@@ -42,9 +42,9 @@ describe('authenticated legacy bootstrap panel', () => {
       />,
     );
 
-    expect(html).toContain('先讀取雲端');
-    expect(html).toContain('立即讀取雲端');
-    expect(html).not.toContain('匯入候選資料');
+    expect(html).toContain('正在安全讀取你的雲端帳本');
+    expect(html).toContain('重新讀取');
+    expect(html).not.toContain('匯入這份資料');
   });
 
   it('shows candidate and unsynced transaction counts before any explicit decision', () => {
@@ -59,10 +59,10 @@ describe('authenticated legacy bootstrap panel', () => {
       />,
     );
 
-    expect(html).toContain('12 筆');
-    expect(html).toContain('1 筆舊交易');
-    expect(html).toContain('下載候選備份');
-    expect(html).toContain('匯入候選資料');
-    expect(html).toContain('保留雲端資料');
+    expect(html).toContain('16 筆舊資料');
+    expect(html).toContain('1 筆交易可能還沒上傳');
+    expect(html).toContain('下載備份');
+    expect(html).toContain('匯入這份資料');
+    expect(html).toContain('保留雲端版本');
   });
 });

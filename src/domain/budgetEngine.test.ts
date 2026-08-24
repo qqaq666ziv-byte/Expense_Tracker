@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Budget, FinanceData } from './model';
 import { createFinanceBackup, restoreFinanceBackup } from './backup';
 import { calculateBudgetUsage, normalizeBudgetScope } from './budgetEngine';
+import { TUTORIAL_RECORD_NOTE } from '../app/tutorial';
 
 describe('budget engine', () => {
   it('uses shared calendar rules for overall and category budgets without counting income or adjustments', () => {
@@ -21,6 +22,11 @@ describe('budget engine', () => {
           id: 'income', ownerId: 'guest', amount: 500, type: 'income', categoryId: 'salary', categoryName: '薪水',
           accountId: 'cash', accountName: '現金', occurredAt: '2026-08-21 09:00', version: 1,
           updatedAt: '2026-08-21T01:00:00.000Z', lastOperationId: 'fixture',
+        },
+        {
+          id: 'tutorial', ownerId: 'guest', amount: 100, type: 'expense', categoryId: 'food', categoryName: '餐飲',
+          accountId: 'cash', accountName: '現金', occurredAt: '2026-08-21 10:00', note: TUTORIAL_RECORD_NOTE,
+          version: 1, updatedAt: '2026-08-21T02:00:00.000Z', lastOperationId: 'tutorial-create',
         },
       ],
       adjustments: [{

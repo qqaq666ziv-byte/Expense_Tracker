@@ -11,6 +11,7 @@ import {
   restoreFinanceBackup,
 } from './backup';
 import { MAX_SAFE_MONEY } from './money';
+import { TUTORIAL_RECORD_NOTE } from '../app/tutorial';
 
 const fixture: FinanceData = {
   accounts: [{
@@ -409,5 +410,21 @@ describe('transaction CSV export', () => {
     const csv = exportTransactionsCsv(data);
 
     expect(csv).toContain('"\' \r\n=HYPERLINK(""https://invalid.example"")"');
+  });
+
+  it('keeps internal tutorial records out of the user-facing transaction CSV', () => {
+    const data = structuredClone(fixture);
+    data.transactions.push({
+      ...data.transactions[0],
+      id: 'tutorial-record',
+      note: TUTORIAL_RECORD_NOTE,
+      lastOperationId: 'tutorial-create',
+    });
+
+    const csv = exportTransactionsCsv(data);
+
+    expect(csv).toContain('tx-breakfast');
+    expect(csv).not.toContain('tutorial-record');
+    expect(csv).not.toContain(TUTORIAL_RECORD_NOTE);
   });
 });

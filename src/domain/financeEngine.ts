@@ -2,6 +2,7 @@ import type { BalanceAdjustment, FinanceData, Transaction } from './model';
 import type { CustomRangeInput, DateRange, PeriodKey } from './dateRange';
 import { sortByDisplayOrder } from './displayOrder';
 import { addMoney, compareMoney, subtractMoney, sumMoney } from './money';
+import { isFinancialTransaction } from './tutorialRecord';
 import {
   countElapsedDays,
   getEquivalentPreviousPeriodRange,
@@ -81,7 +82,7 @@ const isPresent = <T extends { deletedAt?: string }>(record: T): boolean => !rec
 /** Normal transactions and balance corrections share one auditable timeline. */
 export function buildLedgerHistory(data: FinanceData): LedgerHistoryEntry[] {
   return [
-    ...data.transactions.filter(isPresent).map((record) => ({ kind: 'transaction' as const, record })),
+    ...data.transactions.filter(isFinancialTransaction).map((record) => ({ kind: 'transaction' as const, record })),
     ...data.adjustments.filter(isPresent).map((record) => ({ kind: 'adjustment' as const, record })),
   ].sort((left, right) => {
     const timeDelta = parseLocalDateTime(right.record.occurredAt).getTime()
@@ -101,7 +102,7 @@ export function calculateSpendingTrend(
   if (maxPoints <= 0) return [];
   const totals = new Map<string, number>();
   for (const transaction of data.transactions) {
-    if (!isPresent(transaction) || transaction.type !== 'expense' || !isWithinRange(transaction.occurredAt, range)) {
+    if (!isFinancialTransaction(transaction) || transaction.type !== 'expense' || !isWithinRange(transaction.occurredAt, range)) {
       continue;
     }
     const date = toLocalDateKey(transaction.occurredAt);
@@ -113,7 +114,7 @@ export function calculateSpendingTrend(
 }
 
 export function calculateFinancials(data: FinanceData): FinancialSummary {
-  const transactions = data.transactions.filter(isPresent);
+  const transactions = data.transactions.filter(isFinancialTransaction);
   const adjustments = data.adjustments.filter(isPresent);
   const categoriesById = new Map(data.categories.filter(isPresent).map((category) => [category.id, category]));
 
@@ -179,7 +180,7 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
 export function calculateInsights(data: FinanceData, options: InsightsOptions): InsightsSummary {
   const todayRange = getTodayRange(options.reference);
   const todayTransactions = data.transactions.filter(
-    (transaction) => isPresent(transaction) && isWithinRange(transaction.occurredAt, todayRange),
+    (transaction) => isFinancialTransaction(transaction) && isWithinRange(transaction.occurredAt, todayRange),
   );
   const income = sumMoney(todayTransactions
     .filter((transaction) => transaction.type === 'income')
@@ -226,7 +227,7 @@ export function calculateInsights(data: FinanceData, options: InsightsOptions): 
 
 function summarizePeriod(data: FinanceData, range: DateRange, reference: Date): PeriodAnalytics {
   const transactions = data.transactions.filter(
-    (transaction) => isPresent(transaction) && isWithinRange(transaction.occurredAt, range),
+    (transaction) => isFinancialTransaction(transaction) && isWithinRange(transaction.occurredAt, range),
   );
   const income = sumMoney(transactions
     .filter((transaction) => transaction.type === 'income')

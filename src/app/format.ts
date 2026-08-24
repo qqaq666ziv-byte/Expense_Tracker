@@ -1,12 +1,18 @@
 import { parseLocalDateTime } from '../domain/dateRange';
 import { MAX_SAFE_MONEY, toMinorUnits } from '../domain/money';
 
-export const money = new Intl.NumberFormat('zh-TW', {
+const twdMoney = new Intl.NumberFormat('zh-TW', {
   style: 'currency',
   currency: 'TWD',
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
+
+export const money = {
+  format(value: number) {
+    return twdMoney.format(value).replace('$', 'NT$');
+  },
+};
 
 export function toLocalInput(date = new Date()): string {
   const offset = date.getTimezoneOffset() * 60_000;

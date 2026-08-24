@@ -1,6 +1,7 @@
 import { getPeriodRange, isWithinRange } from './dateRange';
 import type { FinanceData } from './model';
 import { subtractMoney, sumMoney } from './money';
+import { isFinancialTransaction } from './tutorialRecord';
 
 export interface BudgetUsage {
   budgetId: string;
@@ -29,7 +30,7 @@ export function calculateBudgetUsage(data: FinanceData, reference: Date): Budget
     data.categories.filter((category) => !category.deletedAt).map((category) => [category.id, category]),
   );
   const expenses = data.transactions.filter(
-    (transaction) => !transaction.deletedAt && transaction.type === 'expense',
+    (transaction) => isFinancialTransaction(transaction) && transaction.type === 'expense',
   );
 
   return data.budgets

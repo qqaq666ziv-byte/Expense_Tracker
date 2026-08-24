@@ -106,13 +106,8 @@ describe('SettingsView recurring safety', () => {
       <RecurringPanel
         data={state.data}
         ownerId="guest"
-        putAccount={() => true}
-        putCategory={() => true}
         putRecurring={() => true}
-        archiveAccount={() => true}
-        archiveCategory={() => true}
         deleteRecurring={() => true}
-        restore={() => undefined}
       />,
     );
 

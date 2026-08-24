@@ -1,4 +1,5 @@
 import type { FinanceData, OwnerId } from './model';
+import { isTutorialTransaction } from './tutorialRecord';
 import {
   MAX_LEGACY_MONEY_DECIMAL_PLACES,
   MAX_SAFE_MONEY,
@@ -109,7 +110,9 @@ function csvCell(value: string | number | undefined, protectFormula = true): str
 
 export function exportTransactionsCsv(data: FinanceData): string {
   validateFinanceData(data, 'data');
-  const rows = data.transactions.map((transaction) => [
+  const rows = data.transactions
+    .filter((transaction) => !isTutorialTransaction(transaction))
+    .map((transaction) => [
     csvCell(transaction.id),
     csvCell(transaction.ownerId),
     csvCell(transaction.type),
@@ -123,7 +126,7 @@ export function exportTransactionsCsv(data: FinanceData): string {
     csvCell(transaction.recurringRuleId),
     csvCell(transaction.occurrenceDate),
     csvCell(transaction.deletedAt),
-  ].join(','));
+    ].join(','));
 
   return `${TRANSACTION_CSV_HEADERS.join(',')}\r\n${rows.join('\r\n')}${rows.length > 0 ? '\r\n' : ''}`;
 }

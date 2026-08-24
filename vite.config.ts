@@ -11,13 +11,13 @@ export default defineConfig(() => {
       VitePWA({
         registerType: 'autoUpdate',
         manifest: {
-          name: '柴柴極速記帳',
+          name: '柴柴記帳',
           short_name: '柴柴記帳',
           lang: 'zh-TW',
-          description: '柴犬主題的個人記帳、預算管理與儲蓄目標應用',
+          description: '三個選擇記下一筆，慢慢看懂錢去了哪裡、現在放在哪裡。',
           start_url: '/',
-          theme_color: '#8a5100',
-          background_color: '#fef9ef',
+          theme_color: '#d96512',
+          background_color: '#f8f3eb',
           display: 'standalone',
           orientation: 'portrait',
           icons: [
