@@ -17,15 +17,19 @@ import {
 export const LOCAL_STATE_PREFIX = 'shiba-finance:v3:';
 
 const DEFAULT_CATEGORIES = [
-  ['expense', '餐飲', '🍜'],
-  ['expense', '交通', '🚌'],
+  ['expense', '餐飲', '🍖'],
+  ['expense', '交通', '🚗'],
   ['expense', '購物', '🛍️'],
-  ['expense', '娛樂', '🎮'],
-  ['expense', '生活', '🏠'],
+  ['expense', '娛樂', '✨'],
+  ['expense', '居家', '🏠'],
+  ['expense', '醫療', '🩹'],
+  ['expense', '學習', '📚'],
+  ['expense', '人情', '🎁'],
   ['expense', '其他支出', '🧾'],
-  ['income', '薪資', '💼'],
+  ['income', '薪資', '💰'],
   ['income', '零用錢', '🪙'],
   ['income', '獎金', '🎁'],
+  ['income', '投資', '📈'],
   ['income', '其他收入', '✨'],
 ] as const;
 

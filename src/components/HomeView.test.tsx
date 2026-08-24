@@ -4,6 +4,20 @@ import { createInitialState } from '../app/state';
 import { HomeView } from './HomeView';
 
 describe('HomeView ledger access', () => {
+  it('keeps the primary entry path in amount, category, account order', () => {
+    const state = createInitialState('guest');
+    const html = renderToStaticMarkup(
+      <HomeView data={state.data} ownerId="guest" put={() => true} deleteTransaction={() => true} />,
+    );
+
+    expect(html).toContain('極速記帳');
+    expect(html).toContain('記支出');
+    expect(html).toContain('餐飲');
+    expect(html).toContain('從哪個資產帳戶付款？');
+    expect(html.indexOf('aria-label="金額"')).toBeLessThan(html.indexOf('選擇分類'));
+    expect(html.indexOf('選擇分類')).toBeLessThan(html.indexOf('從哪個資產帳戶付款？'));
+  });
+
   it('offers access beyond the first 30 auditable ledger entries', () => {
     const state = createInitialState('guest');
     const account = state.data.accounts[0];
@@ -28,7 +42,6 @@ describe('HomeView ledger access', () => {
         data={state.data}
         ownerId="guest"
         put={() => true}
-        putAdjustment={() => true}
         deleteTransaction={() => true}
       />,
     );

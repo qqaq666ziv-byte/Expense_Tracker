@@ -67,15 +67,15 @@ export function IconPicker({ value, onChange }: { value: IconRef; onChange(icon:
   return (
     <div className="space-y-2">
       <div className="flex gap-2" role="group" aria-label="圖示類型">
-        <button type="button" className={`chip ${value.type === 'emoji' ? 'chip-active' : ''}`} onClick={() => onChange({ type: 'emoji', value: value.type === 'emoji' ? value.value : '💰' })}>Emoji</button>
-        <button type="button" className={`chip ${value.type === 'vector' ? 'chip-active' : ''}`} onClick={() => onChange({ type: 'vector', value: value.type === 'vector' ? value.value : 'wallet' })}>向量圖示</button>
+        <button type="button" className={`chip ${value.type === 'emoji' ? 'chip-active' : ''}`} onClick={() => onChange({ type: 'emoji', value: value.type === 'emoji' ? value.value : '💰' })}>表情圖案</button>
+        <button type="button" className={`chip ${value.type === 'vector' ? 'chip-active' : ''}`} onClick={() => onChange({ type: 'vector', value: value.type === 'vector' ? value.value : 'wallet' })}>簡約圖案</button>
       </div>
       {value.type === 'emoji' ? (
-        <label className="field-label">任意 Emoji
-          <input className="field mt-1" aria-label="任意 Emoji" value={value.value} maxLength={64} onChange={(event) => onChange({ type: 'emoji', value: event.target.value || '💰' })} />
+        <label className="field-label">貼上喜歡的表情圖案
+          <input className="field mt-1" aria-label="自訂表情圖案" value={value.value} maxLength={64} onChange={(event) => onChange({ type: 'emoji', value: event.target.value || '💰' })} />
         </label>
       ) : (
-        <div className="grid grid-cols-9 gap-1" aria-label="向量圖示選擇">
+        <div className="grid grid-cols-9 gap-1" aria-label="簡約圖案選擇">
           {VECTOR_ICON_OPTIONS.map((key) => (
             <button type="button" key={key} aria-label={`圖示 ${key}`} className={`icon-choice ${value.value === key ? 'icon-choice-active' : ''}`} onClick={() => onChange({ type: 'vector', value: key })}>
               <FinanceIcon icon={{ type: 'vector', value: key }} />

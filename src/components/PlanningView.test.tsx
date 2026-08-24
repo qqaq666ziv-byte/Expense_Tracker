@@ -29,6 +29,8 @@ describe('PlanningView archived allocations', () => {
         putGoal={() => true}
         putAllocation={() => true}
         putBudget={() => true}
+        putRecurring={() => true}
+        deleteRecurring={() => true}
         archiveGoal={() => true}
         archiveBudget={() => true}
       />,
@@ -38,7 +40,7 @@ describe('PlanningView archived allocations', () => {
     expect(html).toContain('已封存');
     expect(html).toContain('釋放旅行基金配置');
     expect(html).toContain('重新啟用旅行基金');
-    expect(html).toContain('1 筆已釋放配置保留 tombstone 稽核');
+    expect(html).toContain('1 筆已釋放的過去配置仍安全保留');
   });
 
   it('does not treat 0.10 plus 0.20 as exceeding 0.30 of assets', () => {
@@ -62,6 +64,8 @@ describe('PlanningView archived allocations', () => {
         putGoal={() => true}
         putAllocation={() => true}
         putBudget={() => true}
+        putRecurring={() => true}
+        deleteRecurring={() => true}
         archiveGoal={() => true}
         archiveBudget={() => true}
       />,
@@ -94,6 +98,8 @@ describe('PlanningView archived allocations', () => {
         putGoal={() => true}
         putAllocation={() => true}
         putBudget={() => true}
+        putRecurring={() => true}
+        deleteRecurring={() => true}
         archiveGoal={() => true}
         archiveBudget={() => true}
       />,

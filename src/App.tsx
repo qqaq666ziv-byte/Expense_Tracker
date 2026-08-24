@@ -1,19 +1,54 @@
-import { lazy, Suspense, useEffect, useState } from 'react';
-import { BarChart3, Cloud, CloudOff, Download, Home, LogIn, LogOut, RefreshCw, Settings, Target } from 'lucide-react';
-import { useTheme } from './context/ThemeContext';
-import { useFinanceApp } from './app/useFinanceApp';
-import { changedRecordMeta } from './app/state';
-import type { FinanceData, LegacyAuthenticatedBootstrap } from './domain/model';
-import { exportFinanceBackup } from './domain/backup';
-import { calculateFinancials } from './domain/financeEngine';
-import { money } from './app/format';
-import { HomeView } from './components/HomeView';
+import { lazy, Suspense, useEffect, useState } from "react";
+import {
+  BarChart3,
+  BookOpenCheck,
+  Cloud,
+  CloudOff,
+  Download,
+  HelpCircle,
+  LogIn,
+  LogOut,
+  Menu,
+  Palette,
+  PieChart,
+  RefreshCw,
+  Settings,
+  Target,
+  X,
+} from "lucide-react";
+import { useTheme } from "./context/ThemeContext";
+import { useFinanceApp } from "./app/useFinanceApp";
+import { changedRecordMeta } from "./app/state";
+import type { FinanceData, LegacyAuthenticatedBootstrap } from "./domain/model";
+import { exportFinanceBackup } from "./domain/backup";
+import { calculateFinancials } from "./domain/financeEngine";
+import { displayMoney } from "./app/presentation";
+import { HomeView } from "./components/HomeView";
+import { BrandMark } from "./components/BrandMark";
+import { Onboarding } from "./components/Onboarding";
 
-const InsightsView = lazy(() => import('./components/InsightsView').then((module) => ({ default: module.InsightsView })));
-const PlanningView = lazy(() => import('./components/PlanningView').then((module) => ({ default: module.PlanningView })));
-const SettingsView = lazy(() => import('./components/SettingsView').then((module) => ({ default: module.SettingsView })));
+const InsightsView = lazy(() =>
+  import("./components/InsightsView").then((module) => ({
+    default: module.InsightsView,
+  })),
+);
+const AssetsView = lazy(() =>
+  import("./components/AssetsView").then((module) => ({
+    default: module.AssetsView,
+  })),
+);
+const PlanningView = lazy(() =>
+  import("./components/PlanningView").then((module) => ({
+    default: module.PlanningView,
+  })),
+);
+const SettingsView = lazy(() =>
+  import("./components/SettingsView").then((module) => ({
+    default: module.SettingsView,
+  })),
+);
 
-type Tab = 'home' | 'insights' | 'planning' | 'settings';
+type Tab = "record" | "insights" | "assets" | "planning";
 
 interface LegacyBootstrapPanelProps {
   bootstrap: LegacyAuthenticatedBootstrap;
@@ -25,14 +60,16 @@ interface LegacyBootstrapPanelProps {
 }
 
 function candidateRecordCount(data: FinanceData): number {
-  return data.accounts.length
-    + data.categories.length
-    + data.transactions.length
-    + data.adjustments.length
-    + data.goals.length
-    + data.allocations.length
-    + data.budgets.length
-    + data.recurringRules.length;
+  return (
+    data.accounts.length +
+    data.categories.length +
+    data.transactions.length +
+    data.adjustments.length +
+    data.goals.length +
+    data.allocations.length +
+    data.budgets.length +
+    data.recurringRules.length
+  );
 }
 
 export function LegacyBootstrapPanel({
@@ -43,22 +80,91 @@ export function LegacyBootstrapPanel({
   onImport,
   onKeepCloud,
 }: LegacyBootstrapPanelProps) {
-  if (bootstrap.status === 'pending') {
-    return <section className="warning-banner" role="status" aria-live="polite"><div><strong>舊版本機資料正在先讀取雲端</strong><p>為避免將這台裝置的過期快取重新上傳，完成雲端對齊前已停止帳本新增、修改、刪除與備份還原。</p></div><button type="button" className="secondary-button" disabled={syncBusy} onClick={onSync}>{syncBusy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Cloud className="h-4 w-4" />}{syncBusy ? '正在讀取雲端' : '立即讀取雲端'}</button></section>;
-  }
-
+  if (bootstrap.status === "pending")
+    return (
+      <section className="warning-banner" role="status" aria-live="polite">
+        <div>
+          <strong>正在安全讀取你的雲端帳本</strong>
+          <p>完成前會暫停修改，避免這台裝置的舊資料蓋過較新的紀錄。</p>
+        </div>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={syncBusy}
+          onClick={onSync}
+        >
+          {syncBusy ? (
+            <RefreshCw className="h-4 w-4 animate-spin" />
+          ) : (
+            <Cloud className="h-4 w-4" />
+          )}
+          {syncBusy ? "正在讀取" : "重新讀取"}
+        </button>
+      </section>
+    );
   const recordCount = candidateRecordCount(bootstrap.candidate);
   const unsyncedCount = bootstrap.unsyncedTransactionIds.length;
-  return <section className="warning-banner" aria-labelledby="legacy-candidate-title"><div className="min-w-0 flex-1"><strong id="legacy-candidate-title">找到舊版本機候選資料</strong><p>雲端帳本已安全讀取。本機候選共 {recordCount} 筆，其中 {unsyncedCount} 筆舊交易曾標記為未同步；目前尚未上傳。請先下載備份審閱，再明確選擇匯入或保留雲端。</p><div className="mt-3 flex flex-wrap gap-2"><button type="button" className="secondary-button" onClick={onDownload}><Download className="h-4 w-4" />下載候選備份</button><button type="button" className="primary-button" disabled={syncBusy} onClick={() => {
-    if (window.confirm('匯入會以舊版候選帳本明確取代目前讀取的雲端帳本，並建立待同步新增、更新與刪除作業。這可能重新加入曾在其他裝置刪除的記錄。確定匯入候選資料？')) onImport();
-  }}>匯入候選資料</button><button type="button" className="secondary-button" disabled={syncBusy} onClick={() => {
-    if (window.confirm('將保留目前雲端帳本並移除這份候選提示；舊版候選不會上傳。若尚未下載備份，建議先取得備份。確定保留雲端資料？')) onKeepCloud();
-  }}>保留雲端資料</button></div></div></section>;
+  return (
+    <section
+      className="warning-banner"
+      aria-labelledby="legacy-candidate-title"
+    >
+      <div className="min-w-0 flex-1">
+        <strong id="legacy-candidate-title">找到這台裝置上的舊版資料</strong>
+        <p>
+          雲端帳本已安全讀取；這台裝置另有 {recordCount} 筆舊資料，其中{" "}
+          {unsyncedCount} 筆交易可能還沒上傳。先下載備份，再決定是否匯入最安心。
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={onDownload}
+          >
+            <Download className="h-4 w-4" />
+            下載備份
+          </button>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={syncBusy}
+            onClick={() => {
+              if (
+                window.confirm(
+                  "要把這台裝置上的舊版資料匯入目前帳本嗎？建議先下載備份。",
+                )
+              )
+                onImport();
+            }}
+          >
+            匯入這份資料
+          </button>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={syncBusy}
+            onClick={() => {
+              if (
+                window.confirm(
+                  "要保留目前雲端帳本，並略過這台裝置上的舊版資料嗎？",
+                )
+              )
+                onKeepCloud();
+            }}
+          >
+            保留雲端版本
+          </button>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function downloadJson(name: string, content: string) {
-  const url = URL.createObjectURL(new Blob([content], { type: 'application/json' }));
-  const link = document.createElement('a');
+  const url = URL.createObjectURL(
+    new Blob([content], { type: "application/json" }),
+  );
+  const link = document.createElement("a");
   link.href = url;
   link.download = name;
   link.click();
@@ -68,122 +174,562 @@ function downloadJson(name: string, content: string) {
 export default function App() {
   const app = useFinanceApp();
   const { theme, toggleTheme } = useTheme();
-  const [tab, setTab] = useState<Tab>('home');
+  const [tab, setTab] = useState<Tab>("record");
   const [online, setOnline] = useState(navigator.onLine);
-  const [authMessage, setAuthMessage] = useState('');
+  const [authMessage, setAuthMessage] = useState("");
+  const [showSystem, setShowSystem] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
 
   useEffect(() => {
     const update = () => setOnline(navigator.onLine);
-    window.addEventListener('online', update);
-    window.addEventListener('offline', update);
-    return () => { window.removeEventListener('online', update); window.removeEventListener('offline', update); };
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    try {
+      if (!localStorage.getItem("shiba-finance:onboarding:v1"))
+        setShowOnboarding(true);
+    } catch {
+      /* UI preference only */
+    }
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
   }, []);
 
+  const closeOnboarding = () => {
+    try {
+      localStorage.setItem("shiba-finance:onboarding:v1", "done");
+    } catch {
+      /* UI preference only */
+    }
+    setShowOnboarding(false);
+  };
   const data = app.state.data;
   const pending = app.state.outbox.length;
   const legacyBootstrap = app.state.legacyBootstrap;
-  const legacyPending = legacyBootstrap?.status === 'pending';
+  const legacyPending = legacyBootstrap?.status === "pending";
+  const syncLabel =
+    app.state.ownerId === "guest"
+      ? "只存在這台裝置"
+      : legacyPending
+        ? "正在確認雲端資料"
+        : !online
+          ? `離線${pending ? ` · ${pending} 筆待同步` : ""}`
+          : pending > 0
+            ? `${pending} 筆等待同步`
+            : "資料已同步";
+  const syncTone =
+    app.state.ownerId === "guest"
+      ? "local"
+      : !online || pending > 0 || app.state.lastSyncError
+        ? "attention"
+        : "synced";
+
   const downloadLegacyCandidate = () => {
     if (!legacyBootstrap) return;
     try {
       downloadJson(
-        `shiba-finance-legacy-candidate-${Date.now()}.json`,
+        `shiba-finance-old-data-${Date.now()}.json`,
         exportFinanceBackup(legacyBootstrap.candidate),
       );
-      setAuthMessage('');
+      setAuthMessage("");
     } catch (error) {
-      setAuthMessage(`候選備份未匯出：${error instanceof Error ? error.message : String(error)}`);
+      setAuthMessage(
+        `備份未下載：${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   };
-  const syncLabel = app.state.ownerId === 'guest'
-    ? '僅此裝置'
-    : legacyPending
-      ? app.syncBusy ? '正在先讀取雲端' : '先讀取雲端'
-      : !online
-        ? `離線 · 待傳 ${pending}`
-        : pending > 0 ? `待同步 ${pending}` : '已同步';
-  const archiveAccount = (record: FinanceData['accounts'][number]) => {
-    const balance = calculateFinancials(data).accountBalances.find((item) => item.accountId === record.id)?.balance ?? 0;
-    const transactionCount = data.transactions.filter((item) => !item.deletedAt && item.accountId === record.id).length;
-    const recurringCount = data.recurringRules.filter((rule) => !rule.deletedAt && rule.isActive && rule.accountId === record.id).length;
-    const impact = [
-      record.includeInTotalAssets ? `總資產將排除目前餘額 ${money.format(balance)}` : '此帳戶原本未納入總資產',
-      `${transactionCount} 筆歷史交易仍會保留`,
-      recurringCount > 0 ? `${recurringCount} 條進行中的週期規則會一併暫停` : '沒有進行中的週期規則',
-    ].join('；');
-    if (!window.confirm(`確定封存「${record.name}」？${impact}。`)) return false;
-    // Queue dependent pauses first. If connectivity drops between operations,
-    // the safe partial state is an active parent with paused rules.
-    for (const rule of data.recurringRules
-      .filter((item) => !item.deletedAt && item.isActive && item.accountId === record.id)) {
-      if (!app.put('recurringRules', { ...rule, ...changedRecordMeta(rule), isActive: false })) return false;
-    }
-    return app.put('accounts', { ...record, ...changedRecordMeta(record), isActive: false });
+  const archiveAccount = (record: FinanceData["accounts"][number]) => {
+    const balance =
+      calculateFinancials(data).accountBalances.find(
+        (item) => item.accountId === record.id,
+      )?.balance ?? 0;
+    const transactionCount = data.transactions.filter(
+      (item) => !item.deletedAt && item.accountId === record.id,
+    ).length;
+    const recurring = data.recurringRules.filter(
+      (rule) =>
+        !rule.deletedAt && rule.isActive && rule.accountId === record.id,
+    );
+    if (
+      !window.confirm(
+        `封存「${record.name}」後，${record.includeInTotalAssets ? `總資產會少計 ${displayMoney(balance)}；` : ""}${transactionCount} 筆過去紀錄仍會保留${recurring.length ? `，並暫停 ${recurring.length} 個週期收支` : ""}。確定繼續？`,
+      )
+    )
+      return false;
+    for (const rule of recurring)
+      if (
+        !app.put("recurringRules", {
+          ...rule,
+          ...changedRecordMeta(rule),
+          isActive: false,
+        })
+      )
+        return false;
+    return app.put("accounts", {
+      ...record,
+      ...changedRecordMeta(record),
+      isActive: false,
+    });
   };
-  const archiveCategory = (record: FinanceData['categories'][number]) => {
-    const recurringCount = data.recurringRules.filter((rule) => !rule.deletedAt && rule.isActive && rule.categoryId === record.id).length;
-    if (recurringCount > 0 && !window.confirm(`封存「${record.name}」會同時暫停 ${recurringCount} 條週期規則；歷史交易仍會保留。是否繼續？`)) return false;
-    for (const rule of data.recurringRules
-      .filter((item) => !item.deletedAt && item.isActive && item.categoryId === record.id)) {
-      if (!app.put('recurringRules', { ...rule, ...changedRecordMeta(rule), isActive: false })) return false;
-    }
-    return app.put('categories', { ...record, ...changedRecordMeta(record), isActive: false });
+  const archiveCategory = (record: FinanceData["categories"][number]) => {
+    const recurring = data.recurringRules.filter(
+      (rule) =>
+        !rule.deletedAt && rule.isActive && rule.categoryId === record.id,
+    );
+    if (
+      recurring.length > 0 &&
+      !window.confirm(
+        `封存「${record.name}」也會暫停 ${recurring.length} 個週期收支；過去紀錄仍會保留。要繼續嗎？`,
+      )
+    )
+      return false;
+    for (const rule of recurring)
+      if (
+        !app.put("recurringRules", {
+          ...rule,
+          ...changedRecordMeta(rule),
+          isActive: false,
+        })
+      )
+        return false;
+    return app.put("categories", {
+      ...record,
+      ...changedRecordMeta(record),
+      isActive: false,
+    });
   };
-  const nav: { key: Tab; label: string; icon: typeof Home }[] = [
-    { key: 'home', label: '首頁', icon: Home },
-    { key: 'insights', label: '分析', icon: BarChart3 },
-    { key: 'planning', label: '規劃', icon: Target },
-    { key: 'settings', label: '管理', icon: Settings },
+  const nav = [
+    { key: "record" as const, label: "記帳", icon: BookOpenCheck },
+    { key: "insights" as const, label: "洞察", icon: BarChart3 },
+    { key: "assets" as const, label: "資產", icon: PieChart },
+    { key: "planning" as const, label: "規劃", icon: Target },
   ];
 
+  const settings = (
+    <SettingsView
+      data={data}
+      ownerId={app.state.ownerId}
+      putAccount={(record) => app.put("accounts", record)}
+      putCategory={(record) => app.put("categories", record)}
+      putRecurring={(record) => app.put("recurringRules", record)}
+      archiveAccount={archiveAccount}
+      archiveCategory={archiveCategory}
+      deleteRecurring={(record) => app.softDelete("recurringRules", record)}
+      restore={app.setData}
+    />
+  );
+
   return (
-    <div className="min-h-screen pb-24 text-zinc-900 dark:text-zinc-100">
-      <header className="sticky top-0 z-30 border-b border-amber-100/80 bg-[#fffaf0]/90 backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-950/90">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-3">
-          <button type="button" className="flex min-w-0 items-center gap-3 text-left" onClick={toggleTheme} aria-label="切換柴犬或米克斯主題">
-            <span className="grid h-11 w-11 shrink-0 place-items-center overflow-hidden rounded-2xl bg-gradient-to-br from-amber-300 to-orange-500 text-2xl shadow-sm">{theme.mascotAvatarType === 'image' ? <img className="h-full w-full object-cover" src={theme.mascotAvatar} alt="" /> : theme.mascotAvatar}</span>
-            <span className="min-w-0"><strong className="block truncate text-lg">{theme.welcomeTitle}</strong><span className="block truncate text-xs text-zinc-500">總資產由真實資產帳戶帳本衍生</span></span>
+    <div className="app-shell">
+      <header className="app-header">
+        <div className="header-inner">
+          <button
+            type="button"
+            className="brand-lockup"
+            onClick={() => setTab("record")}
+            aria-label="回到極速記帳"
+          >
+            <BrandMark />
+            <span>
+              <strong>柴柴記帳</strong>
+              <small>日子有跡，心裡有底</small>
+            </span>
           </button>
-          <div className="flex items-center gap-2">
-            <button type="button" className="status-pill" disabled={app.state.ownerId === 'guest' || app.syncBusy} onClick={() => void app.syncNow()} title={app.state.lastSyncError ?? '同步狀態'} aria-label={syncLabel}>
-              {!online ? <CloudOff className="h-4 w-4" /> : app.syncBusy ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Cloud className="h-4 w-4" />}
-              {pending > 0 && <span className="sm:hidden">{pending}</span>}
-              <span className="hidden sm:inline">{syncLabel}</span>
-            </button>
-            {app.user ? <button type="button" className="icon-button" aria-label="登出" onClick={() => void app.signOut().catch((error) => setAuthMessage(String(error)))}><LogOut className="h-5 w-5" /></button> : <button type="button" className="icon-button" aria-label="使用 Google 登入" disabled={!app.cloudEnabled || app.authLoading} onClick={() => void app.signIn().catch((error) => setAuthMessage(String(error)))}><LogIn className="h-5 w-5" /></button>}
-          </div>
+          <button
+            type="button"
+            className={`system-button ${syncTone}`}
+            onClick={() => setShowSystem(true)}
+            aria-label={`帳戶與同步：${syncLabel}`}
+          >
+            <i />
+            <span className="system-copy">
+              <b>
+                {app.user
+                  ? app.user.email?.split("@")[0] || "我的帳戶"
+                  : "訪客模式"}
+              </b>
+              <small>{syncLabel}</small>
+            </span>
+            <Menu className="h-5 w-5" />
+          </button>
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl px-4 py-5">
-        {!app.cloudEnabled && <div className="info-banner"><CloudOff className="h-5 w-5" /><span><strong>訪客離線模式</strong><br />尚未設定 Supabase 公開環境變數；資料仍會依訪客身分保存在這台裝置。</span></div>}
+      <main className="app-main">
         {authMessage && <div className="error-message mb-4">{authMessage}</div>}
-        {app.storageRecovery ? <div className="warning-banner"><div><strong>本機快照已進入復原保護</strong><p>{app.storageError} 請先下載原始快照，再從「管理 → 備份」還原有效備份；成功還原前已封鎖帳本修改、週期補登與遠端同步，且不會覆寫原始 key。</p></div><button type="button" className="secondary-button" onClick={() => {
-          const url = URL.createObjectURL(new Blob([app.storageRecovery!.raw], { type: 'application/json' }));
-          const link = document.createElement('a');
-          link.href = url;
-          link.download = `shiba-finance-recovery-${Date.now()}.json`;
-          link.click();
-          URL.revokeObjectURL(url);
-        }}>下載原始快照</button></div> : app.storageError && <div className="warning-banner"><div><strong>本機儲存失敗</strong><p>{app.storageError}。請立即從「管理 → 備份」匯出 JSON，避免關閉頁面後遺失尚未落盤的變更。</p></div></div>}
-        {app.guestImportNotice && <div className="info-banner"><span><strong>訪客資料匯入結果</strong><br />{app.guestImportNotice}</span></div>}
-        {app.legacyBootstrapNotice && <div className="info-banner" aria-live="polite"><span><strong>舊版資料處理結果</strong><br />{app.legacyBootstrapNotice}</span></div>}
-        {app.safetyNotice && <div className="warning-banner" role="alert"><div><strong>操作未執行</strong><p>{app.safetyNotice}。請確認目前帳號後重試。</p></div></div>}
-        {legacyBootstrap && <LegacyBootstrapPanel bootstrap={legacyBootstrap} syncBusy={app.syncBusy} onSync={() => void app.syncNow()} onDownload={downloadLegacyCandidate} onImport={app.importLegacyCandidate} onKeepCloud={app.keepCloudData} />}
-        {app.hasSeparateGuestData && <div className="warning-banner"><div><strong>偵測到分離的訪客資料</strong><p>登入不會自動混入訪客帳本。你可以明確匯入，或保持分離。</p></div><div className="flex gap-2"><button type="button" className="primary-button" onClick={app.importGuestData}>匯入此帳號</button><button type="button" className="secondary-button" onClick={app.dismissGuestImport}>保持分離</button></div></div>}
-        {app.state.lastSyncError && <div className="warning-banner"><div><strong>部分資料尚未同步</strong><p>{app.state.lastSyncError}</p></div><button type="button" className="secondary-button" onClick={() => void app.syncNow()}>重試</button></div>}
+        {app.storageRecovery ? (
+          <div className="warning-banner">
+            <div>
+              <strong>你的本機資料需要復原</strong>
+              <p>
+                為避免資料受損，目前已暫停修改。請先下載原始資料，再到「設定與說明
+                → 資料備份」還原有效備份。
+              </p>
+            </div>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => {
+                const url = URL.createObjectURL(
+                  new Blob([app.storageRecovery!.raw], {
+                    type: "application/json",
+                  }),
+                );
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = `shiba-finance-recovery-${Date.now()}.json`;
+                link.click();
+                URL.revokeObjectURL(url);
+              }}
+            >
+              下載原始資料
+            </button>
+          </div>
+        ) : (
+          app.storageError && (
+            <div className="warning-banner">
+              <div>
+                <strong>這次變更可能尚未保存</strong>
+                <p>請到「設定與說明 → 資料備份」下載完整備份後再關閉頁面。</p>
+              </div>
+            </div>
+          )
+        )}
+        {app.guestImportNotice && (
+          <div className="info-banner">
+            <span>
+              <strong>訪客資料處理結果</strong>
+              <br />
+              {app.guestImportNotice}
+            </span>
+          </div>
+        )}
+        {app.legacyBootstrapNotice && (
+          <div className="info-banner" aria-live="polite">
+            <span>
+              <strong>舊版資料處理結果</strong>
+              <br />
+              {app.legacyBootstrapNotice}
+            </span>
+          </div>
+        )}
+        {app.safetyNotice && (
+          <div className="warning-banner" role="alert">
+            <div>
+              <strong>這次操作沒有執行</strong>
+              <p>請確認目前帳戶後再試一次。</p>
+            </div>
+          </div>
+        )}
+        {legacyBootstrap && (
+          <LegacyBootstrapPanel
+            bootstrap={legacyBootstrap}
+            syncBusy={app.syncBusy}
+            onSync={() => void app.syncNow()}
+            onDownload={downloadLegacyCandidate}
+            onImport={app.importLegacyCandidate}
+            onKeepCloud={app.keepCloudData}
+          />
+        )}
+        {app.hasSeparateGuestData && (
+          <div className="warning-banner">
+            <div>
+              <strong>這台裝置還有訪客資料</strong>
+              <p>
+                登入不會自動混入訪客帳本。你可以匯入目前帳戶，或繼續分開保留。
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="primary-button"
+                onClick={app.importGuestData}
+              >
+                匯入目前帳戶
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={app.dismissGuestImport}
+              >
+                保持分開
+              </button>
+            </div>
+          </div>
+        )}
+        {app.state.lastSyncError && (
+          <div className="warning-banner">
+            <div>
+              <strong>部分資料還在這台裝置</strong>
+              <p>同步尚未完成，但本機紀錄仍保留。連線正常後可再試一次。</p>
+              <details>
+                <summary>查看詳細資訊</summary>
+                <code>{app.state.lastSyncError}</code>
+              </details>
+            </div>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => void app.syncNow()}
+            >
+              重新同步
+            </button>
+          </div>
+        )}
 
-        {!legacyPending && <Suspense fallback={<div className="card text-center text-sm text-zinc-500">載入功能中…</div>}>
-          {tab === 'home' && <HomeView data={data} ownerId={app.state.ownerId} put={(_entity, record) => app.put('transactions', record)} putAdjustment={(record) => app.put('adjustments', record)} deleteTransaction={(record) => app.softDelete('transactions', record)} />}
-          {tab === 'insights' && <InsightsView data={data} onOpenLedger={() => setTab('home')} />}
-          {tab === 'planning' && <PlanningView data={data} ownerId={app.state.ownerId} putGoal={(record) => app.put('goals', record)} putAllocation={(record) => app.put('allocations', record)} putBudget={(record) => app.put('budgets', record)} archiveGoal={(record) => app.put('goals', { ...record, ...changedRecordMeta(record), isActive: false })} archiveBudget={(record) => app.put('budgets', { ...record, ...changedRecordMeta(record), isActive: false })} />}
-          {tab === 'settings' && <SettingsView data={data} ownerId={app.state.ownerId} putAccount={(record) => app.put('accounts', record)} putCategory={(record) => app.put('categories', record)} putRecurring={(record) => app.put('recurringRules', record)} archiveAccount={archiveAccount} archiveCategory={archiveCategory} deleteRecurring={(record) => app.softDelete('recurringRules', record)} restore={app.setData} />}
-        </Suspense>}
+        {!legacyPending && (
+          <Suspense
+            fallback={
+              <div className="friendly-inline">柴柴正在把頁面準備好…</div>
+            }
+          >
+            {tab === "record" && (
+              <HomeView
+                data={data}
+                ownerId={app.state.ownerId}
+                put={(_entity, record) => app.put("transactions", record)}
+                deleteTransaction={(record) =>
+                  app.softDelete("transactions", record)
+                }
+              />
+            )}
+            {tab === "insights" && (
+              <InsightsView data={data} onOpenLedger={() => setTab("record")} />
+            )}
+            {tab === "assets" && (
+              <AssetsView
+                data={data}
+                ownerId={app.state.ownerId}
+                putAccount={(record) => app.put("accounts", record)}
+                putAdjustment={(record) => app.put("adjustments", record)}
+                archiveAccount={archiveAccount}
+              />
+            )}
+            {tab === "planning" && (
+              <PlanningView
+                data={data}
+                ownerId={app.state.ownerId}
+                putGoal={(record) => app.put("goals", record)}
+                putAllocation={(record) => app.put("allocations", record)}
+                putBudget={(record) => app.put("budgets", record)}
+                putRecurring={(record) => app.put("recurringRules", record)}
+                deleteRecurring={(record) =>
+                  app.softDelete("recurringRules", record)
+                }
+                archiveGoal={(record) =>
+                  app.put("goals", {
+                    ...record,
+                    ...changedRecordMeta(record),
+                    isActive: false,
+                  })
+                }
+                archiveBudget={(record) =>
+                  app.put("budgets", {
+                    ...record,
+                    ...changedRecordMeta(record),
+                    isActive: false,
+                  })
+                }
+              />
+            )}
+          </Suspense>
+        )}
       </main>
 
-      <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-amber-100 bg-white/95 px-3 pb-[max(0.7rem,env(safe-area-inset-bottom))] pt-2 shadow-[0_-8px_30px_rgba(120,72,0,0.08)] backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-950/95" aria-label="主要導覽">
-        <div className="mx-auto grid max-w-xl grid-cols-4 gap-1">{nav.map((item) => { const Icon = item.icon; return <button type="button" key={item.key} className={`nav-button ${tab === item.key ? 'nav-button-active' : ''}`} aria-current={tab === item.key ? 'page' : undefined} aria-pressed={tab === item.key} disabled={legacyPending} onClick={() => setTab(item.key)}><Icon className="h-5 w-5" /><span>{item.label}</span></button>; })}</div>
+      <nav className="bottom-nav" aria-label="主要導覽">
+        <div>
+          {nav.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                type="button"
+                key={item.key}
+                className={tab === item.key ? "active" : ""}
+                aria-current={tab === item.key ? "page" : undefined}
+                aria-pressed={tab === item.key}
+                disabled={legacyPending}
+                onClick={() => setTab(item.key)}
+              >
+                <Icon />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
       </nav>
+
+      {showSystem && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setShowSystem(false);
+          }}
+        >
+          <aside
+            className="system-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="system-title"
+          >
+            <button
+              className="sheet-close"
+              type="button"
+              aria-label="關閉帳戶選單"
+              onClick={() => setShowSystem(false)}
+            >
+              <X />
+            </button>
+            <BrandMark className="h-14 w-14" />
+            <p className="section-kicker">帳戶與資料</p>
+            <h2 id="system-title">
+              {app.user
+                ? app.user.email || "我的 Google 帳戶"
+                : "目前是訪客模式"}
+            </h2>
+            <div className={`sync-card ${syncTone}`}>
+              <span>
+                <i />
+                {syncLabel}
+              </span>
+              <p>
+                {app.state.ownerId === "guest"
+                  ? "資料只保存在這台裝置。定期下載備份，或登入後開啟跨裝置同步。"
+                  : app.state.lastSyncError
+                    ? "資料仍留在這台裝置，修復連線後可重新同步。"
+                    : "你的資料狀態正常；沒有需要處理的事。"}
+              </p>
+              {app.state.ownerId !== "guest" && (
+                <button
+                  type="button"
+                  disabled={app.syncBusy}
+                  onClick={() => void app.syncNow()}
+                >
+                  <RefreshCw className={app.syncBusy ? "animate-spin" : ""} />
+                  {app.syncBusy ? "同步中" : "立即同步"}
+                </button>
+              )}
+            </div>
+            <div className="system-actions">
+              {app.user ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void app
+                      .signOut()
+                      .then(() => setShowSystem(false))
+                      .catch((error) => setAuthMessage(String(error)))
+                  }
+                >
+                  <LogOut />
+                  登出 Google 帳戶<small>切回這台裝置的訪客帳本</small>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={!app.cloudEnabled || app.authLoading}
+                  onClick={() =>
+                    void app
+                      .signIn()
+                      .catch((error) => setAuthMessage(String(error)))
+                  }
+                >
+                  <LogIn />
+                  使用 Google 登入
+                  <small>
+                    {app.cloudEnabled
+                      ? "跨裝置同步你的資料"
+                      : "目前未開啟雲端同步"}
+                  </small>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setShowSystem(false);
+                  setShowSettings(true);
+                }}
+              >
+                <Settings />
+                設定與說明<small>分類、週期收支、備份與重要說明</small>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  toggleTheme();
+                }}
+              >
+                <Palette />
+                切換成{theme.id === "shiba" ? "米克斯" : "柴犬"}風格
+                <small>只改變這台裝置的外觀</small>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowSystem(false);
+                  setShowOnboarding(true);
+                }}
+              >
+                <HelpCircle />
+                重新查看新手導覽<small>快速認識記帳、資產、洞察與同步</small>
+              </button>
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {showSettings && (
+        <div className="settings-overlay">
+          <header>
+            <button type="button" onClick={() => setShowSettings(false)}>
+              <X />
+              關閉
+            </button>
+            <div>
+              <p className="section-kicker">需要時再來</p>
+              <h1>設定與說明</h1>
+            </div>
+          </header>
+          <div className="settings-content">
+            <section className="help-strip">
+              <div>
+                <HelpCircle />
+                <span>
+                  <strong>怎麼開始？</strong>
+                  <small>
+                    分類是「為什麼花」，資產帳戶是「錢從哪裡進出」。平常照名稱選就好。
+                  </small>
+                </span>
+              </div>
+              <div>
+                <Cloud />
+                <span>
+                  <strong>資料在哪裡？</strong>
+                  <small>
+                    訪客資料只在這台裝置；登入才會同步。JSON
+                    備份可以完整還原，CSV 適合自行整理交易。
+                  </small>
+                </span>
+              </div>
+            </section>
+            <section className="faq-panel" aria-labelledby="faq-title">
+              <div className="plain-heading"><div><p className="section-kicker">常見問題</p><h2 id="faq-title">使用說明與資料安心指南</h2></div></div>
+              <details><summary>分類和資產帳戶有什麼不同？</summary><p>分類回答「這筆錢為什麼增加或減少」，例如餐飲；資產帳戶回答「錢實際從哪裡進出」，例如現金或街口支付。</p></details>
+              <details><summary>離線時可以記帳嗎？</summary><p>可以。紀錄會先安全保存在這台裝置；已登入時，恢復連線後再同步。右上角帳戶選單會告訴你是否還有資料等待同步。</p></details>
+              <details><summary>Google 登入會自動混合訪客資料嗎？</summary><p>不會。登入後如果偵測到訪客帳本，柴柴會讓你明確選擇匯入或保持分開，不會偷偷合併。</p></details>
+              <details><summary>怎麼備份或換裝置？</summary><p>使用下方「資料備份」下載完整 JSON；它可以安全合併或還原。交易 CSV 適合試算表整理，但不能用來完整還原設定。</p></details>
+              <details><summary>帳戶金額對不上時怎麼辦？</summary><p>到「資產」點開該帳戶，再選「調整餘額」。這會保留一筆調整紀錄，但不會被誤算成收入或支出。</p></details>
+            </section>
+            <Suspense
+              fallback={<div className="friendly-inline">設定載入中…</div>}
+            >
+              {settings}
+            </Suspense>
+          </div>
+        </div>
+      )}
+      {showOnboarding && <Onboarding onClose={closeOnboarding} />}
     </div>
   );
 }
