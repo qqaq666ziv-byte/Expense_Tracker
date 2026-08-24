@@ -144,7 +144,7 @@ Migrations（依時間順序）：
 
 - 第二支 server resource guard migration 尚未獲授權套用 production；目前正式 schema 已是 v3，但 server 端 text/numeric/quota 新防護仍以既有 PostgREST／平台限制為主。
 - 套用第二支 guard 後，兩台裝置若同時在相同 owner／entity 的配額前一筆離線新增，後到 server 的操作可能收到 `54000` 並保留在 pending outbox。由於 tombstone 也計入安全配額，刪除該本機紀錄不能自動釋放 server row；請先下載 JSON 備份並保留 pending snapshot，再由維護者唯讀核對該 ID 未上雲、建立獨立資料庫備份，最後以經審查的 quota 擴充或資料保留修復解除，不能直接清除 outbox 假裝同步成功。
-- 最新 Preview 已完成本機資料的新增、編輯、重新載入持久化與分析聚合 E2E，live CSP／HSTS／anti-framing 等 headers 亦已確認；但 production Supabase 尚未加入上述 Preview Redirect URL allowlist，因此 Preview Google OAuth 仍會 fallback 到舊 Site URL，是發布前 High 外部設定 blocker。相同 release candidate 已透過已允許的 `http://127.0.0.1:8888` 在兩個獨立瀏覽器 session 完成真實 Google OAuth、保持訪客資料分離、拉取既有 43 筆 transactions 並收斂為「已同步」；未新增、編輯或刪除任何 production 財務紀錄。真實雲端 edit/delete、離線重連不復活仍留待 allowlist 修正後 smoke；owner 隔離、retry、衝突與 tombstone 已由 adapter／engine／PGlite RLS 測試覆蓋。
+- 最新 Preview 已完成本機資料的新增、編輯、重新載入持久化與分析聚合 E2E，live CSP／HSTS／anti-framing 等 headers 亦已確認；production Supabase 已加入受保護分支的精確 Preview Redirect origin。相同 release candidate 已透過已允許的 `http://127.0.0.1:8888` 在兩個獨立瀏覽器 session 完成真實 Google OAuth、保持訪客資料分離、拉取既有 43 筆 transactions 並收斂為「已同步」；未新增、編輯或刪除任何 production 財務紀錄。精確 allowlist 設定後的 Preview／Production OAuth return 因本機 Chrome 擴充功能介面阻擋自動化，保留為發布後唯讀 smoke；真實雲端 edit/delete、離線重連不復活亦未在 production 建立測試交易。owner 隔離、retry、衝突與 tombstone 已由 adapter／engine／PGlite RLS 測試覆蓋。
 - Migration 已在本機 PGlite 覆蓋 fresh、legacy、重跑、RLS、mixed-version bridge、conflict clock 與 resource guards；第一支已在真實 production schema 執行並通過 row/orphan/RLS 核對，第二支尚未執行真實 PostgREST rejection smoke。
 - Supabase Security Advisor 仍有「Leaked Password Protection Disabled」既存警告；應依 [Supabase password security 指南](https://supabase.com/docs/guides/auth/password-security#password-strength-and-leaked-password-protection)於 Auth 設定啟用並重跑 advisor。
 - 週期交易由 client 在開啟、回到前景或跨日後補齊，不是背景排程服務；長期不開 App 時會在下次開啟補齊。
@@ -158,6 +158,7 @@ Migrations（依時間順序）：
 - 中斷續作前遠端 checkpoint：`checkpoint/20260823-105721-before-resume-interrupted-build`，SHA `ba3e5de15a83cf314c3a3a64a7fc3580fd625fee`。
 - 本次 production E2E release gate 前 checkpoint：`checkpoint/20260824-101753-before-production-e2e-release-gate`，SHA `5fb688f32cdaa54d0734de6b28d1b59cbde6516f`。
 - v3 production release 前 checkpoint：`checkpoint/20260824-1158-before-v3-production-release`，SHA `a1d3ebfd45f9a9f4fb7451ee6dc123bfe18ef643`。
-- 程式碼回復：production regression 優先將 Vercel rollback 到上一個已知正常 deployment `dpl_6ejsiuY1gFcGne5F7U44kuUeFdWj`（main `5fcebebe4b924b94929a4e0c638437796ef2ef9c`），並保留已套用的向後相容 v3 additive schema；只撤銷本次 release 文件或設定修補時可從最新 checkpoint 建立 recovery branch，回到整個建置前則使用最早 checkpoint。四個 tag 均已推送；不要改寫／刪除 checkpoint history。
+- production deploy 前 checkpoint：`checkpoint/20260824-1224-before-production-deploy`，SHA `afba1fe976448a184eb9c852897bfbdb05bab79d`。
+- 程式碼回復：production regression 優先將 Vercel rollback 到上一個已知正常 deployment `dpl_6ejsiuY1gFcGne5F7U44kuUeFdWj`（main `5fcebebe4b924b94929a4e0c638437796ef2ef9c`），並保留已套用的向後相容 v3 additive schema；只撤銷本次 release 文件或設定修補時可從最新 checkpoint 建立 recovery branch，回到整個建置前則使用最早 checkpoint。五個 tag 均已推送；不要改寫／刪除 checkpoint history。
 - 使用者資料回復：優先使用管理頁的 JSON backup 安全合併／明確取代。
 - Database：第一支 v3 additive migration 已在外部 backup 後套用；第二支 guard migration未套用。Schema 回復與 additive forward-fix 依 `supabase/ROLLBACK.md`，不可把 Git tag 當作 database backup。
