@@ -29,6 +29,7 @@ import {
 import { completeAppliedMutation } from "../app/mutationResult";
 import { useCalendarReference } from "../app/useCalendarReference";
 import { RecurringPanel } from "./SettingsView";
+import { MoneyInput } from "./MoneyInput";
 
 interface PlanningViewProps {
   data: FinanceData;
@@ -48,7 +49,7 @@ export function PlanningView(props: PlanningViewProps) {
     "savings",
   );
   return (
-    <div className="space-y-5">
+    <div className="space-y-5" data-tutorial="planning-overview">
       <header className="page-intro">
         <div>
           <p className="section-kicker">把未來慢慢安排好</p>
@@ -253,14 +254,12 @@ function SavingsPanel({
             </label>
             <label className="field-label">
               目標金額
-              <input
+              <MoneyInput
                 aria-label="目標金額"
                 className="field mt-1"
-                inputMode="decimal"
                 value={target}
-                onChange={(event) =>
-                  setTarget(event.target.value.replace(/[^0-9.]/g, ""))
-                }
+                allowDecimal
+                onValueChange={setTarget}
               />
             </label>
             <label className="field-label">
@@ -306,14 +305,12 @@ function SavingsPanel({
             </label>
             <label className="field-label">
               配置金額
-              <input
+              <MoneyInput
                 aria-label="配置金額"
                 className="field mt-1"
-                inputMode="decimal"
                 value={allocation}
-                onChange={(event) =>
-                  setAllocation(event.target.value.replace(/[^0-9.]/g, ""))
-                }
+                allowDecimal
+                onValueChange={setAllocation}
               />
             </label>
             <button
@@ -562,14 +559,12 @@ function BudgetPanel({
           )}
           <label className="field-label">
             預算金額
-            <input
+            <MoneyInput
               aria-label="預算金額"
               className="field mt-1"
-              inputMode="decimal"
               value={amount}
-              onChange={(event) =>
-                setAmount(event.target.value.replace(/[^0-9.]/g, ""))
-              }
+              allowDecimal
+              onValueChange={setAmount}
             />
           </label>
           <button className="primary-button sm:col-span-2" type="submit">

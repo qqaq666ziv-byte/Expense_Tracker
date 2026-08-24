@@ -9,6 +9,7 @@ import type {
 import { enqueueSyncRecord } from '../domain/syncEngine';
 import { migrateLegacyData, stableLegacyId } from '../domain/legacyMigration';
 import { validateFinanceData } from '../domain/backup';
+import { isTutorialTransaction } from '../domain/tutorialRecord';
 import {
   assertFinanceOwnerRowLimit,
   assertFinanceRecordWithinWriteLimits,
@@ -617,7 +618,7 @@ export function hasUserContent(data: FinanceData): boolean {
     sortOrder: record.sortOrder,
     legacyKey: record.legacyKey,
   }));
-  return data.transactions.length > 0
+  return data.transactions.some((transaction) => !isTutorialTransaction(transaction))
     || data.adjustments.length > 0
     || data.goals.length > 0
     || data.allocations.length > 0
@@ -657,7 +658,9 @@ export function remapOwner(data: FinanceData, ownerId: string): FinanceData {
     ...structuredClone(data),
     accounts: data.accounts.map((record) => remap(record, accountIds.get(record.id)!)),
     categories: data.categories.map((record) => remap(record, categoryIds.get(record.id)!)),
-    transactions: data.transactions.map((record) => {
+    transactions: data.transactions
+      .filter((record) => !isTutorialTransaction(record))
+      .map((record) => {
       const recurringRuleId = record.recurringRuleId ? recurringIds.get(record.recurringRuleId) : undefined;
       const id = recurringRuleId && record.occurrenceDate
         ? `rec-${recurringRuleId}-${record.occurrenceDate}`
@@ -668,7 +671,7 @@ export function remapOwner(data: FinanceData, ownerId: string): FinanceData {
         categoryId: categoryIds.get(record.categoryId)!,
         ...(recurringRuleId ? { recurringRuleId } : {}),
       }, id);
-    }),
+      }),
     adjustments: data.adjustments.map((record) => remap({
       ...record,
       accountId: accountIds.get(record.accountId)!,

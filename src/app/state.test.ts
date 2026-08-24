@@ -18,6 +18,7 @@ import {
   saveFinanceState,
   storageKey,
 } from './state';
+import { TUTORIAL_RECORD_NOTE } from '../domain/tutorialRecord';
 
 function memoryStorage() {
   const values = new Map<string, string>();
@@ -344,6 +345,23 @@ describe('owner-scoped local state', () => {
     data.categories[0] = { ...data.categories[0], name: '早午餐', icon: { type: 'emoji', value: '🥢' } };
     expect(hasUserContent(data)).toBe(true);
     expect(guestSnapshotFingerprint(data)).not.toBe(before);
+  });
+
+  it('does not treat or import an onboarding-only guest tombstone as long-term user content', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.transactions.push({
+      id: 'tutorial-record', ownerId: 'guest', version: 2,
+      updatedAt: '2026-08-24T09:00:00.000Z', lastOperationId: 'tutorial-delete',
+      deletedAt: '2026-08-24T09:00:00.000Z', amount: 100, type: 'expense',
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name, occurredAt: '2026-08-24 17:00',
+      note: TUTORIAL_RECORD_NOTE,
+    });
+
+    expect(hasUserContent(state.data)).toBe(false);
+    expect(remapOwner(state.data, 'user-a').transactions).toEqual([]);
   });
 
   it('does not lose a local mutation completed while synchronization is in flight', () => {

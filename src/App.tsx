@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   BarChart3,
   BookOpenCheck,
@@ -22,10 +22,23 @@ import { changedRecordMeta } from "./app/state";
 import type { FinanceData, LegacyAuthenticatedBootstrap } from "./domain/model";
 import { exportFinanceBackup } from "./domain/backup";
 import { calculateFinancials } from "./domain/financeEngine";
+import { isFinancialTransaction } from "./domain/tutorialRecord";
 import { displayMoney } from "./app/presentation";
+import {
+  TUTORIAL_STORAGE_KEY,
+  isTutorialTransaction,
+  parseTutorialProgress,
+  prepareTutorialResume,
+  startTutorial,
+  transitionTutorial,
+  type TutorialChapter,
+  type TutorialEvent,
+  type TutorialProgress,
+} from "./app/tutorial";
 import { HomeView } from "./components/HomeView";
 import { BrandMark } from "./components/BrandMark";
 import { Onboarding } from "./components/Onboarding";
+import { ContextHint } from "./components/ContextHint";
 
 const InsightsView = lazy(() =>
   import("./components/InsightsView").then((module) => ({
@@ -49,6 +62,21 @@ const SettingsView = lazy(() =>
 );
 
 type Tab = "record" | "insights" | "assets" | "planning";
+
+function initialTutorialProgress(): TutorialProgress | null {
+  try {
+    const saved = parseTutorialProgress(
+      localStorage.getItem(TUTORIAL_STORAGE_KEY),
+    );
+    if (saved) return saved;
+    // People who completed the previous tour should not be interrupted again;
+    // the new interactive chapters remain available from Help & Tutorials.
+    if (localStorage.getItem("shiba-finance:onboarding:v1")) return null;
+    return startTutorial("full");
+  } catch {
+    return null;
+  }
+}
 
 interface LegacyBootstrapPanelProps {
   bootstrap: LegacyAuthenticatedBootstrap;
@@ -173,39 +201,136 @@ function downloadJson(name: string, content: string) {
 
 export default function App() {
   const app = useFinanceApp();
+  const data = app.state.data;
   const { theme, toggleTheme } = useTheme();
   const [tab, setTab] = useState<Tab>("record");
   const [online, setOnline] = useState(navigator.onLine);
   const [authMessage, setAuthMessage] = useState("");
   const [showSystem, setShowSystem] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [tutorial, setTutorial] = useState<TutorialProgress | null>(
+    initialTutorialProgress,
+  );
+  const tutorialResumeChecked = useRef(false);
 
   useEffect(() => {
     const update = () => setOnline(navigator.onLine);
     window.addEventListener("online", update);
     window.addEventListener("offline", update);
-    try {
-      if (!localStorage.getItem("shiba-finance:onboarding:v1"))
-        setShowOnboarding(true);
-    } catch {
-      /* UI preference only */
-    }
     return () => {
       window.removeEventListener("online", update);
       window.removeEventListener("offline", update);
     };
   }, []);
 
-  const closeOnboarding = () => {
+  useEffect(() => {
+    if (!tutorial) return;
     try {
-      localStorage.setItem("shiba-finance:onboarding:v1", "done");
+      localStorage.setItem(TUTORIAL_STORAGE_KEY, JSON.stringify(tutorial));
     } catch {
       /* UI preference only */
     }
-    setShowOnboarding(false);
+  }, [tutorial]);
+
+  const activeTutorial = tutorial?.status === "active" ? tutorial : null;
+
+  const tutorialRecordState = (
+    progress: TutorialProgress,
+  ): "active" | "deleted" | "missing" => {
+    if (!progress.recordId) return "missing";
+    const record = data.transactions.find(
+      (item) => item.id === progress.recordId && isTutorialTransaction(item),
+    );
+    if (!record) return "missing";
+    return record.deletedAt ? "deleted" : "active";
   };
-  const data = app.state.data;
+
+  useEffect(() => {
+    if (tutorialResumeChecked.current || app.authLoading) return;
+    tutorialResumeChecked.current = true;
+    setTutorial((current) =>
+      current?.status === "active"
+        ? prepareTutorialResume(current, tutorialRecordState(current))
+        : current,
+    );
+  }, [app.authLoading]);
+
+  const handleTutorialEvent = (event: TutorialEvent) =>
+    setTutorial((current) =>
+      current ? transitionTutorial(current, event) : current,
+    );
+
+  const cleanupTutorialRecords = (): boolean =>
+    data.transactions
+      .filter((record) => !record.deletedAt && isTutorialTransaction(record))
+      .every((record) => app.softDelete("transactions", record));
+
+  const startTutorialChapter = (chapter: TutorialChapter) => {
+    if (!cleanupTutorialRecords()) {
+      setAuthMessage("教學紀錄尚未安全清除，請稍後再重新開始教學。");
+      return;
+    }
+    setShowSettings(false);
+    setShowSystem(false);
+    setTutorial(startTutorial(chapter));
+  };
+
+  const pauseTutorial = () => handleTutorialEvent({ type: "pause" });
+  const skipTutorial = () => {
+    if (!cleanupTutorialRecords()) {
+      setAuthMessage("教學紀錄尚未安全清除，因此沒有結束教學。");
+      return;
+    }
+    handleTutorialEvent({ type: "skip" });
+  };
+
+  const resumeTutorial = () => {
+    setShowSettings(false);
+    setShowSystem(false);
+    setTutorial((current) =>
+      current
+        ? prepareTutorialResume(current, tutorialRecordState(current))
+        : current,
+    );
+  };
+
+  useEffect(() => {
+    if (!activeTutorial) return;
+    const step = activeTutorial.step;
+    if (
+      [
+        "welcome",
+        "amount",
+        "category",
+        "account",
+        "create",
+        "locate",
+        "open-edit",
+        "edit-amount",
+        "save-edit",
+        "delete",
+        "cleanup-confirmed",
+        "snapshot-summary",
+      ].includes(step)
+    ) {
+      setTab("record");
+      setShowSystem(false);
+    } else if (
+      ["snapshot-category", "snapshot-detail", "tour-insights"].includes(step)
+    ) {
+      setTab("insights");
+      setShowSystem(false);
+    } else if (step === "tour-assets") {
+      setTab("assets");
+      setShowSystem(false);
+    } else if (step === "tour-planning") {
+      setTab("planning");
+      setShowSystem(false);
+    } else if (step === "tour-sync") {
+      setShowSystem(true);
+    }
+  }, [activeTutorial?.step]);
+
   const pending = app.state.outbox.length;
   const legacyBootstrap = app.state.legacyBootstrap;
   const legacyPending = legacyBootstrap?.status === "pending";
@@ -246,7 +371,7 @@ export default function App() {
         (item) => item.accountId === record.id,
       )?.balance ?? 0;
     const transactionCount = data.transactions.filter(
-      (item) => !item.deletedAt && item.accountId === record.id,
+      (item) => isFinancialTransaction(item) && item.accountId === record.id,
     ).length;
     const recurring = data.recurringRules.filter(
       (rule) =>
@@ -485,6 +610,21 @@ export default function App() {
               <div className="friendly-inline">柴柴正在把頁面準備好…</div>
             }
           >
+            {!activeTutorial && tab === "insights" && (
+              <ContextHint id="insights" title="先總覽，再往下看">
+                先選期間，再看摘要與分類；點分類就能展開對應明細。看過一次後不會再打擾你。
+              </ContextHint>
+            )}
+            {!activeTutorial && tab === "assets" && (
+              <ContextHint id="assets" title="帳戶不是分類">
+                資產帳戶回答錢放在哪裡。對帳不一致時用「調整餘額」，不要補一筆假收入或假支出。
+              </ContextHint>
+            )}
+            {!activeTutorial && tab === "planning" && (
+              <ContextHint id="planning" title="三種規劃，各做一件事">
+                儲蓄目標留下錢、預算控制支出、固定收支處理規律交易。
+              </ContextHint>
+            )}
             {tab === "record" && (
               <HomeView
                 data={data}
@@ -493,6 +633,8 @@ export default function App() {
                 deleteTransaction={(record) =>
                   app.softDelete("transactions", record)
                 }
+                tutorial={activeTutorial}
+                onTutorialEvent={handleTutorialEvent}
               />
             )}
             {tab === "insights" && (
@@ -588,7 +730,12 @@ export default function App() {
                 ? app.user.email || "我的 Google 帳戶"
                 : "目前是訪客模式"}
             </h2>
-            <div className={`sync-card ${syncTone}`}>
+            {!activeTutorial && (
+              <ContextHint id="sync" title="先確認資料位置">
+                訪客只存在這台裝置；登入後才會同步。狀態正常時不需要手動操作。
+              </ContextHint>
+            )}
+            <div className={`sync-card ${syncTone}`} data-tutorial="sync-panel">
               <span>
                 <i />
                 {syncLabel}
@@ -668,11 +815,11 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   setShowSystem(false);
-                  setShowOnboarding(true);
+                  setShowSettings(true);
                 }}
               >
                 <HelpCircle />
-                重新查看新手導覽<small>快速認識記帳、資產、洞察與同步</small>
+                幫助與互動教學<small>續跑、重跑完整流程或選擇單一章節</small>
               </button>
             </div>
           </aside>
@@ -692,6 +839,59 @@ export default function App() {
             </div>
           </header>
           <div className="settings-content">
+            <section
+              className="tutorial-center"
+              aria-labelledby="tutorial-center-title"
+            >
+              <div className="plain-heading">
+                <div>
+                  <p className="section-kicker">幫助與教學</p>
+                  <h2 id="tutorial-center-title">跟著柴柴實際操作一次</h2>
+                </div>
+                <HelpCircle />
+              </div>
+              <p>
+                互動教學直接使用正式介面；第一筆教學紀錄會被排除於財務數字，並在教學中安全刪除。
+              </p>
+              <div className="tutorial-center-actions">
+                {tutorial?.status === "paused" && (
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={resumeTutorial}
+                  >
+                    繼續上次進度
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => startTutorialChapter("full")}
+                >
+                  從頭跑完整教學
+                </button>
+              </div>
+              <div className="tutorial-chapters" aria-label="單獨重跑教學章節">
+                {(
+                  [
+                    ["first-record", "第一筆記帳"],
+                    ["snapshot", "今日財務快照"],
+                    ["assets", "資產帳戶"],
+                    ["insights", "財務洞察"],
+                    ["planning", "生活規劃"],
+                    ["sync", "帳號與同步"],
+                  ] as const
+                ).map(([chapter, label]) => (
+                  <button
+                    type="button"
+                    key={chapter}
+                    onClick={() => startTutorialChapter(chapter)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </section>
             <section className="help-strip">
               <div>
                 <HelpCircle />
@@ -714,12 +914,43 @@ export default function App() {
               </div>
             </section>
             <section className="faq-panel" aria-labelledby="faq-title">
-              <div className="plain-heading"><div><p className="section-kicker">常見問題</p><h2 id="faq-title">使用說明與資料安心指南</h2></div></div>
-              <details><summary>分類和資產帳戶有什麼不同？</summary><p>分類回答「這筆錢為什麼增加或減少」，例如餐飲；資產帳戶回答「錢實際從哪裡進出」，例如現金或街口支付。</p></details>
-              <details><summary>離線時可以記帳嗎？</summary><p>可以。紀錄會先安全保存在這台裝置；已登入時，恢復連線後再同步。右上角帳戶選單會告訴你是否還有資料等待同步。</p></details>
-              <details><summary>Google 登入會自動混合訪客資料嗎？</summary><p>不會。登入後如果偵測到訪客帳本，柴柴會讓你明確選擇匯入或保持分開，不會偷偷合併。</p></details>
-              <details><summary>怎麼備份或換裝置？</summary><p>使用下方「資料備份」下載完整 JSON；它可以安全合併或還原。交易 CSV 適合試算表整理，但不能用來完整還原設定。</p></details>
-              <details><summary>帳戶金額對不上時怎麼辦？</summary><p>到「資產」點開該帳戶，再選「調整餘額」。這會保留一筆調整紀錄，但不會被誤算成收入或支出。</p></details>
+              <div className="plain-heading">
+                <div>
+                  <p className="section-kicker">常見問題</p>
+                  <h2 id="faq-title">使用說明與資料安心指南</h2>
+                </div>
+              </div>
+              <details>
+                <summary>分類和資產帳戶有什麼不同？</summary>
+                <p>
+                  分類回答「這筆錢為什麼增加或減少」，例如餐飲；資產帳戶回答「錢實際從哪裡進出」，例如現金或街口支付。
+                </p>
+              </details>
+              <details>
+                <summary>離線時可以記帳嗎？</summary>
+                <p>
+                  可以。紀錄會先安全保存在這台裝置；已登入時，恢復連線後再同步。右上角帳戶選單會告訴你是否還有資料等待同步。
+                </p>
+              </details>
+              <details>
+                <summary>Google 登入會自動混合訪客資料嗎？</summary>
+                <p>
+                  不會。登入後如果偵測到訪客帳本，柴柴會讓你明確選擇匯入或保持分開，不會偷偷合併。
+                </p>
+              </details>
+              <details>
+                <summary>怎麼備份或換裝置？</summary>
+                <p>
+                  使用下方「資料備份」下載完整 JSON；它可以安全合併或還原。交易
+                  CSV 適合試算表整理，但不能用來完整還原設定。
+                </p>
+              </details>
+              <details>
+                <summary>帳戶金額對不上時怎麼辦？</summary>
+                <p>
+                  到「資產」點開該帳戶，再選「調整餘額」。這會保留一筆調整紀錄，但不會被誤算成收入或支出。
+                </p>
+              </details>
             </section>
             <Suspense
               fallback={<div className="friendly-inline">設定載入中…</div>}
@@ -729,7 +960,14 @@ export default function App() {
           </div>
         </div>
       )}
-      {showOnboarding && <Onboarding onClose={closeOnboarding} />}
+      {activeTutorial && (
+        <Onboarding
+          progress={activeTutorial}
+          onEvent={handleTutorialEvent}
+          onPause={pauseTutorial}
+          onSkip={skipTutorial}
+        />
+      )}
     </div>
   );
 }

@@ -32,7 +32,9 @@ import { nextDisplayOrder, sortByDisplayOrder } from "../domain/displayOrder";
 import { changedRecordMeta, newRecordMeta } from "../app/state";
 import { localDate, money, parseRequiredNumberInput } from "../app/format";
 import { completeAppliedMutation } from "../app/mutationResult";
+import { isFinancialTransaction } from "../domain/tutorialRecord";
 import { FinanceIcon, IconPicker } from "./FinanceIcon";
+import { MoneyInput } from "./MoneyInput";
 
 interface SettingsViewProps {
   data: FinanceData;
@@ -105,7 +107,7 @@ function AccountsPanel({
       editing &&
       editing.openingBalance !== amount &&
       data.transactions.some(
-        (item) => !item.deletedAt && item.accountId === editing.id,
+        (item) => isFinancialTransaction(item) && item.accountId === editing.id,
       ) &&
       !window.confirm(
         `修改「${editing.name}」起始金額會重新計算過去的帳戶餘額。若只是盤點後金額不同，請改用資產頁的「調整餘額」。確定繼續？`,
@@ -175,14 +177,13 @@ function AccountsPanel({
           </label>
           <label className="field-label">
             期初餘額
-            <input
+            <MoneyInput
               aria-label="期初餘額"
               className="field mt-1"
-              inputMode="decimal"
               value={opening}
-              onChange={(event) =>
-                setOpening(event.target.value.replace(/[^0-9.-]/g, ""))
-              }
+              allowDecimal
+              allowNegative
+              onValueChange={setOpening}
             />
           </label>
           <label className="flex items-start gap-3 rounded-xl bg-amber-50 p-3 text-sm dark:bg-zinc-800">
@@ -202,7 +203,8 @@ function AccountsPanel({
           </label>
           {editing &&
             data.transactions.some(
-              (item) => !item.deletedAt && item.accountId === editing.id,
+              (item) =>
+                isFinancialTransaction(item) && item.accountId === editing.id,
             ) && (
               <p className="warning-message">
                 此帳戶已有交易；修改起始金額會改變過去的帳戶餘額。若只是盤點後金額不同，請使用資產頁「調整餘額」。
@@ -611,14 +613,12 @@ export function RecurringPanel({
             </label>
             <label className="field-label">
               金額
-              <input
+              <MoneyInput
                 aria-label="週期金額"
                 className="field mt-1"
-                inputMode="decimal"
                 value={amount}
-                onChange={(event) =>
-                  setAmount(event.target.value.replace(/[^0-9.]/g, ""))
-                }
+                allowDecimal
+                onValueChange={setAmount}
               />
             </label>
           </div>

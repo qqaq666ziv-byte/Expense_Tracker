@@ -21,6 +21,7 @@ import {
 import { localDate, shortDate } from "../app/format";
 import { displayMoney } from "../app/presentation";
 import { useCalendarReference } from "../app/useCalendarReference";
+import { isFinancialTransaction } from "../domain/tutorialRecord";
 import { FinanceIcon } from "./FinanceIcon";
 
 type AnalysisPeriod = "day" | PeriodKey;
@@ -88,7 +89,7 @@ function MoneyMetric({
 }
 
 function within(transaction: Transaction, start: Date, end: Date): boolean {
-  if (transaction.deletedAt) return false;
+  if (!isFinancialTransaction(transaction)) return false;
   try {
     const value = parseLocalDateTime(transaction.occurredAt);
     return value >= start && value <= end;
@@ -175,7 +176,7 @@ export function InsightsView({
   const areaPath = points.length ? `${path} L 100 92 L 0 92 Z` : "";
 
   return (
-    <div className="insights-page">
+    <div className="insights-page" data-tutorial="insights-overview">
       <header className="page-intro">
         <div>
           <p className="section-kicker">把數字看懂一點</p>
@@ -284,6 +285,7 @@ export function InsightsView({
             <section
               className="analysis-panel"
               aria-labelledby="composition-title"
+              data-tutorial="insights-categories"
             >
               <div className="plain-heading">
                 <div>
@@ -481,7 +483,11 @@ export function InsightsView({
         </>
       )}
 
-      <section className="today-snapshot" aria-labelledby="today-title">
+      <section
+        className="today-snapshot"
+        aria-labelledby="today-title"
+        data-tutorial="today-snapshot"
+      >
         <div className="plain-heading">
           <div>
             <p className="section-kicker">不用計算，直接回答</p>

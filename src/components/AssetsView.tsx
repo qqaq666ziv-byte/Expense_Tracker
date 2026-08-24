@@ -21,7 +21,9 @@ import {
 } from "../app/format";
 import { subtractMoney } from "../domain/money";
 import { completeAppliedMutation } from "../app/mutationResult";
+import { isFinancialTransaction } from "../domain/tutorialRecord";
 import { FinanceIcon, IconPicker } from "./FinanceIcon";
+import { MoneyInput } from "./MoneyInput";
 
 interface AssetsViewProps {
   data: FinanceData;
@@ -174,7 +176,7 @@ export function AssetsView({
   };
 
   return (
-    <div className="assets-page">
+    <div className="assets-page" data-tutorial="assets-overview">
       <header className="page-intro">
         <div>
           <p className="section-kicker">我的錢在哪裡？</p>
@@ -227,7 +229,8 @@ export function AssetsView({
               )?.balance ?? 0;
             const related = data.transactions
               .filter(
-                (item) => !item.deletedAt && item.accountId === account.id,
+                (item) =>
+                  isFinancialTransaction(item) && item.accountId === account.id,
               )
               .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
             const colorIndex = Math.max(
@@ -397,14 +400,13 @@ export function AssetsView({
                 {editing && (
                   <small>若只是盤點後不同，請從帳戶明細使用「調整餘額」</small>
                 )}
-                <input
+                <MoneyInput
                   aria-label="期初餘額"
                   className="field mt-1"
-                  inputMode="decimal"
                   value={opening}
-                  onChange={(event) =>
-                    setOpening(event.target.value.replace(/[^0-9.-]/g, ""))
-                  }
+                  allowDecimal
+                  allowNegative
+                  onValueChange={setOpening}
                 />
               </label>
               <label className="friendly-check">
@@ -459,13 +461,14 @@ export function AssetsView({
             <form className="account-form" onSubmit={submitAdjustment}>
               <label className="field-label">
                 實際餘額
-                <input
+                <MoneyInput
                   autoFocus
                   aria-label="實際餘額"
                   className="field mt-1"
-                  inputMode="decimal"
                   value={actualBalance}
-                  onChange={(event) => setActualBalance(event.target.value)}
+                  allowDecimal
+                  allowNegative
+                  onValueChange={setActualBalance}
                 />
               </label>
               <label className="field-label">

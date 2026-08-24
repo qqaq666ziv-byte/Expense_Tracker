@@ -18,13 +18,22 @@ import {
   toLocalInput,
 } from "../app/format";
 import { completeAppliedMutation } from "../app/mutationResult";
+import {
+  TUTORIAL_RECORD_NOTE,
+  isTutorialTransaction,
+  type TutorialEvent,
+  type TutorialProgress,
+} from "../app/tutorial";
 import { FinanceIcon } from "./FinanceIcon";
+import { MoneyInput } from "./MoneyInput";
 
 interface HomeViewProps {
   data: FinanceData;
   ownerId: string;
   put(entity: "transactions", record: Transaction): boolean;
   deleteTransaction(record: Transaction): boolean;
+  tutorial?: TutorialProgress | null;
+  onTutorialEvent?(event: TutorialEvent): void;
 }
 
 const ledgerPageSize = 30;
@@ -34,6 +43,8 @@ export function HomeView({
   ownerId,
   put,
   deleteTransaction,
+  tutorial,
+  onTutorialEvent,
 }: HomeViewProps) {
   const amountRef = useRef<HTMLInputElement>(null);
   const [type, setType] = useState<"expense" | "income">("expense");
@@ -91,7 +102,23 @@ export function HomeView({
       calculateInsights(data, { period: "month", reference: new Date() }).today,
     [data],
   );
-  const history = useMemo(() => buildLedgerHistory(data), [data]);
+  const history = useMemo(() => {
+    const normalHistory = buildLedgerHistory(data);
+    const tutorialRecord = tutorial?.recordId
+      ? data.transactions.find(
+          (record) =>
+            record.id === tutorial.recordId &&
+            !record.deletedAt &&
+            isTutorialTransaction(record),
+        )
+      : undefined;
+    return tutorialRecord
+      ? [
+          { kind: "transaction" as const, record: tutorialRecord },
+          ...normalHistory,
+        ]
+      : normalHistory;
+  }, [data, tutorial?.recordId]);
   const normalizedQuery = query.trim().toLocaleLowerCase("zh-TW");
   const filteredHistory = history.filter((entry) => {
     if (!normalizedQuery) return true;
@@ -143,6 +170,10 @@ export function HomeView({
     if (!category || !account) return setError("請先建立可用的資產帳戶與分類");
     if (!occurredAt) return setError("請選擇交易時間");
 
+    const editingTutorial = Boolean(editing && isTutorialTransaction(editing));
+    const creatingTutorial = tutorial?.step === "create" && !editing;
+    const tutorialNote = editingTutorial || creatingTutorial;
+
     const record: Transaction = editing
       ? {
           ...editing,
@@ -154,7 +185,7 @@ export function HomeView({
           accountId: account.id,
           accountName: account.name,
           occurredAt,
-          note: note.trim() || undefined,
+          note: tutorialNote ? TUTORIAL_RECORD_NOTE : note.trim() || undefined,
         }
       : {
           ...newRecordMeta(ownerId),
@@ -165,7 +196,7 @@ export function HomeView({
           accountId: account.id,
           accountName: account.name,
           occurredAt,
-          note: note.trim() || undefined,
+          note: tutorialNote ? TUTORIAL_RECORD_NOTE : note.trim() || undefined,
         };
 
     completeAppliedMutation(
@@ -182,6 +213,13 @@ export function HomeView({
         setSuccess(
           `${editing ? "已更新" : "已記下"} ${type === "expense" ? "支出" : "收入"} ${displayMoney(numericAmount)}`,
         );
+        if (tutorialNote) {
+          onTutorialEvent?.(
+            editing
+              ? { type: "transaction-updated" }
+              : { type: "transaction-created", recordId: record.id },
+          );
+        }
         resetForm();
       },
       setError,
@@ -195,9 +233,11 @@ export function HomeView({
     setCategoryId(transaction.categoryId);
     setAccountId(transaction.accountId);
     setOccurredAt(transaction.occurredAt.slice(0, 16).replace(" ", "T"));
-    setNote(transaction.note ?? "");
+    setNote(isTutorialTransaction(transaction) ? "" : (transaction.note ?? ""));
     setSuccess("");
     window.scrollTo({ top: 0, behavior: "smooth" });
+    if (isTutorialTransaction(transaction))
+      onTutorialEvent?.({ type: "edit-opened" });
   };
 
   return (
@@ -212,6 +252,7 @@ export function HomeView({
           </div>
           <div
             className="today-mini"
+            data-tutorial="today-summary"
             aria-label={`今日支出 ${displayMoney(today.expense)}`}
           >
             <span>今日支出</span>
@@ -239,27 +280,37 @@ export function HomeView({
             </button>
           </div>
 
-          <label className={`amount-stage ${type}`}>
+          <label className={`amount-stage ${type}`} data-tutorial="amount">
             <span>{type === "expense" ? "支出金額" : "收入金額"}</span>
-            <span className="amount-input-wrap">
-              <b>NT$</b>
-              <input
-                ref={amountRef}
-                autoFocus
-                aria-label="金額"
-                inputMode="decimal"
-                placeholder="0"
-                value={amount}
-                onChange={(event) => {
-                  setAmount(event.target.value.replace(/[^0-9.]/g, ""));
-                  setError("");
-                  setSuccess("");
-                }}
-              />
-            </span>
+            <MoneyInput
+              ref={amountRef}
+              className="amount-input-wrap"
+              autoFocus
+              aria-label="金額"
+              placeholder="0"
+              value={amount}
+              allowDecimal
+              onBlur={() => {
+                const numeric = parseRequiredNumberInput(amount);
+                if (tutorial?.step === "amount" && numeric && numeric > 0)
+                  onTutorialEvent?.({ type: "amount-ready" });
+              }}
+              onValueChange={(value) => {
+                setAmount(value);
+                setError("");
+                setSuccess("");
+                if (
+                  tutorial?.step === "edit-amount" &&
+                  editing &&
+                  isTutorialTransaction(editing) &&
+                  value !== String(editing.amount)
+                )
+                  onTutorialEvent?.({ type: "amount-changed" });
+              }}
+            />
           </label>
 
-          <fieldset className="choice-section">
+          <fieldset className="choice-section" data-tutorial="category">
             <legend>選擇分類</legend>
             <div className="category-grid">
               {categories.map((category) => (
@@ -268,7 +319,10 @@ export function HomeView({
                   key={category.id}
                   className={`category-choice ${resolvedCategoryId === category.id ? "selected" : ""}`}
                   aria-pressed={resolvedCategoryId === category.id}
-                  onClick={() => setCategoryId(category.id)}
+                  onClick={() => {
+                    setCategoryId(category.id);
+                    onTutorialEvent?.({ type: "category-selected" });
+                  }}
                 >
                   <span>
                     <FinanceIcon icon={category.icon} />
@@ -279,7 +333,10 @@ export function HomeView({
             </div>
           </fieldset>
 
-          <fieldset className="choice-section account-choices">
+          <fieldset
+            className="choice-section account-choices"
+            data-tutorial="account"
+          >
             <legend>
               從哪個資產帳戶{type === "expense" ? "付款" : "存入"}？
             </legend>
@@ -290,7 +347,10 @@ export function HomeView({
                   key={account.id}
                   className={`account-chip ${resolvedAccountId === account.id ? "selected" : ""}`}
                   aria-pressed={resolvedAccountId === account.id}
-                  onClick={() => setAccountId(account.id)}
+                  onClick={() => {
+                    setAccountId(account.id);
+                    onTutorialEvent?.({ type: "account-selected" });
+                  }}
                 >
                   <FinanceIcon icon={account.icon} />
                   {account.name}
@@ -341,7 +401,11 @@ export function HomeView({
             </p>
           )}
           <div className="entry-actions">
-            <button className={`save-entry ${type}`} type="submit">
+            <button
+              className={`save-entry ${type}`}
+              type="submit"
+              data-tutorial="create"
+            >
               {editing
                 ? "儲存修改"
                 : `記下這筆${type === "expense" ? "支出" : "收入"}`}
@@ -359,7 +423,11 @@ export function HomeView({
         </form>
       </section>
 
-      <section className="ledger-paper" aria-labelledby="history-title">
+      <section
+        className="ledger-paper"
+        aria-labelledby="history-title"
+        data-tutorial="ledger"
+      >
         <div className="ledger-heading">
           <div>
             <p className="section-kicker">我的生活帳本</p>
@@ -417,6 +485,7 @@ export function HomeView({
                 );
               }
               const transaction = entry.record;
+              const tutorialRow = isTutorialTransaction(transaction);
               const category = data.categories.find(
                 (item) => item.id === transaction.categoryId,
               );
@@ -425,9 +494,10 @@ export function HomeView({
               );
               return (
                 <article
-                  className="ledger-row"
+                  className={`ledger-row ${tutorialRow ? "tutorial-record-row" : ""}`}
                   key={transaction.id}
                   data-testid="transaction-row"
+                  data-tutorial={tutorialRow ? "tutorial-record" : undefined}
                 >
                   <span className="record-icon">
                     <FinanceIcon
@@ -437,11 +507,18 @@ export function HomeView({
                   <div>
                     <strong>
                       {category?.name ?? transaction.categoryName}
+                      {tutorialRow && (
+                        <em className="tutorial-record-badge">
+                          教學紀錄 · 完成後刪除
+                        </em>
+                      )}
                     </strong>
                     <small>
                       {account?.name ?? transaction.accountName} ·{" "}
                       {shortDate(transaction.occurredAt)}
-                      {transaction.note ? ` · ${transaction.note}` : ""}
+                      {!tutorialRow && transaction.note
+                        ? ` · ${transaction.note}`
+                        : ""}
                     </small>
                   </div>
                   <b className={transaction.type}>
@@ -462,8 +539,11 @@ export function HomeView({
                       onClick={() => {
                         if (
                           window.confirm("刪除這筆紀錄？它不會再出現在帳本中。")
-                        )
-                          deleteTransaction(transaction);
+                        ) {
+                          const deleted = deleteTransaction(transaction);
+                          if (deleted && tutorialRow)
+                            onTutorialEvent?.({ type: "transaction-deleted" });
+                        }
                       }}
                     >
                       <Trash2 className="h-4 w-4" />
