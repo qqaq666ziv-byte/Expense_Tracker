@@ -10,6 +10,7 @@
 - Prefer the smallest coherent design that satisfies the requested product behavior and improves maintainability.
 - Preserve the existing product identity and working behavior unless the task explicitly changes it.
 - Ask for user input only when blocked by missing credentials/permissions, an irreversible or destructive action, a material product-value ambiguity that cannot be inferred, or a significant security/legal/financial consequence.
+- Prefer clear goals, invariants, and repository evidence over prescriptive implementation recipes; use engineering judgment unless a hard safety or product boundary requires otherwise.
 
 ## 2. Mandatory remote checkpoint before mutation
 
@@ -50,6 +51,7 @@ Work on a task/feature branch rather than making experimental changes directly o
 - Prefer additive migrations and verified backfills over destructive rewrites.
 - Never silently discard, overwrite, merge, or reinterpret existing financial records without a documented migration rule and verification.
 - Maintain row-level ownership protections for all user-scoped Supabase tables.
+- For production deployment, domain, OAuth, PWA/Service Worker, or rollback/recovery work, read `docs/PRODUCTION_RELEASE.md` as the detailed release runbook and verify recorded deployment topology against the live environment before relying on it.
 
 ## 5. Verification is required
 
