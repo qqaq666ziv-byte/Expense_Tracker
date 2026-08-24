@@ -1,23 +1,31 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { Theme, themes } from '../themeConfig';
+import { themes, type Theme, type ThemeId } from '../themeConfig';
 
 interface ThemeContextType {
   theme: Theme;
-  setTheme: (themeId: 'shiba' | 'mix') => void;
+  setTheme: (themeId: ThemeId) => void;
   toggleTheme: () => void;
 }
 
 const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
 
 export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [themeId, setThemeIdState] = useState<'shiba' | 'mix'>(() => {
-    const saved = localStorage.getItem('pet-theme-id');
-    return saved === 'mix' ? 'mix' : 'shiba';
+  const [themeId, setThemeIdState] = useState<ThemeId>(() => {
+    try {
+      const saved = localStorage.getItem('pet-theme-id');
+      return saved === 'mix' ? 'mix' : 'shiba';
+    } catch {
+      return 'shiba';
+    }
   });
 
-  const setTheme = (id: 'shiba' | 'mix') => {
+  const setTheme = (id: ThemeId) => {
     setThemeIdState(id);
-    localStorage.setItem('pet-theme-id', id);
+    try {
+      localStorage.setItem('pet-theme-id', id);
+    } catch {
+      // The in-memory theme remains usable when browser storage is unavailable.
+    }
   };
 
   const toggleTheme = () => {

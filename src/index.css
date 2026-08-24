@@ -1,1 +1,82 @@
 @import "tailwindcss";
+
+@theme {
+  --font-sans: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: light;
+  font-family: var(--font-sans);
+  background: #fffaf0;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 15% -10%, rgba(251, 191, 36, .22), transparent 32rem),
+    linear-gradient(180deg, #fffaf0 0%, #fffdf8 55%, #fff8e8 100%);
+}
+button, input, select { font: inherit; }
+button:disabled { cursor: not-allowed; opacity: .5; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgba(245, 158, 11, .35); outline-offset: 2px; }
+
+@layer components {
+  .card { @apply rounded-3xl border border-amber-100/90 bg-white p-4 shadow-[0_12px_35px_rgba(120,72,0,0.07)] sm:p-5; }
+  .hero-card { @apply relative overflow-hidden rounded-[2rem] bg-gradient-to-br from-amber-500 via-orange-500 to-amber-700 p-6 text-white shadow-[0_18px_45px_rgba(180,83,9,0.25)] sm:p-8; }
+  .hero-card::after { content: "🐾"; @apply absolute -bottom-8 -right-2 rotate-[-14deg] text-[9rem] opacity-10; }
+  .hero-card-savings { @apply from-emerald-500 via-teal-600 to-emerald-800; }
+  .section-heading { @apply mb-4 flex items-center justify-between gap-3; }
+  .section-heading h2 { @apply text-xl font-black tracking-tight; }
+  .eyebrow { @apply mb-0.5 text-[11px] font-black uppercase tracking-[0.16em] text-amber-600; }
+  .field-label { @apply text-sm font-bold text-zinc-700; }
+  .field { @apply min-h-11 w-full rounded-xl border border-amber-200 bg-white px-3 py-2.5 text-base text-zinc-900 shadow-inner shadow-amber-900/3 transition focus:border-amber-500; }
+  .primary-button { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-amber-600 px-4 py-2.5 text-sm font-black text-white shadow-sm transition hover:bg-amber-700 active:scale-[.98]; }
+  .secondary-button { @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-amber-200 bg-white px-3 py-2 text-sm font-bold text-amber-800 transition hover:bg-amber-50 active:scale-[.98]; }
+  .icon-button { @apply inline-grid h-10 w-10 shrink-0 place-items-center rounded-xl text-zinc-500 transition hover:bg-amber-50 hover:text-amber-700; }
+  .icon-button.danger { @apply hover:bg-rose-50 hover:text-rose-600; }
+  .icon-badge { @apply grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-amber-100 text-amber-800; }
+  .icon-choice { @apply grid aspect-square place-items-center rounded-lg border border-transparent text-zinc-500 hover:bg-amber-50; }
+  .icon-choice-active { @apply border-amber-500 bg-amber-100 text-amber-800; }
+  .tab-button { @apply min-h-10 rounded-xl px-2 py-2 text-xs font-black text-zinc-500 transition sm:text-sm; }
+  .tab-button-active { @apply bg-amber-600 text-white shadow-sm; }
+  .nav-button { @apply flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-2xl text-xs font-bold text-zinc-500 transition; }
+  .nav-button-active { @apply bg-amber-100 text-amber-800; }
+  .chip { @apply rounded-full border border-amber-200 px-3 py-1.5 text-xs font-bold text-zinc-600; }
+  .chip-active { @apply border-amber-600 bg-amber-600 text-white; }
+  .status-pill { @apply inline-flex min-h-10 items-center gap-2 rounded-full bg-amber-100 px-3 py-2 text-xs font-bold text-amber-900; }
+  .count-badge { @apply rounded-full bg-amber-100 px-3 py-1 text-xs font-black text-amber-800; }
+  .metric-card { @apply flex min-h-24 flex-col justify-center rounded-2xl bg-amber-50 p-3 text-zinc-600 transition hover:bg-amber-100; }
+  .metric-card > span:first-child { @apply text-xs font-bold; }
+  .metric-card > strong { @apply my-1 block break-words text-lg font-black text-zinc-900; }
+  .transaction-row { @apply flex items-center gap-2 rounded-2xl border border-transparent bg-amber-50/70 p-2 transition hover:border-amber-200 hover:bg-amber-50; }
+  .settings-row { @apply flex min-h-14 items-center gap-3 rounded-2xl bg-amber-50/70 p-2; }
+  .empty-state { @apply rounded-2xl border border-dashed border-amber-200 p-6 text-center text-sm text-zinc-500; }
+  .error-message { @apply flex items-center gap-2 rounded-xl bg-rose-50 p-3 text-sm font-bold text-rose-700; }
+  .warning-message { @apply rounded-xl bg-orange-50 p-3 text-xs leading-relaxed text-orange-800; }
+  .info-banner { @apply mb-4 flex items-center gap-3 rounded-2xl border border-sky-100 bg-sky-50 p-4 text-sm text-sky-900; }
+  .warning-banner { @apply mb-4 flex flex-col justify-between gap-3 rounded-2xl border border-orange-200 bg-orange-50 p-4 text-sm text-orange-900 sm:flex-row sm:items-center; }
+  .warning-banner p { @apply mt-1 break-all text-xs opacity-80; }
+  .progress-track { @apply h-2.5 overflow-hidden rounded-full bg-amber-100; }
+  .progress-track > span { @apply block h-full rounded-full bg-gradient-to-r from-amber-500 to-orange-500 transition-all; }
+  .progress-danger > span { @apply from-rose-500 to-red-600; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root { color-scheme: dark; background: #09090b; }
+  body { background: radial-gradient(circle at 15% -10%, rgba(146, 64, 14, .2), transparent 30rem), #09090b; }
+  .card { @apply border-zinc-800 bg-zinc-900; }
+  .field-label { @apply text-zinc-300; }
+  .field { @apply border-zinc-700 bg-zinc-950 text-zinc-100; }
+  .secondary-button { @apply border-zinc-700 bg-zinc-900 text-amber-300 hover:bg-zinc-800; }
+  .metric-card { @apply bg-zinc-800 text-zinc-400 hover:bg-zinc-800; }
+  .metric-card > strong { @apply text-zinc-100; }
+  .transaction-row, .settings-row { @apply bg-zinc-800/80; }
+}

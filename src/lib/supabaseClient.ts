@@ -1,10 +1,36 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL?.trim();
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
 
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.warn('⚠️ 警告：缺少 VITE_SUPABASE_URL 或 VITE_SUPABASE_ANON_KEY 環境變數，請確認根目錄的 .env 設定汪！');
+/**
+ * Capability marker used only for backward-compatible tombstone visibility.
+ * It is not an authorization secret; RLS still enforces auth.uid() ownership.
+ */
+export const FINANCE_SYNC_CLIENT_HEADERS = Object.freeze({
+  'x-shiba-finance-client': 'v3',
+});
+
+export function isBrowserSafeSupabaseKey(value: string | undefined): boolean {
+  if (!value || value.startsWith('sb_secret_')) return false;
+  const parts = value.split('.');
+  if (parts.length === 3) {
+    try {
+      const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))) as { role?: unknown };
+      if (payload.role === 'service_role') return false;
+    } catch {
+      // Non-JWT publishable keys are valid; createClient performs final format validation.
+    }
+  }
+  return true;
 }
 
-export const supabase = createClient(supabaseUrl || '', supabaseAnonKey || '');
+export const supabaseConfigured = Boolean(supabaseUrl && isBrowserSafeSupabaseKey(supabaseAnonKey));
+
+/** Public browser client only. A service-role key must never be used here. */
+export const supabase: SupabaseClient | null = supabaseConfigured
+  ? createClient(supabaseUrl!, supabaseAnonKey!, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+      global: { headers: FINANCE_SYNC_CLIENT_HEADERS },
+    })
+  : null;
