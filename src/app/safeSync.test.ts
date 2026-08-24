@@ -77,7 +77,15 @@ describe('recovery-protected remote sync', () => {
       () => order.push('clear'),
     );
 
-    expect(restored.data).toEqual(state.data);
+    expect(restored.data.accounts.map(({ id, name }) => ({ id, name })))
+      .toEqual(state.data.accounts.map(({ id, name }) => ({ id, name })));
+    expect(restored.data.categories.map(({ id, name }) => ({ id, name })))
+      .toEqual(state.data.categories.map(({ id, name }) => ({ id, name })));
+    expect(restored.initialBootstrap).toBeUndefined();
+    expect(restored.outbox).toHaveLength(15);
+    expect(restored.outbox.every(({ record }) => (
+      record.version === 2 && !record.lastOperationId.startsWith('seed-')
+    ))).toBe(true);
     expect(order).toEqual(['persist', 'clear']);
   });
 });

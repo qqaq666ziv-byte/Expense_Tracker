@@ -331,13 +331,17 @@ export default function App() {
     }
   }, [activeTutorial?.step]);
 
-  const pending = app.state.outbox.length;
+  const initialBootstrap = app.state.initialBootstrap;
+  const pending = app.state.outbox.length
+    + (initialBootstrap?.pendingOperations.length ?? 0);
   const legacyBootstrap = app.state.legacyBootstrap;
   const legacyPending = legacyBootstrap?.status === "pending";
   const syncLabel =
     app.state.ownerId === "guest"
       ? "只存在這台裝置"
-      : legacyPending
+      : initialBootstrap
+        ? "正在讀取雲端帳本"
+        : legacyPending
         ? "正在確認雲端資料"
         : !online
           ? `離線${pending ? ` · ${pending} 筆待同步` : ""}`
@@ -347,7 +351,7 @@ export default function App() {
   const syncTone =
     app.state.ownerId === "guest"
       ? "local"
-      : !online || pending > 0 || app.state.lastSyncError
+      : initialBootstrap || !online || pending > 0 || app.state.lastSyncError
         ? "attention"
         : "synced";
 

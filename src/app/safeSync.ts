@@ -17,7 +17,23 @@ export function restoreFinanceStateAndClearRecovery(
   persist: (restored: PersistedFinanceState) => void,
   clearRecovery: () => void,
 ): PersistedFinanceState {
-  const restored = applyRestoredData(state, restoredData);
+  const restoreBase = state.initialBootstrap === undefined ? state : {
+    ...state,
+    data: {
+      accounts: [],
+      categories: [],
+      transactions: [],
+      adjustments: [],
+      goals: [],
+      allocations: [],
+      budgets: [],
+      recurringRules: [],
+      settings: structuredClone(state.data.settings),
+    },
+    outbox: [],
+    initialBootstrap: undefined,
+  };
+  const restored = applyRestoredData(restoreBase, restoredData);
   persist(restored);
   clearRecovery();
   return restored;

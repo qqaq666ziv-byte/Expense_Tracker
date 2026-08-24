@@ -402,6 +402,59 @@ function validateOwnership(
       });
     }
   }
+  const initialBootstrap = state.initialBootstrap;
+  if (initialBootstrap !== undefined) {
+    try {
+      validateFinanceData(initialBootstrap.candidate, 'authenticated initial bootstrap candidate');
+    } catch (error) {
+      failures.push({
+        stage: 'validation',
+        message: `Invalid authenticated initial bootstrap: ${errorMessage(error)}`,
+      });
+    }
+    for (const entity of ENTITY_NAMES) {
+      for (const record of initialBootstrap.candidate[entity] as SyncEntityRecord[]) {
+        if (record.ownerId !== state.ownerId) {
+          failures.push({
+            stage: 'validation',
+            message: `authenticated initial bootstrap ${entity}/${record.id} belongs to ${record.ownerId}, not ${state.ownerId}`,
+            entity,
+            recordId: record.id,
+          });
+        }
+      }
+    }
+    const operationKeys = new Set<string>();
+    for (const operation of initialBootstrap.pendingOperations) {
+      const key = recordKey(operation.entity, operation.recordId);
+      if (operation.record.ownerId !== state.ownerId
+        || operation.recordId !== operation.record.id
+        || operation.id !== operation.record.lastOperationId
+        || operationKeys.has(key)) {
+        failures.push({
+          stage: 'validation',
+          message: `invalid preserved operation ${operation.id} in authenticated initial bootstrap`,
+          operationId: operation.id,
+          entity: operation.entity,
+          recordId: operation.recordId,
+        });
+      }
+      operationKeys.add(key);
+    }
+    if (initialBootstrap.status === 'pending' && state.outbox.length > 0) {
+      failures.push({
+        stage: 'validation',
+        message: 'authenticated initial bootstrap must quarantine operations until cloud pull',
+      });
+    }
+    if (initialBootstrap.status === 'seeding'
+      && initialBootstrap.pendingOperations.length > 0) {
+      failures.push({
+        stage: 'validation',
+        message: 'authenticated seeding bootstrap must keep retryable operations in the outbox',
+      });
+    }
+  }
   return failures;
 }
 
@@ -493,6 +546,152 @@ async function syncAuthenticatedLegacyBootstrap(
   };
 }
 
+function operationsForData(data: FinanceData): PendingOperation[] {
+  return ENTITY_NAMES.flatMap((entity) => (
+    (data[entity] as SyncEntityRecord[]).map((record) => ({
+      id: record.lastOperationId,
+      entity,
+      recordId: record.id,
+      record,
+      attempts: 0,
+      queuedAt: record.updatedAt,
+    }))
+  ));
+}
+
+async function syncInitialAuthenticatedBootstrap(
+  state: PersistedFinanceState,
+  authenticatedOwnerId: string,
+  remote: RemoteAdapter,
+  now: () => string,
+): Promise<SyncResult> {
+  const bootstrap = state.initialBootstrap;
+  if (bootstrap?.status !== 'pending') {
+    throw new Error('authenticated initial bootstrap is not pending');
+  }
+
+  let pulled = 0;
+  const failures: SyncFailure[] = [];
+  let remoteData = emptyRemoteData(state.data.settings);
+  let remoteHasRows = false;
+  try {
+    const pullResult = normalizePullResponse(await remote.pull(authenticatedOwnerId));
+    pulled = pullResult.records.length;
+    remoteHasRows = pullResult.records.length > 0;
+    failures.push(...pullResult.issues.map((issue) => ({ ...issue })));
+    for (const remoteRecord of pullResult.records) {
+      if (remoteRecord.record.ownerId !== authenticatedOwnerId) {
+        failures.push({
+          stage: 'validation',
+          message: `${remoteRecord.entity}/${remoteRecord.record.id} belongs to ${remoteRecord.record.ownerId}, not ${authenticatedOwnerId}`,
+          entity: remoteRecord.entity,
+          recordId: remoteRecord.record.id,
+        });
+        continue;
+      }
+      remoteData = replaceRecord(remoteData, remoteRecord);
+    }
+  } catch (error) {
+    failures.push({ stage: 'pull', message: errorMessage(error) });
+  }
+
+  if (failures.length === 0) {
+    try {
+      validateFinanceData(remoteData, 'authenticated initial remote bootstrap graph');
+    } catch (error) {
+      failures.push({ stage: 'validation', message: errorMessage(error) });
+    }
+  }
+  if (failures.length > 0) {
+    const lastSyncError = failures.map((failure) => failure.message).join('; ');
+    return {
+      state: { ...state, lastSyncedAt: undefined, lastSyncError },
+      report: {
+        ownerId: state.ownerId,
+        status: 'partial',
+        applied: 0,
+        pulled,
+        pending: pendingReport(bootstrap.pendingOperations),
+        failures,
+        conflicts: [],
+      },
+    };
+  }
+
+  if (remoteHasRows && bootstrap.pendingOperations.length === 0) {
+    return {
+      state: {
+        ...state,
+        data: remoteData,
+        outbox: [],
+        initialBootstrap: undefined,
+        lastSyncedAt: now(),
+        lastSyncError: undefined,
+      },
+      report: {
+        ownerId: state.ownerId,
+        status: 'synced',
+        applied: 0,
+        pulled,
+        pending: [],
+        failures: [],
+        conflicts: [],
+      },
+    };
+  }
+
+  let stagedData = structuredClone(remoteHasRows ? remoteData : bootstrap.candidate);
+  let stagedOutbox = remoteHasRows ? [] : operationsForData(bootstrap.candidate);
+  for (const operation of bootstrap.pendingOperations) {
+    stagedData = replaceRecord(stagedData, {
+      entity: operation.entity,
+      record: operation.record,
+    } as RemoteRecord);
+    const key = recordKey(operation.entity, operation.recordId);
+    stagedOutbox = [
+      ...stagedOutbox.filter((candidate) => recordKey(candidate.entity, candidate.recordId) !== key),
+      structuredClone(operation),
+    ];
+  }
+  try {
+    validateFinanceData(stagedData, 'authenticated initial bootstrap replay graph');
+  } catch (error) {
+    const failure: SyncFailure = {
+      stage: 'validation',
+      message: `Preserved local mutations require review after cloud hydration: ${errorMessage(error)}`,
+    };
+    return {
+      state: { ...state, lastSyncedAt: undefined, lastSyncError: failure.message },
+      report: {
+        ownerId: state.ownerId,
+        status: 'partial',
+        applied: 0,
+        pulled,
+        pending: pendingReport(bootstrap.pendingOperations),
+        failures: [failure],
+        conflicts: [],
+      },
+    };
+  }
+
+  const staged: PersistedFinanceState = {
+    ...state,
+    data: stagedData,
+    outbox: stagedOutbox,
+    initialBootstrap: undefined,
+    lastSyncedAt: undefined,
+    lastSyncError: undefined,
+  };
+  const synced = await syncFinanceState(staged, authenticatedOwnerId, remote, now);
+  const initialBootstrap = synced.state.outbox.length > 0
+    ? { ...bootstrap, status: 'seeding' as const, pendingOperations: [] }
+    : undefined;
+  return {
+    state: { ...synced.state, initialBootstrap },
+    report: { ...synced.report, pulled: pulled + synced.report.pulled },
+  };
+}
+
 /**
  * Store the latest local snapshot and its retryable operation in one step.
  * A delete uses the same record shape with `deletedAt` set (a tombstone).
@@ -508,6 +707,9 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
   }
   if (state.legacyBootstrap?.status === 'pending') {
     throw new Error('authenticated legacy bootstrap must finish its remote pull before local mutations');
+  }
+  if (state.initialBootstrap) {
+    throw new Error('authenticated initial bootstrap must finish its remote pull before local mutations');
   }
   if (record.ownerId !== state.ownerId) {
     throw new Error(`record ${record.id} belongs to ${record.ownerId}, not ${state.ownerId}`);
@@ -561,6 +763,9 @@ export async function syncFinanceState(
   }
   if (state.legacyBootstrap?.status === 'pending') {
     return syncAuthenticatedLegacyBootstrap(state, authenticatedOwnerId, remote, now);
+  }
+  if (state.initialBootstrap?.status === 'pending') {
+    return syncInitialAuthenticatedBootstrap(state, authenticatedOwnerId, remote, now);
   }
 
   let failures: SyncFailure[] = [];
@@ -690,6 +895,9 @@ export async function syncFinanceState(
     ...state,
     data,
     outbox: finalRemaining,
+    ...(state.initialBootstrap?.status === 'seeding' && finalRemaining.length === 0
+      ? { initialBootstrap: undefined }
+      : {}),
     ...(pullSucceeded ? { lastSyncedAt: now() } : {}),
     ...(lastSyncError === undefined ? { lastSyncError: undefined } : { lastSyncError }),
   };

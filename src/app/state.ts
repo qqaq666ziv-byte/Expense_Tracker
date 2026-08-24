@@ -2,6 +2,7 @@ import type {
   FinanceData,
   FinanceEntityName,
   OwnerId,
+  PendingOperation,
   PersistedFinanceState,
   SavingsAllocation,
   SyncRecord,
@@ -88,17 +89,32 @@ function createEmptyData(): FinanceData {
 }
 
 export function createInitialState(ownerId: OwnerId): PersistedFinanceState {
-  let state: PersistedFinanceState = {
+  const data = createInitialData(ownerId);
+  return {
     schemaVersion: 3,
     ownerId,
-    data: createInitialData(ownerId),
+    data,
     outbox: [],
+    ...(ownerId === 'guest' ? {} : {
+      initialBootstrap: {
+        status: 'pending' as const,
+        candidate: structuredClone(data),
+        pendingOperations: [],
+      },
+    }),
   };
-  if (ownerId !== 'guest') {
-    for (const account of state.data.accounts) state = enqueueSyncRecord(state, 'accounts', account);
-    for (const category of state.data.categories) state = enqueueSyncRecord(state, 'categories', category);
-  }
-  return state;
+}
+
+function isExactSyntheticDefaultOperation(
+  operation: PendingOperation,
+  defaults: FinanceData,
+): boolean {
+  if (operation.entity !== 'accounts' && operation.entity !== 'categories') return false;
+  const expected = (defaults[operation.entity] as SyncRecord[])
+    .find((record) => record.id === operation.recordId);
+  return expected !== undefined
+    && operation.id === expected.lastOperationId
+    && JSON.stringify(operation.record) === JSON.stringify(expected);
 }
 
 export function storageKey(ownerId: OwnerId): string {
@@ -198,6 +214,37 @@ export function loadFinanceStateWithRecovery(
         throw new Error('outbox does not match the current local record');
       }
     }
+    if (parsed.initialBootstrap !== undefined) {
+      const bootstrap = parsed.initialBootstrap;
+      if (!bootstrap || typeof bootstrap !== 'object'
+        || (bootstrap.status !== 'pending' && bootstrap.status !== 'seeding')
+        || !bootstrap.candidate
+        || !Array.isArray(bootstrap.pendingOperations)
+        || (bootstrap.status === 'pending' && parsed.outbox.length > 0)
+        || (bootstrap.status === 'seeding' && bootstrap.pendingOperations.length > 0)
+        || parsed.legacyBootstrap !== undefined) {
+        throw new Error('invalid authenticated initial bootstrap');
+      }
+      validateFinanceData(bootstrap.candidate, 'authenticated initial bootstrap candidate');
+      for (const entity of entityNames) {
+        if (bootstrap.candidate[entity].some((record) => record.ownerId !== ownerId)) {
+          throw new Error(`foreign owner in authenticated initial bootstrap candidate ${entity}`);
+        }
+      }
+      const pendingKeys = new Set<string>();
+      for (const operation of bootstrap.pendingOperations) {
+        const key = `${operation.entity}:${operation.recordId}`;
+        if (!operation || typeof operation !== 'object'
+          || operation.record.ownerId !== ownerId
+          || operation.recordId !== operation.record.id
+          || operation.id !== operation.record.lastOperationId
+          || !entityNames.includes(operation.entity)
+          || pendingKeys.has(key)) {
+          throw new Error('invalid or duplicate operation in authenticated initial bootstrap');
+        }
+        pendingKeys.add(key);
+      }
+    }
     if (parsed.legacyBootstrap !== undefined) {
       const bootstrap = parsed.legacyBootstrap;
       if (!bootstrap || typeof bootstrap !== 'object'
@@ -240,6 +287,34 @@ export function loadFinanceStateWithRecovery(
           },
         },
       };
+    }
+    if (ownerId !== 'guest'
+      && parsed.initialBootstrap === undefined
+      && parsed.legacyBootstrap === undefined) {
+      const defaults = createInitialData(ownerId);
+      const syntheticOperations = parsed.outbox.filter((operation) => (
+        isExactSyntheticDefaultOperation(operation, defaults)
+      ));
+      if (syntheticOperations.length > 0) {
+        const syntheticKeys = new Set(syntheticOperations.map((operation) => (
+          `${operation.entity}:${operation.recordId}`
+        )));
+        return {
+          state: {
+            ...parsed,
+            outbox: [],
+            lastSyncedAt: undefined,
+            lastSyncError: undefined,
+            initialBootstrap: {
+              status: 'pending',
+              candidate: defaults,
+              pendingOperations: parsed.outbox.filter((operation) => (
+                !syntheticKeys.has(`${operation.entity}:${operation.recordId}`)
+              )),
+            },
+          },
+        };
+      }
     }
     return { state: parsed };
   } catch (error) {
