@@ -1071,6 +1071,110 @@ describe('offline sync engine', () => {
     expect(remoteBudgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
   });
 
+  it('preserves a newer queued inactive budget edit when an older remote budget is already inactive', async () => {
+    const remoteBudget: Budget = {
+      id: 'budget-offline-edit', ownerId: 'user-a', version: 2,
+      updatedAt: NOW, lastOperationId: 'remote-archive',
+      scope: 'overall', period: 'monthly', amount: 5_000, isActive: false,
+    };
+    const localBudget: Budget = {
+      ...remoteBudget,
+      version: 3,
+      lastOperationId: 'local-offline-edit',
+      amount: 8_000,
+    };
+    const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [localBudget] },
+      outbox: [budgetOperation(localBudget)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.data.budgets).toEqual([localBudget]);
+    expect((await remote.pull('user-a'))[0]).toEqual({ entity: 'budgets', record: localBudget });
+  });
+
+  it('treats an exactly matching inactive remote budget as an idempotent confirmation', async () => {
+    const inactive: Budget = {
+      id: 'budget-confirmed-archive', ownerId: 'user-a', version: 3,
+      updatedAt: NOW, lastOperationId: 'confirmed-archive',
+      scope: 'overall', period: 'monthly', amount: 8_000, isActive: false,
+    };
+    const remote = new InMemoryRemote([{ entity: 'budgets', record: inactive }]);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [inactive] },
+      outbox: [budgetOperation(inactive)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(result.report.status).toBe('synced');
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.data.budgets).toEqual([inactive]);
+  });
+
+  it('keeps a same-clock divergent inactive budget pending for explicit conflict review', async () => {
+    const localBudget: Budget = {
+      id: 'budget-divergent-archive', ownerId: 'user-a', version: 3,
+      updatedAt: NOW, lastOperationId: 'shared-archive-clock',
+      scope: 'overall', period: 'monthly', amount: 8_000, isActive: false,
+    };
+    const remoteBudget: Budget = { ...localBudget, amount: 5_000 };
+    const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [localBudget] },
+      outbox: [budgetOperation(localBudget)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(result.report.status).toBe('partial');
+    expect(result.state.data.budgets).toEqual([localBudget]);
+    expect(result.state.outbox).toEqual([
+      expect.objectContaining({
+        id: localBudget.lastOperationId,
+        lastError: expect.stringContaining('same-clock payload conflict'),
+      }),
+    ]);
+    expect(result.report.conflicts).toEqual([
+      expect.objectContaining({ winner: 'unresolved', reason: 'payload' }),
+    ]);
+  });
+
+  it('accepts an inactive remote budget only when its conflict clock wins', async () => {
+    const localBudget: Budget = {
+      id: 'budget-remote-winner', ownerId: 'user-a', version: 3,
+      updatedAt: NOW, lastOperationId: 'local-archive',
+      scope: 'overall', period: 'monthly', amount: 8_000, isActive: false,
+    };
+    const remoteBudget: Budget = {
+      ...localBudget,
+      version: 4,
+      lastOperationId: 'remote-newer-archive',
+      amount: 5_000,
+    };
+    const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [localBudget] },
+      outbox: [budgetOperation(localBudget)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.data.budgets).toEqual([remoteBudget]);
+  });
+
   it('keeps a same-clock divergent payload pending as a visible unresolved conflict', async () => {
     const local = {
       ...account('wallet', 'user-a', 3, 'op-same-clock'),

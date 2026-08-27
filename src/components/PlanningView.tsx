@@ -33,6 +33,10 @@ import {
 } from "../app/state";
 import { activeOperationId } from "../domain/syncEngine";
 import {
+  assertFreshEditorSnapshot,
+  isEditorSnapshotStale,
+} from "../domain/staleEditor";
+import {
   localDate,
   money,
   parseRequiredNumberInput,
@@ -63,14 +67,16 @@ export interface SavingsGoalEditDraft {
 }
 
 export function buildEditedSavingsGoal(
-  goal: SavingsGoal,
+  opened: SavingsGoal,
+  current: SavingsGoal | undefined,
   draft: SavingsGoalEditDraft,
   now = new Date(),
   operationId: string = crypto.randomUUID(),
 ): SavingsGoal {
+  assertFreshEditorSnapshot(opened, current, "此儲蓄目標");
   const edited: SavingsGoal = {
-    ...goal,
-    version: goal.version + 1,
+    ...current,
+    version: current.version + 1,
     updatedAt: now.toISOString(),
     lastOperationId: activeOperationId(operationId),
     name: draft.name.trim(),
@@ -78,6 +84,41 @@ export function buildEditedSavingsGoal(
   };
   if (draft.targetDate) edited.targetDate = draft.targetDate;
   else delete edited.targetDate;
+  return edited;
+}
+
+export interface BudgetEditDraft {
+  scope: Budget["scope"];
+  period: Budget["period"];
+  amount: number;
+  categoryId?: string;
+  categoryName?: string;
+}
+
+export function buildEditedBudget(
+  opened: Budget,
+  current: Budget | undefined,
+  draft: BudgetEditDraft,
+  now = new Date(),
+  operationId: string = crypto.randomUUID(),
+): Budget {
+  assertFreshEditorSnapshot(opened, current, "此預算", { requireActive: true });
+  const edited: Budget = {
+    ...current,
+    version: current.version + 1,
+    updatedAt: now.toISOString(),
+    lastOperationId: activeOperationId(operationId),
+    scope: draft.scope,
+    period: draft.period,
+    amount: draft.amount,
+  };
+  if (draft.scope === "category" && draft.categoryId && draft.categoryName) {
+    edited.categoryId = draft.categoryId;
+    edited.categoryName = draft.categoryName;
+  } else {
+    delete edited.categoryId;
+    delete edited.categoryName;
+  }
   return edited;
 }
 
@@ -150,7 +191,8 @@ function SavingsPanel({
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
   const [targetDate, setTargetDate] = useState("");
-  const [editingGoalId, setEditingGoalId] = useState("");
+  const [editingGoalSnapshot, setEditingGoalSnapshot] = useState<SavingsGoal | null>(null);
+  const editingGoalId = editingGoalSnapshot?.id ?? "";
   const [goalId, setGoalId] = useState("");
   const [allocation, setAllocation] = useState("");
   const [message, setMessage] = useState("");
@@ -173,11 +215,11 @@ function SavingsPanel({
     setName("");
     setTarget("");
     setTargetDate("");
-    setEditingGoalId("");
+    setEditingGoalSnapshot(null);
   };
 
   const startGoalEdit = (goal: SavingsGoal) => {
-    setEditingGoalId(goal.id);
+    setEditingGoalSnapshot({ ...goal });
     setName(goal.name);
     setTarget(String(goal.targetAmount));
     setTargetDate(goal.targetDate ?? "");
@@ -191,13 +233,17 @@ function SavingsPanel({
       return setMessage(
         "請輸入目標名稱與大於 0、最多兩位小數且可安全精確處理的金額",
       );
-    const editingGoal = editingGoalId
-      ? visibleGoals.find((goal) => goal.id === editingGoalId)
+    const editingGoal = editingGoalSnapshot
+      ? data.goals.find((goal) => goal.id === editingGoalSnapshot.id)
       : undefined;
-    if (editingGoalId && !editingGoal)
-      return setMessage("找不到要編輯的目標；資料未變更");
-    const record = editingGoal
-      ? buildEditedSavingsGoal(editingGoal, {
+    if (editingGoalSnapshot && isEditorSnapshotStale(
+      editingGoalSnapshot,
+      editingGoal,
+    )) return setMessage(
+      "此儲蓄目標已在其他裝置或背景更新、封存或刪除；資料未變更，請取消後重新開啟編輯",
+    );
+    const record = editingGoalSnapshot
+      ? buildEditedSavingsGoal(editingGoalSnapshot, editingGoal, {
           name,
           targetAmount: amount,
           targetDate: targetDate || undefined,
@@ -214,7 +260,7 @@ function SavingsPanel({
       applied,
       () => {
         resetGoalForm();
-        setMessage(editingGoal ? "目標已更新；既有配置紀錄保持不變" : "目標已建立");
+        setMessage(editingGoalSnapshot ? "目標已更新；既有配置紀錄保持不變" : "目標已建立");
       },
       setMessage,
     );
@@ -543,7 +589,8 @@ export function BudgetPanel({
   const [categoryId, setCategoryId] = useState("");
   const [period, setPeriod] = useState<"weekly" | "monthly">("monthly");
   const [amount, setAmount] = useState("");
-  const [editingBudgetId, setEditingBudgetId] = useState("");
+  const [editingBudgetSnapshot, setEditingBudgetSnapshot] = useState<Budget | null>(null);
+  const editingBudgetId = editingBudgetSnapshot?.id ?? "";
   const [message, setMessage] = useState("");
   const categories = sortByDisplayOrder(
     data.categories.filter(
@@ -552,11 +599,11 @@ export function BudgetPanel({
   );
   const visibleBudgets = data.budgets.filter((item) => !item.deletedAt);
   const archivedBudgets = visibleBudgets.filter((item) => !item.isActive);
-  const editingBudget = editingBudgetId
-    ? visibleBudgets.find((item) => item.id === editingBudgetId)
+  const editingBudget = editingBudgetSnapshot
+    ? data.budgets.find((item) => item.id === editingBudgetSnapshot.id)
     : undefined;
-  const editingCategory = editingBudget?.scope === "category"
-    ? data.categories.find((item) => item.id === editingBudget.categoryId)
+  const editingCategory = editingBudgetSnapshot?.scope === "category"
+    ? data.categories.find((item) => item.id === editingBudgetSnapshot.categoryId)
     : undefined;
   const categoryOptions = editingCategory && !categories.some((item) => item.id === editingCategory.id)
     ? [editingCategory, ...categories]
@@ -580,11 +627,11 @@ export function BudgetPanel({
     setCategoryId("");
     setPeriod("monthly");
     setAmount("");
-    setEditingBudgetId("");
+    setEditingBudgetSnapshot(null);
   };
 
   const startBudgetEdit = (budget: Budget) => {
-    setEditingBudgetId(budget.id);
+    setEditingBudgetSnapshot({ ...budget });
     setScope(budget.scope);
     setCategoryId(budget.categoryId ?? "");
     setPeriod(budget.period);
@@ -604,19 +651,21 @@ export function BudgetPanel({
       return setMessage(
         "請輸入大於 0、最多兩位小數且可安全精確處理的預算並選擇分類",
       );
-    if (editingBudgetId && !editingBudget)
-      return setMessage("找不到要編輯的預算；資料未變更");
-    const record: Budget = editingBudget
-      ? {
-          ...editingBudget,
-          ...changedRecordMeta(editingBudget),
+    if (editingBudgetSnapshot && isEditorSnapshotStale(
+      editingBudgetSnapshot,
+      editingBudget,
+      { requireActive: true },
+    )) return setMessage(
+      "此預算已在其他裝置或背景更新、封存或刪除；資料未變更，請取消後重新開啟編輯",
+    );
+    const record: Budget = editingBudgetSnapshot
+      ? buildEditedBudget(editingBudgetSnapshot, editingBudget, {
           scope,
           period,
           amount: limit,
-          ...(scope === "category" && category
-            ? { categoryId: category.id, categoryName: category.name }
-            : {}),
-        }
+          categoryId: category?.id,
+          categoryName: category?.name,
+        })
       : {
           ...newRecordMeta(ownerId),
           id: budgetSemanticId(ownerId, scope, period, category?.id),
@@ -629,7 +678,7 @@ export function BudgetPanel({
             : {}),
         };
     const normalized = normalizeBudgetScope(record);
-    const semanticMatch = !editingBudget && findBudgetCreationCollision(data.budgets, normalized);
+    const semanticMatch = !editingBudgetSnapshot && findBudgetCreationCollision(data.budgets, normalized);
     if (semanticMatch) {
       return setMessage(semanticMatch.deletedAt
         ? `相同範圍與週期已有同步刪除紀錄；為避免舊資料復活，未建立新預算`
@@ -644,7 +693,7 @@ export function BudgetPanel({
       applied,
       () => {
         resetBudgetForm();
-        setMessage(editingBudget ? "預算已更新" : "預算已建立");
+        setMessage(editingBudgetSnapshot ? "預算已更新" : "預算已建立");
       },
       setMessage,
     );

@@ -24,6 +24,10 @@ import { completeAppliedMutation } from "../app/mutationResult";
 import { isFinancialTransaction } from "../domain/tutorialRecord";
 import { FinanceIcon, IconPicker } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
+import {
+  assertFreshEditorSnapshot,
+  isEditorSnapshotStale,
+} from "../domain/staleEditor";
 
 interface AssetsViewProps {
   data: FinanceData;
@@ -117,6 +121,34 @@ export function calculateBalanceAdjustmentDelta(
   actualBalance: number,
 ): number {
   return subtractMoney(actualBalance, currentBalance);
+}
+
+export function isAccountEditable(account: AssetAccount): boolean {
+  return account.isActive && !account.deletedAt;
+}
+
+export interface AccountEditDraft {
+  name: string;
+  icon: AssetAccount["icon"];
+  includeInTotalAssets: boolean;
+}
+
+export function buildEditedAccount(
+  opened: AssetAccount,
+  current: AssetAccount | undefined,
+  draft: AccountEditDraft,
+  now = new Date(),
+): AssetAccount {
+  assertFreshEditorSnapshot(opened, current, "此帳戶", { requireActive: true });
+  return {
+    ...current,
+    ...changedRecordMeta(current, now),
+    name: draft.name.trim(),
+    openingBalance: current.openingBalance,
+    icon: draft.icon,
+    includeInTotalAssets: draft.includeInTotalAssets,
+    requiresReview: false,
+  };
 }
 
 export function AssetsView({
@@ -219,19 +251,24 @@ export function AssetsView({
   };
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const amount = resolveAccountOpeningBalance(editing, opening);
+    const currentAccount = editing
+      ? data.accounts.find((account) => account.id === editing.id)
+      : undefined;
+    if (editing && isEditorSnapshotStale(editing, currentAccount, { requireActive: true })) {
+      setMessage(
+        "此帳戶已在其他裝置或背景更新、封存或刪除；資料未變更，請關閉後重新開啟編輯",
+      );
+      return;
+    }
+    const amount = resolveAccountOpeningBalance(currentAccount ?? editing, opening);
     if (!name.trim() || amount === null)
       return setMessage("請輸入帳戶名稱與有效的起始金額");
     const record: AssetAccount = editing
-      ? {
-          ...editing,
-          ...changedRecordMeta(editing),
+      ? buildEditedAccount(editing, currentAccount, {
           name: name.trim(),
-          openingBalance: amount,
           icon,
           includeInTotalAssets: included,
-          requiresReview: false,
-        }
+        })
       : {
           ...newRecordMeta(ownerId),
           name: name.trim(),
@@ -381,10 +418,12 @@ export function AssetsView({
                 {expandedId === account.id && (
                   <div className="asset-detail">
                     <div className="asset-detail-actions">
-                      <button type="button" onClick={() => openEdit(account)}>
-                        <Pencil className="h-4 w-4" />
-                        編輯帳戶
-                      </button>
+                      {isAccountEditable(account) && (
+                        <button type="button" onClick={() => openEdit(account)}>
+                          <Pencil className="h-4 w-4" />
+                          編輯帳戶
+                        </button>
+                      )}
                       {account.isActive && (
                         <button
                           type="button"

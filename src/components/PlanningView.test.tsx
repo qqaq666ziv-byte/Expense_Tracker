@@ -1,7 +1,12 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../app/state';
-import { BudgetPanel, buildEditedSavingsGoal, PlanningView } from './PlanningView';
+import {
+  BudgetPanel,
+  buildEditedBudget,
+  buildEditedSavingsGoal,
+  PlanningView,
+} from './PlanningView';
 
 describe('PlanningView goal lifecycle', () => {
   it('edits the goal record without changing its allocation history', () => {
@@ -19,7 +24,7 @@ describe('PlanningView goal lifecycle', () => {
     }];
     const allocationsBefore = structuredClone(state.data.allocations);
 
-    state.data.goals[0] = buildEditedSavingsGoal(goal, {
+    state.data.goals[0] = buildEditedSavingsGoal(goal, goal, {
       name: '日本旅行',
       targetAmount: 8_000,
       targetDate: undefined,
@@ -32,6 +37,47 @@ describe('PlanningView goal lifecycle', () => {
     });
     expect(state.data.goals[0].targetDate).toBeUndefined();
     expect(state.data.allocations).toEqual(allocationsBefore);
+  });
+
+  it('rejects a stale goal editor without overwriting the N+1 record', () => {
+    const opened = {
+      id: 'goal-trip', ownerId: 'guest', version: 2,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'goal-opened',
+      name: '旅行基金', targetAmount: 5_000, isActive: true,
+    };
+    const current = {
+      ...opened,
+      version: 3,
+      lastOperationId: 'goal-background-update',
+      name: '雲端旅行基金',
+    };
+    const before = structuredClone(current);
+
+    expect(() => buildEditedSavingsGoal(opened, current, {
+      name: '舊表單名稱',
+      targetAmount: 8_000,
+    })).toThrow(/背景更新/);
+    expect(current).toEqual(before);
+  });
+
+  it('allows editing a goal that was already archived when the editor opened', () => {
+    const archived = {
+      id: 'goal-archived', ownerId: 'guest', version: 3,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'goal-archive',
+      name: '舊名稱', targetAmount: 5_000, isActive: false,
+    };
+
+    const edited = buildEditedSavingsGoal(archived, archived, {
+      name: '封存後整理名稱',
+      targetAmount: 6_000,
+    }, new Date('2026-08-27T02:00:00.000Z'), 'archived-goal-edit');
+
+    expect(edited).toMatchObject({
+      name: '封存後整理名稱',
+      targetAmount: 6_000,
+      isActive: false,
+      version: 4,
+    });
   });
 });
 
@@ -176,5 +222,27 @@ describe('PlanningView budget lifecycle', () => {
     expect(html).toContain('編輯總預算');
     expect(html).toContain('已封存預算');
     expect(html).toContain('重新啟用餐飲預算');
+  });
+
+  it('rejects a stale budget editor without overwriting the N+1 record', () => {
+    const opened = {
+      id: 'budget-monthly', ownerId: 'guest', version: 4,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'budget-opened',
+      scope: 'overall' as const, period: 'monthly' as const, amount: 12_000, isActive: true,
+    };
+    const current = {
+      ...opened,
+      version: 5,
+      lastOperationId: 'budget-background-update',
+      amount: 15_000,
+    };
+    const before = structuredClone(current);
+
+    expect(() => buildEditedBudget(opened, current, {
+      scope: 'overall',
+      period: 'monthly',
+      amount: 9_000,
+    })).toThrow(/背景更新/);
+    expect(current).toEqual(before);
   });
 });

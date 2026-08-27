@@ -1,0 +1,34 @@
+import type { SyncRecord } from './model';
+
+type EditableSyncRecord = SyncRecord & { isActive?: boolean };
+
+export interface EditorSnapshotOptions {
+  requireActive?: boolean;
+}
+
+/**
+ * Compare the immutable snapshot captured when an editor opened with the latest
+ * record from FinanceData. Missing, deleted, archived, or changed records fail
+ * closed so a stale form cannot manufacture a new conflict-clock winner.
+ */
+export function isEditorSnapshotStale<T extends EditableSyncRecord>(
+  opened: T,
+  current: T | undefined,
+  options: EditorSnapshotOptions = {},
+): boolean {
+  if (!current || current.id !== opened.id || current.deletedAt) return true;
+  if (options.requireActive && current.isActive !== true) return true;
+  return current.version !== opened.version
+    || current.lastOperationId !== opened.lastOperationId;
+}
+
+export function assertFreshEditorSnapshot<T extends EditableSyncRecord>(
+  opened: T,
+  current: T | undefined,
+  label: string,
+  options: EditorSnapshotOptions = {},
+): asserts current is T {
+  if (isEditorSnapshotStale(opened, current, options)) {
+    throw new Error(`${label}已在背景更新、封存或刪除；資料未變更，請重新開啟編輯`);
+  }
+}

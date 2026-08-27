@@ -849,6 +849,25 @@ export async function syncFinanceState(
         if (!candidate.isActive) {
           const sameRemoteRecord = remoteBudgets.find((budget) => budget.id === candidate.id);
           if (!sameRemoteRecord) continue;
+          const candidateComparison = compareSyncRecords(candidate, sameRemoteRecord);
+          if (candidateComparison > 0) {
+            // The queued inactive edit owns the newer clock. Send its complete
+            // payload instead of replacing it merely because both sides happen
+            // to be inactive.
+            continue;
+          }
+          if (candidateComparison === 0) {
+            const differingFields = differingSyncRecordFields(
+              'budgets',
+              candidate,
+              sameRemoteRecord,
+            );
+            if (differingFields.length > 0) {
+              // Same-clock payload divergence must remain pending for the
+              // ordinary reconciliation path to expose as unresolved.
+              continue;
+            }
+          }
           const timestamp = now();
           if (!sameRemoteRecord.isActive) {
             const exact: PendingOperation = {

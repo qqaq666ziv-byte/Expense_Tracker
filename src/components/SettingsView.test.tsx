@@ -128,6 +128,9 @@ describe('SettingsView recurring safety', () => {
     expect(includeCurrentInactiveOption([], account)).toEqual([account]);
     expect(getRecurringResumeBlock(state.data, rule)).toMatch(/先重新啟用/);
     expect(isRecurringEditStale(rule, { ...rule, version: 3, lastOperationId: 'newer-rule-op' })).toBe(true);
+    expect(isRecurringEditStale(rule, { ...rule })).toBe(false);
+    expect(isRecurringEditStale(rule, { ...rule, deletedAt: '2026-08-27T02:00:00.000Z' })).toBe(true);
+    expect(isRecurringEditStale(rule, undefined)).toBe(true);
   });
 
   it('shows an explicit recurring-rule edit action', () => {

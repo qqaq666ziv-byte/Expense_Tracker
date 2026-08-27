@@ -17,6 +17,7 @@ import type {
   IconRef,
   RecurringRule,
 } from "../domain/model";
+import { isEditorSnapshotStale } from "../domain/staleEditor";
 import {
   BackupSizeLimitError,
   exportFinanceBackup,
@@ -357,9 +358,11 @@ export function getRecurringResumeBlock(
     : "分類或帳戶目前已封存；請先重新啟用後再恢復週期規則";
 }
 
-export function isRecurringEditStale(opened: RecurringRule, current: RecurringRule): boolean {
-  return opened.version !== current.version
-    || opened.lastOperationId !== current.lastOperationId;
+export function isRecurringEditStale(
+  opened: RecurringRule,
+  current: RecurringRule | undefined,
+): boolean {
+  return isEditorSnapshotStale(opened, current);
 }
 
 export function RecurringPanel({
