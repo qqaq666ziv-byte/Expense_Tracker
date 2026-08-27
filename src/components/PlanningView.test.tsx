@@ -6,6 +6,7 @@ import {
   buildEditedBudget,
   buildEditedSavingsGoal,
   PlanningView,
+  resolveBudgetCategoryId,
   selectableBudgetCategories,
 } from './PlanningView';
 
@@ -282,6 +283,9 @@ describe('PlanningView budget lifecycle', () => {
 
     expect(selectable.some((category) => category.id === locked.id)).toBe(false);
     expect(selectable.length).toBe(expenseCategories.length - 1);
+    expect(resolveBudgetCategoryId(locked.id, selectable)).toBe('');
+    expect(resolveBudgetCategoryId('', selectable)).toBe('');
+    expect(resolveBudgetCategoryId(selectable[0].id, selectable)).toBe(selectable[0].id);
   });
 
   it('shows explicit edit actions and keeps archived budgets available for restore', () => {

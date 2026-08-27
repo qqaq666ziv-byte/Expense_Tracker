@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import type {
   Budget,
+  Category,
   FinanceData,
   RecurringRule,
   SavingsAllocation,
@@ -107,6 +108,16 @@ export function selectableBudgetCategories(
     && !item.deletedAt
     && !mutationLockedRecordKeys.has(syncRecordKey("categories", item.id))
   )));
+}
+
+export function resolveBudgetCategoryId(
+  requestedCategoryId: string,
+  categoryOptions: readonly Category[],
+): string {
+  if (!requestedCategoryId) return "";
+  return categoryOptions.some((item) => item.id === requestedCategoryId)
+    ? requestedCategoryId
+    : "";
 }
 
 export function buildEditedBudget(
@@ -678,12 +689,10 @@ export function BudgetPanel({
   const categoryOptions = editingCategory && !categories.some((item) => item.id === editingCategory.id)
     ? [editingCategory, ...categories]
     : categories;
-  const resolvedCategoryId = categoryOptions.some((item) => item.id === categoryId)
-    ? categoryId
-    : (categoryOptions[0]?.id ?? "");
+  const resolvedCategoryId = resolveBudgetCategoryId(categoryId, categoryOptions);
   const selectedCategoryLocked = scope === "category" && Boolean(
-    resolvedCategoryId
-    && unresolvedSyncRecordKeys.has(syncRecordKey("categories", resolvedCategoryId)),
+    categoryId
+    && unresolvedSyncRecordKeys.has(syncRecordKey("categories", categoryId)),
   );
   const usages = useMemo(
     () => calculateBudgetUsage(data, reference),
@@ -863,6 +872,7 @@ export function BudgetPanel({
                 value={resolvedCategoryId}
                 onChange={(event) => setCategoryId(event.target.value)}
               >
+                <option value="" disabled>請選擇支出分類</option>
                 {categoryOptions.map((category) => (
                   <option
                     key={category.id}
