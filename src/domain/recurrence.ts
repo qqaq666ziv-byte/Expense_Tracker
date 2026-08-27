@@ -139,6 +139,39 @@ export function getNextOccurrenceDate(rule: RecurringRule, afterDate: string): s
   }));
 }
 
+/**
+ * Editing a schedule is forward-only. Already generated occurrences, including
+ * tombstones, remain processed history and the edited cursor starts after the
+ * latest one. Non-schedule edits preserve the existing cursor byte-for-byte.
+ */
+export function getRecurringEditCursor(
+  current: RecurringRule,
+  edited: RecurringRule,
+  transactions: readonly Transaction[],
+): string {
+  const scheduleChanged = current.frequency !== edited.frequency
+    || current.startDate !== edited.startDate
+    || current.anchorDay !== edited.anchorDay;
+  if (!scheduleChanged) return current.nextOccurrenceDate;
+
+  const latestProcessedDate = transactions
+    .filter((transaction) => (
+      transaction.ownerId === current.ownerId
+      && transaction.recurringRuleId === current.id
+      && transaction.occurrenceDate
+    ))
+    .map((transaction) => transaction.occurrenceDate!)
+    .sort()
+    .at(-1);
+  const historicalLowerBound = latestProcessedDate
+    ? getNextOccurrenceDate(edited, latestProcessedDate)
+    : edited.startDate;
+  const committedLowerBound = current.nextOccurrenceDate > historicalLowerBound
+    ? current.nextOccurrenceDate
+    : historicalLowerBound;
+  return firstOccurrenceOnOrAfter(edited, committedLowerBound);
+}
+
 function occurrenceId(ruleId: string, occurrenceDate: string): string {
   return `rec-${ruleId}-${occurrenceDate}`;
 }

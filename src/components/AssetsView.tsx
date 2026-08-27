@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { Archive, ChevronDown, Pencil, Plus, Scale, X } from "lucide-react";
 import type {
   AssetAccount,
@@ -42,6 +42,83 @@ const COLORS = [
   "#db2777",
 ];
 
+function trapDialogFocus(event: KeyboardEvent<HTMLElement>, close: () => void) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    close();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = Array.from<HTMLElement>(event.currentTarget.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
+  ));
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable.at(-1)!;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+interface AccountOpeningBalanceFieldProps {
+  editing: AssetAccount | null;
+  opening: string;
+  onOpeningChange(value: string): void;
+}
+
+/** Existing opening balances are historical inputs; corrections use adjustments. */
+export function AccountOpeningBalanceField({
+  editing,
+  opening,
+  onOpeningChange,
+}: AccountOpeningBalanceFieldProps) {
+  return (
+    <label className="field-label">
+      {editing ? "期初餘額" : "目前金額"}
+      {editing && (
+        <small>
+          期初餘額建立後不會改寫；若帳面金額不同，請從帳戶明細使用「調整餘額」。
+        </small>
+      )}
+      {editing ? (
+        <input
+          aria-label="期初餘額"
+          className="field mt-1"
+          readOnly
+          value={String(editing.openingBalance)}
+        />
+      ) : (
+        <MoneyInput
+          aria-label="期初餘額"
+          className="field mt-1"
+          value={opening}
+          allowDecimal
+          allowNegative
+          onValueChange={onOpeningChange}
+        />
+      )}
+    </label>
+  );
+}
+
+export function resolveAccountOpeningBalance(
+  editing: AssetAccount | null,
+  opening: string,
+): number | null {
+  return editing?.openingBalance ?? parseRequiredNumberInput(opening);
+}
+
+export function calculateBalanceAdjustmentDelta(
+  currentBalance: number,
+  actualBalance: number,
+): number {
+  return subtractMoney(actualBalance, currentBalance);
+}
+
 export function AssetsView({
   data,
   ownerId,
@@ -80,12 +157,30 @@ export function AssetsView({
     value: "💵",
   });
   const [message, setMessage] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
   const [expandedId, setExpandedId] = useState<string>();
   const [adjusting, setAdjusting] = useState<AssetAccount | null>(null);
   const [actualBalance, setActualBalance] = useState("");
   const [reason, setReason] = useState("盤點調整");
+  const accountTriggerRef = useRef<HTMLElement | null>(null);
+  const adjustmentTriggerRef = useRef<HTMLElement | null>(null);
+
+  const captureTrigger = (target: { current: HTMLElement | null }) => {
+    target.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  };
+  const closeAccountForm = () => {
+    setShowForm(false);
+    requestAnimationFrame(() => accountTriggerRef.current?.focus());
+  };
+  const closeAdjustment = () => {
+    setAdjusting(null);
+    requestAnimationFrame(() => adjustmentTriggerRef.current?.focus());
+  };
 
   const openNew = () => {
+    captureTrigger(accountTriggerRef);
     setEditing(null);
     setName("");
     setOpening("0");
@@ -96,6 +191,7 @@ export function AssetsView({
     setShowForm(true);
   };
   const openEdit = (account: AssetAccount) => {
+    captureTrigger(accountTriggerRef);
     setEditing(account);
     setName(account.name);
     setOpening(String(account.openingBalance));
@@ -104,6 +200,12 @@ export function AssetsView({
     setIcon(account.icon);
     setMessage("");
     setShowForm(true);
+  };
+  const openAdjustment = (account: AssetAccount, balance: number) => {
+    captureTrigger(adjustmentTriggerRef);
+    setAdjusting(account);
+    setActualBalance(String(balance));
+    setMessage("");
   };
   const selectPreset = (next: AccountKind) => {
     const preset = ACCOUNT_PRESETS.find((item) => item.kind === next)!;
@@ -117,7 +219,7 @@ export function AssetsView({
   };
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const amount = parseRequiredNumberInput(opening);
+    const amount = resolveAccountOpeningBalance(editing, opening);
     if (!name.trim() || amount === null)
       return setMessage("請輸入帳戶名稱與有效的起始金額");
     const record: AssetAccount = editing
@@ -142,8 +244,9 @@ export function AssetsView({
     completeAppliedMutation(
       putAccount(record),
       () => {
-        setShowForm(false);
+        closeAccountForm();
         setMessage("");
+        setStatusMessage(editing ? "帳戶已更新；餘額與調整紀錄保持不變" : "帳戶已建立");
       },
       setMessage,
     );
@@ -152,11 +255,11 @@ export function AssetsView({
     event.preventDefault();
     if (!adjusting) return;
     const balance =
-      visibleBalances.find((item) => item.accountId === adjusting.id)
+      financials.accountBalances.find((item) => item.accountId === adjusting.id)
         ?.balance ?? 0;
     const target = parseRequiredNumberInput(actualBalance);
     if (target === null) return setMessage("請輸入有效的實際餘額");
-    const delta = subtractMoney(target, balance);
+    const delta = calculateBalanceAdjustmentDelta(balance, target);
     if (delta === 0) return setMessage("實際餘額與目前餘額相同");
     completeAppliedMutation(
       putAdjustment({
@@ -167,9 +270,10 @@ export function AssetsView({
         reason: reason.trim() || "盤點調整",
       }),
       () => {
-        setAdjusting(null);
+        closeAdjustment();
         setActualBalance("");
-        setMessage("餘額已調整");
+        setMessage("");
+        setStatusMessage("餘額已調整");
       },
       setMessage,
     );
@@ -188,6 +292,7 @@ export function AssetsView({
           新增帳戶
         </button>
       </header>
+      {statusMessage && <p aria-live="polite" className="sr-only">{statusMessage}</p>}
 
       <section className="asset-overview" aria-labelledby="asset-total-title">
         <div>
@@ -283,10 +388,7 @@ export function AssetsView({
                       {account.isActive && (
                         <button
                           type="button"
-                          onClick={() => {
-                            setAdjusting(account);
-                            setActualBalance(String(balance));
-                          }}
+                          onClick={() => openAdjustment(account, balance)}
                         >
                           <Scale className="h-4 w-4" />
                           調整餘額
@@ -352,12 +454,13 @@ export function AssetsView({
             role="dialog"
             aria-modal="true"
             aria-labelledby="account-form-title"
+            onKeyDown={(event) => trapDialogFocus(event, closeAccountForm)}
           >
             <button
               className="sheet-close"
               type="button"
               aria-label="關閉"
-              onClick={() => setShowForm(false)}
+              onClick={closeAccountForm}
             >
               <X />
             </button>
@@ -389,26 +492,18 @@ export function AssetsView({
               <label className="field-label">
                 帳戶名稱
                 <input
+                  autoFocus
                   aria-label="帳戶名稱"
                   className="field mt-1"
                   value={name}
                   onChange={(event) => setName(event.target.value)}
                 />
               </label>
-              <label className="field-label">
-                目前金額
-                {editing && (
-                  <small>若只是盤點後不同，請從帳戶明細使用「調整餘額」</small>
-                )}
-                <MoneyInput
-                  aria-label="期初餘額"
-                  className="field mt-1"
-                  value={opening}
-                  allowDecimal
-                  allowNegative
-                  onValueChange={setOpening}
-                />
-              </label>
+              <AccountOpeningBalanceField
+                editing={editing}
+                opening={opening}
+                onOpeningChange={setOpening}
+              />
               <label className="friendly-check">
                 <input
                   aria-label="納入總資產"
@@ -428,7 +523,7 @@ export function AssetsView({
                 </summary>
                 <IconPicker value={icon} onChange={setIcon} />
               </details>
-              {message && <p className="error-message">{message}</p>}
+              {message && <p aria-live="polite" className="error-message">{message}</p>}
               <button className="primary-button w-full" type="submit">
                 儲存帳戶
               </button>
@@ -444,12 +539,13 @@ export function AssetsView({
             role="dialog"
             aria-modal="true"
             aria-labelledby="adjust-title"
+            onKeyDown={(event) => trapDialogFocus(event, closeAdjustment)}
           >
             <button
               className="sheet-close"
               type="button"
               aria-label="關閉"
-              onClick={() => setAdjusting(null)}
+              onClick={closeAdjustment}
             >
               <X />
             </button>
@@ -479,7 +575,7 @@ export function AssetsView({
                   onChange={(event) => setReason(event.target.value)}
                 />
               </label>
-              {message && <p className="error-message">{message}</p>}
+              {message && <p aria-live="polite" className="error-message">{message}</p>}
               <button className="primary-button w-full" type="submit">
                 確認調整
               </button>

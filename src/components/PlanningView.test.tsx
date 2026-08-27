@@ -1,7 +1,39 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../app/state';
-import { PlanningView } from './PlanningView';
+import { BudgetPanel, buildEditedSavingsGoal, PlanningView } from './PlanningView';
+
+describe('PlanningView goal lifecycle', () => {
+  it('edits the goal record without changing its allocation history', () => {
+    const state = createInitialState('guest');
+    const goal = {
+      id: 'goal-trip', ownerId: 'guest', version: 2,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'goal-create',
+      name: '旅行基金', targetAmount: 5_000, targetDate: '2026-12-31', isActive: true,
+    } as const;
+    state.data.goals = [goal];
+    state.data.allocations = [{
+      id: 'allocation-trip', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-21T11:00:00.000Z', lastOperationId: 'allocation-create',
+      goalId: goal.id, amountDelta: 800, occurredAt: '2026-08-21 11:00',
+    }];
+    const allocationsBefore = structuredClone(state.data.allocations);
+
+    state.data.goals[0] = buildEditedSavingsGoal(goal, {
+      name: '日本旅行',
+      targetAmount: 8_000,
+      targetDate: undefined,
+    }, new Date('2026-08-22T00:00:00.000Z'), 'goal-edit');
+
+    expect(state.data.goals[0]).toMatchObject({
+      id: 'goal-trip', ownerId: 'guest', version: 3,
+      lastOperationId: '00000000-0000-0000-0000-000000000000:active:goal-edit',
+      name: '日本旅行', targetAmount: 8_000, isActive: true,
+    });
+    expect(state.data.goals[0].targetDate).toBeUndefined();
+    expect(state.data.allocations).toEqual(allocationsBefore);
+  });
+});
 
 describe('PlanningView archived allocations', () => {
   it('keeps an archived funded goal visible with auditable release and restore actions', () => {
@@ -38,6 +70,7 @@ describe('PlanningView archived allocations', () => {
 
     expect(html).toContain('旅行基金');
     expect(html).toContain('已封存');
+    expect(html).toContain('編輯旅行基金');
     expect(html).toContain('釋放旅行基金配置');
     expect(html).toContain('重新啟用旅行基金');
     expect(html).toContain('1 筆已釋放的過去配置仍安全保留');
@@ -107,5 +140,41 @@ describe('PlanningView archived allocations', () => {
 
     expect(html).toContain('離線同步或資產變動');
     expect(html).toContain('釋放部分配置');
+  });
+});
+
+describe('PlanningView budget lifecycle', () => {
+  it('shows explicit edit actions and keeps archived budgets available for restore', () => {
+    const state = createInitialState('guest');
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.budgets = [{
+      id: 'budget-active', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'budget-active-create',
+      scope: 'overall', period: 'monthly', amount: 12_000, isActive: true,
+    }, {
+      id: 'budget-archived', ownerId: 'guest', version: 2,
+      updatedAt: '2026-08-21T11:00:00.000Z', lastOperationId: 'budget-archive',
+      scope: 'category', categoryId: category.id, categoryName: category.name,
+      period: 'weekly', amount: 2_000, isActive: false,
+    }];
+
+    const html = renderToStaticMarkup(
+      <BudgetPanel
+        data={state.data}
+        ownerId="guest"
+        putGoal={() => true}
+        putAllocation={() => true}
+        putBudget={() => true}
+        putRecurring={() => true}
+        deleteRecurring={() => true}
+        archiveGoal={() => true}
+        archiveBudget={() => true}
+        reference={new Date(2026, 7, 21, 12)}
+      />,
+    );
+
+    expect(html).toContain('編輯總預算');
+    expect(html).toContain('已封存預算');
+    expect(html).toContain('重新啟用餐飲預算');
   });
 });

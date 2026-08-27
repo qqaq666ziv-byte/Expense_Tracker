@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type {
   AssetAccount,
+  Budget,
   Category,
   FinanceData,
   PendingOperation,
@@ -10,7 +11,7 @@ import type {
   Transaction,
 } from './model';
 import type { RemoteAdapter, RemoteRecord } from './syncEngine';
-import { enqueueSyncRecord, syncFinanceState } from './syncEngine';
+import { compareSyncRecords, enqueueSyncRecord, syncFinanceState } from './syncEngine';
 
 const NOW = '2026-08-21T10:00:00.000Z';
 
@@ -66,6 +67,17 @@ function allocationOperation(record: SavingsAllocation): PendingOperation {
   return {
     id: record.lastOperationId,
     entity: 'allocations',
+    recordId: record.id,
+    record,
+    attempts: 0,
+    queuedAt: NOW,
+  };
+}
+
+function budgetOperation(record: Budget): PendingOperation {
+  return {
+    id: record.lastOperationId,
+    entity: 'budgets',
     recordId: record.id,
     record,
     attempts: 0,
@@ -138,6 +150,14 @@ class InMemoryRemote implements RemoteAdapter {
 }
 
 describe('offline sync engine', () => {
+  it('keeps an equal-version tombstone ahead of an active edit in either comparison direction', () => {
+    const active = account('wallet', 'user-a', 2, 'ffffffff-ffff-4fff-8fff-ffffffffffff');
+    const tombstone = { ...active, lastOperationId: 'tombstone:aaaa-delete', deletedAt: NOW };
+
+    expect(compareSyncRecords(tombstone, active)).toBeGreaterThan(0);
+    expect(compareSyncRecords(active, tombstone)).toBeLessThan(0);
+  });
+
   it('uses an authenticated legacy cache only as a candidate when the remote row was deleted', async () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const legacyCategory: Category = {
@@ -748,6 +768,307 @@ describe('offline sync engine', () => {
     expect(result.report.conflicts).toEqual([
       expect.objectContaining({ recordId: 'wallet', winner: 'unresolved', reason: 'pending-local' }),
     ]);
+  });
+
+  it('accepts a winning remote tombstone over a pending stale active edit', async () => {
+    const localActive = account('wallet', 'user-a', 3, 'ffffffff-ffff-4fff-8fff-ffffffffffff');
+    const remoteDeleted = {
+      ...localActive,
+      updatedAt: NOW,
+      lastOperationId: '00000000-0000-4000-8000-000000000000',
+      deletedAt: NOW,
+      isActive: false,
+    };
+    const rejectingRemote: RemoteAdapter = {
+      apply: async () => { throw new Error('remote tombstone already won'); },
+      pull: async () => [{ entity: 'accounts', record: remoteDeleted }],
+    };
+
+    const result = await syncFinanceState(
+      state('user-a', [localActive], [operation(localActive)]),
+      'user-a',
+      rejectingRemote,
+      () => NOW,
+    );
+
+    expect(result.state.data.accounts).toEqual([remoteDeleted]);
+    expect(result.state.outbox).toEqual([]);
+    expect(result.report.conflicts).toEqual([
+      expect.objectContaining({ recordId: 'wallet', winner: 'remote' }),
+    ]);
+  });
+
+  it('keeps a legacy UUID tombstone ahead when it arrives between preflight and apply', async () => {
+    const localActive = account(
+      'wallet-race',
+      'user-a',
+      2,
+      '00000000-0000-0000-0000-000000000000:active:ffffffff-ffff-4fff-8fff-ffffffffffff',
+    );
+    const remoteDeleted = {
+      ...localActive,
+      isActive: false,
+      lastOperationId: '00000000-0000-4000-8000-000000000000',
+      deletedAt: NOW,
+    };
+    let pullCount = 0;
+    let remoteRecord: AssetAccount | undefined;
+    const racingRemote: RemoteAdapter = {
+      async pull() {
+        pullCount += 1;
+        return remoteRecord ? [{ entity: 'accounts', record: remoteRecord }] : [];
+      },
+      async apply(_ownerId, pending) {
+        remoteRecord = remoteDeleted;
+        if (compareSyncRecords(pending.record, remoteRecord) > 0) {
+          remoteRecord = pending.record as AssetAccount;
+        }
+      },
+    };
+
+    const result = await syncFinanceState(
+      state('user-a', [localActive], [operation(localActive)]),
+      'user-a',
+      racingRemote,
+      () => NOW,
+    );
+
+    expect(pullCount).toBe(2);
+    expect(remoteRecord).toEqual(remoteDeleted);
+    expect(result.state.data.accounts).toEqual([remoteDeleted]);
+    expect(result.state.outbox).toEqual([]);
+  });
+
+  it('fails closed before applying a budget that conflicts with a remote legacy id', async () => {
+    const remoteBudget: Budget = {
+      id: 'legacy-random-budget-id', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'legacy-budget-create',
+      scope: 'overall', period: 'monthly', amount: 5_000, isActive: true,
+    };
+    const localBudget: Budget = {
+      ...remoteBudget,
+      id: 'deterministic-budget-id',
+      lastOperationId: 'local-budget-create',
+      amount: 6_000,
+    };
+    const applied: PendingOperation[] = [];
+    const remoteBudgets = [remoteBudget];
+    const remote: RemoteAdapter = {
+      async pull() {
+        return remoteBudgets.map((record) => ({ entity: 'budgets' as const, record }));
+      },
+      async apply(_ownerId, pending) {
+        applied.push(pending);
+        remoteBudgets.push(pending.record as Budget);
+      },
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [localBudget] },
+      outbox: [budgetOperation(localBudget)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(applied).toEqual([]);
+    expect(result.report.status).toBe('partial');
+    expect(result.state.outbox).toEqual([
+      expect.objectContaining({
+        recordId: localBudget.id,
+        attempts: 1,
+        lastError: expect.stringContaining('雲端有效預算'),
+        record: expect.objectContaining({ isActive: false }),
+      }),
+    ]);
+    expect(result.state.data.budgets.filter((budget) => budget.isActive)).toEqual([remoteBudget]);
+    expect(result.state.data.budgets.find((budget) => budget.id === localBudget.id)).toMatchObject({
+      amount: localBudget.amount,
+      isActive: false,
+    });
+    expect(result.report.failures).toEqual([
+      expect.objectContaining({ stage: 'apply', recordId: localBudget.id }),
+    ]);
+
+    const retried = await syncFinanceState(result.state, 'user-a', remote, () => NOW);
+    expect(applied).toEqual([
+      expect.objectContaining({ record: expect.objectContaining({ isActive: false }) }),
+    ]);
+    expect(retried.state.outbox).toEqual([]);
+    expect(retried.state.data.budgets.filter((budget) => budget.isActive)).toEqual([remoteBudget]);
+  });
+
+  it('rolls back only its own budget when a legacy semantic conflict arrives after preflight', async () => {
+    const localBudget: Budget = {
+      id: 'deterministic-budget-race', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'local-budget-race-create',
+      scope: 'overall', period: 'monthly', amount: 6_000, isActive: true,
+    };
+    const legacyBudget: Budget = {
+      ...localBudget,
+      id: 'legacy-budget-race',
+      lastOperationId: 'legacy-budget-race-create',
+      amount: 5_000,
+    };
+    const remoteBudgets: Budget[] = [];
+    const applied: PendingOperation[] = [];
+    const remote: RemoteAdapter = {
+      async pull() {
+        return remoteBudgets.map((record) => ({ entity: 'budgets' as const, record }));
+      },
+      async apply(_ownerId, pending) {
+        applied.push(pending);
+        const budget = pending.record as Budget;
+        if (budget.id === localBudget.id && budget.isActive) {
+          remoteBudgets.push(legacyBudget, budget);
+          return;
+        }
+        const index = remoteBudgets.findIndex((record) => record.id === budget.id);
+        if (index >= 0) remoteBudgets[index] = budget;
+        else remoteBudgets.push(budget);
+      },
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [localBudget] },
+      outbox: [budgetOperation(localBudget)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(applied).toHaveLength(2);
+    expect(applied[0]).toMatchObject({ record: expect.objectContaining({ isActive: true }) });
+    expect(applied[1]).toMatchObject({ record: expect.objectContaining({ isActive: false }) });
+    expect(result.report.status).toBe('partial');
+    expect(result.report.failures).toEqual([
+      expect.objectContaining({ stage: 'conflict', recordId: localBudget.id }),
+    ]);
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.data.budgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
+    expect(remoteBudgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
+  });
+
+  it('retains an applied budget until a failed confirmation pull can be retried safely', async () => {
+    const localBudget: Budget = {
+      id: 'deterministic-budget-confirm', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'local-budget-confirm-create',
+      scope: 'overall', period: 'weekly', amount: 1_500, isActive: true,
+    };
+    const legacyBudget: Budget = {
+      ...localBudget,
+      id: 'legacy-budget-confirm',
+      lastOperationId: 'legacy-budget-confirm-create',
+      amount: 1_200,
+    };
+    const remoteBudgets: Budget[] = [];
+    let pullCount = 0;
+    let failConfirmation = true;
+    const remote: RemoteAdapter = {
+      async pull() {
+        pullCount += 1;
+        if (failConfirmation && pullCount === 2) throw new Error('confirmation offline');
+        return remoteBudgets.map((record) => ({ entity: 'budgets' as const, record }));
+      },
+      async apply(_ownerId, pending) {
+        const budget = pending.record as Budget;
+        const index = remoteBudgets.findIndex((record) => record.id === budget.id);
+        if (index >= 0) remoteBudgets[index] = budget;
+        else remoteBudgets.push(budget);
+      },
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [localBudget] },
+      outbox: [budgetOperation(localBudget)],
+    };
+
+    const unconfirmed = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+    expect(unconfirmed.report.status).toBe('partial');
+    expect(unconfirmed.state.outbox).toEqual([
+      expect.objectContaining({
+        id: localBudget.lastOperationId,
+        lastError: expect.stringContaining('尚未完成雲端語義衝突確認'),
+      }),
+    ]);
+
+    failConfirmation = false;
+    remoteBudgets.push(legacyBudget);
+    const deactivated = await syncFinanceState(unconfirmed.state, 'user-a', remote, () => NOW);
+    expect(deactivated.report.status).toBe('partial');
+    expect(deactivated.state.data.budgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
+    expect(deactivated.state.outbox).toEqual([
+      expect.objectContaining({ record: expect.objectContaining({ isActive: false }) }),
+    ]);
+
+    const converged = await syncFinanceState(deactivated.state, 'user-a', remote, () => NOW);
+    expect(converged.state.outbox).toEqual([]);
+    expect(converged.state.data.budgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
+    expect(remoteBudgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
+  });
+
+  it('rebases a failed inactive rollback onto the latest remote budget clock', async () => {
+    const localBudget: Budget = {
+      id: 'deterministic-budget-rebase', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'local-budget-rebase-create',
+      scope: 'overall', period: 'monthly', amount: 6_000, isActive: true,
+    };
+    const legacyBudget: Budget = {
+      ...localBudget,
+      id: 'legacy-budget-rebase',
+      lastOperationId: 'legacy-budget-rebase-create',
+      amount: 5_000,
+    };
+    const remoteBudgets: Budget[] = [];
+    let rejectFirstRollback = true;
+    const remote: RemoteAdapter = {
+      async pull() {
+        return remoteBudgets.map((record) => ({ entity: 'budgets' as const, record }));
+      },
+      async apply(_ownerId, pending) {
+        const budget = pending.record as Budget;
+        const index = remoteBudgets.findIndex((record) => record.id === budget.id);
+        if (budget.id === localBudget.id && budget.isActive && index < 0) {
+          remoteBudgets.push(legacyBudget, budget);
+          return;
+        }
+        if (budget.id === localBudget.id && !budget.isActive && rejectFirstRollback) {
+          rejectFirstRollback = false;
+          remoteBudgets[index] = {
+            ...remoteBudgets[index],
+            version: budget.version,
+            lastOperationId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+            isActive: true,
+          };
+          throw new Error('Supabase retained a different conflict clock');
+        }
+        if (index >= 0) remoteBudgets[index] = budget;
+        else remoteBudgets.push(budget);
+      },
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [localBudget] },
+      outbox: [budgetOperation(localBudget)],
+    };
+
+    const blocked = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+    const staleRollback = blocked.state.outbox[0];
+    expect(staleRollback).toMatchObject({
+      attempts: 1,
+      record: expect.objectContaining({ version: 2, isActive: false }),
+    });
+
+    const converged = await syncFinanceState(blocked.state, 'user-a', remote, () => NOW);
+    expect(converged.state.outbox).toEqual([]);
+    expect(converged.state.data.budgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
+    expect(remoteBudgets.find((budget) => budget.id === localBudget.id)).toMatchObject({
+      version: 3,
+      isActive: false,
+    });
+    expect(remoteBudgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
   });
 
   it('keeps a same-clock divergent payload pending as a visible unresolved conflict', async () => {

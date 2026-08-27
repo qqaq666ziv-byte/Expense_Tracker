@@ -1,16 +1,19 @@
 import type {
   FinanceData,
   FinanceEntityName,
+  AssetAccount,
+  Category,
   OwnerId,
   PendingOperation,
   PersistedFinanceState,
   SavingsAllocation,
   SyncRecord,
 } from '../domain/model';
-import { enqueueSyncRecord } from '../domain/syncEngine';
+import { activeOperationId, enqueueSyncRecord } from '../domain/syncEngine';
 import { migrateLegacyData, stableLegacyId } from '../domain/legacyMigration';
 import { validateFinanceData } from '../domain/backup';
 import { isTutorialTransaction } from '../domain/tutorialRecord';
+import { assertCategoryUpsert, getCategoryActionBlock, type CategoryAction } from '../domain/lifecycle';
 import {
   assertFinanceOwnerRowLimit,
   assertFinanceRecordWithinWriteLimits,
@@ -603,10 +606,7 @@ export function applyRestoredData(
       if (!incomingIds.has(existing.id) && !existing.deletedAt) {
         next = putRecord(next, entity, {
           ...existing,
-          version: existing.version + 1,
-          updatedAt: timestamp,
-          lastOperationId: operationId(),
-          deletedAt: timestamp,
+          ...tombstoneRecordMeta(existing, now, operationId),
           ...('isActive' in existing ? { isActive: false } : {}),
         } as FinanceData[typeof entity][number]);
       }
@@ -619,7 +619,9 @@ export function applyRestoredData(
         ownerId: state.ownerId,
         version: Math.max(existing?.version ?? 0, record.version) + 1,
         updatedAt: timestamp,
-        lastOperationId: operationId(),
+        lastOperationId: record.deletedAt
+          ? `tombstone:${operationId()}`
+          : activeOperationId(operationId()),
       } as FinanceData[typeof entity][number]);
     }
   }
@@ -641,8 +643,143 @@ export function changedRecordMeta<T extends SyncRecord>(record: T, now = new Dat
   return {
     version: record.version + 1,
     updatedAt: now.toISOString(),
-    lastOperationId: crypto.randomUUID(),
+    lastOperationId: record.deletedAt
+      ? `tombstone:${crypto.randomUUID()}`
+      : activeOperationId(),
   };
+}
+
+/** Keep future recurring snapshots aligned while preserving historical transactions. */
+export function putCategoryWithDependents(
+  state: PersistedFinanceState,
+  category: Category,
+  now = new Date(),
+  operationId: () => string = () => crypto.randomUUID(),
+): PersistedFinanceState {
+  assertCategoryUpsert(state.data, category);
+  const timestamp = now.toISOString();
+  const existing = state.data.categories.find((candidate) => candidate.id === category.id);
+  const siblings = state.data.categories
+    .filter((candidate) => (
+      candidate.id !== category.id
+      && candidate.ownerId === category.ownerId
+      && candidate.kind === category.kind
+      && !candidate.deletedAt
+    ))
+    .sort((left, right) => left.sortOrder - right.sortOrder || left.id.localeCompare(right.id));
+  const desiredIndex = Math.max(0, Math.min(category.sortOrder, siblings.length));
+  const ordered = [...siblings];
+  ordered.splice(desiredIndex, 0, category);
+  let next = state;
+  for (const [sortOrder, record] of ordered.entries()) {
+    if (record.id === category.id) {
+      next = putRecord(next, 'categories', { ...category, sortOrder });
+    } else if (record.sortOrder !== sortOrder) {
+      next = putRecord(next, 'categories', {
+        ...record,
+        version: record.version + 1,
+        updatedAt: timestamp,
+        lastOperationId: activeOperationId(operationId()),
+        sortOrder,
+      });
+    }
+  }
+  if (existing && existing.name !== category.name) {
+    for (const rule of state.data.recurringRules.filter((candidate) => (
+      !candidate.deletedAt && candidate.categoryId === category.id
+    ))) {
+      next = putRecord(next, 'recurringRules', {
+        ...rule,
+        version: rule.version + 1,
+        updatedAt: timestamp,
+        lastOperationId: activeOperationId(operationId()),
+        categoryName: category.name,
+      });
+    }
+  }
+  return next;
+}
+
+/** Keep future recurring account snapshots aligned without touching transactions or adjustments. */
+export function putAccountWithDependents(
+  state: PersistedFinanceState,
+  account: AssetAccount,
+  now = new Date(),
+  operationId: () => string = () => crypto.randomUUID(),
+): PersistedFinanceState {
+  const existing = state.data.accounts.find((candidate) => candidate.id === account.id);
+  let next = putRecord(state, 'accounts', account);
+  if (!existing || existing.name === account.name) return next;
+  const timestamp = now.toISOString();
+  for (const rule of state.data.recurringRules.filter((candidate) => (
+    !candidate.deletedAt && candidate.accountId === account.id
+  ))) {
+    next = putRecord(next, 'recurringRules', {
+      ...rule,
+      version: rule.version + 1,
+      updatedAt: timestamp,
+      lastOperationId: activeOperationId(operationId()),
+      accountName: account.name,
+    });
+  }
+  return next;
+}
+
+/**
+ * Tombstones must win an equal-version race against legacy clients whose
+ * operation IDs are UUIDs. The deployed database clock compares the operation
+ * ID lexicographically after version, so keep this prefix stable.
+ */
+export function tombstoneRecordMeta<T extends SyncRecord>(
+  record: T,
+  now = new Date(),
+  operationId: () => string = () => crypto.randomUUID(),
+): Pick<SyncRecord, 'version' | 'updatedAt' | 'lastOperationId' | 'deletedAt'> {
+  const timestamp = now.toISOString();
+  return {
+    version: record.version + 1,
+    updatedAt: timestamp,
+    lastOperationId: `tombstone:${operationId()}`,
+    deletedAt: timestamp,
+  };
+}
+
+/** Apply category lifecycle changes atomically to the local snapshot/outbox. */
+export function applyCategoryLifecycleMutation(
+  state: PersistedFinanceState,
+  categoryId: string,
+  action: CategoryAction,
+  now = new Date(),
+  operationId: () => string = () => crypto.randomUUID(),
+): PersistedFinanceState {
+  const category = state.data.categories.find((candidate) => candidate.id === categoryId);
+  if (!category) throw new Error('找不到分類，本次操作未執行。');
+  const block = getCategoryActionBlock(state.data, category, action);
+  if (block) throw new Error(block.message);
+
+  const timestamp = now.toISOString();
+  const changed = <T extends SyncRecord>(record: T) => ({
+    version: record.version + 1,
+    updatedAt: timestamp,
+    lastOperationId: activeOperationId(operationId()),
+  });
+  let next = state;
+  if (action === 'archive') {
+    for (const rule of state.data.recurringRules.filter((candidate) => (
+      !candidate.deletedAt && candidate.isActive && candidate.categoryId === category.id
+    ))) {
+      next = putRecord(next, 'recurringRules', { ...rule, ...changed(rule), isActive: false });
+    }
+    return putRecord(next, 'categories', { ...category, ...changed(category), isActive: false });
+  }
+  if (action === 'restore') {
+    return putRecord(next, 'categories', { ...category, ...changed(category), isActive: true });
+  }
+  return putRecord(next, 'categories', {
+    ...category,
+    ...tombstoneRecordMeta(category, now, operationId),
+    isActive: false,
+  });
 }
 
 /**
@@ -664,7 +801,7 @@ export function releaseGoalAllocations(
       ...allocation,
       version: allocation.version + 1,
       updatedAt: timestamp,
-      lastOperationId: operationId(),
+      lastOperationId: `tombstone:${operationId()}`,
       deletedAt: timestamp,
     }));
 }
@@ -727,7 +864,9 @@ export function remapOwner(data: FinanceData, ownerId: string): FinanceData {
     ownerId,
     version: record.version + 1,
     updatedAt: new Date().toISOString(),
-    lastOperationId: crypto.randomUUID(),
+    lastOperationId: record.deletedAt
+      ? `tombstone:${crypto.randomUUID()}`
+      : activeOperationId(),
   });
   return {
     ...structuredClone(data),

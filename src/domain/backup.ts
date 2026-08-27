@@ -1,4 +1,5 @@
 import type { FinanceData, OwnerId } from './model';
+import { assertLifecycleTransition } from './lifecycle';
 import { isTutorialTransaction } from './tutorialRecord';
 import {
   MAX_LEGACY_MONEY_DECIMAL_PLACES,
@@ -543,6 +544,7 @@ export function restoreFinanceBackup(
     if (options.confirmReplace !== true) {
       throw new BackupValidationError('Replacement restore requires confirmReplace: true.');
     }
+    assertLifecycleTransition(current, incoming);
     return clone(incoming);
   }
 
@@ -558,10 +560,17 @@ export function restoreFinanceBackup(
     settings: mergeSettings(current, incoming),
   };
   validateFinanceData(merged, 'restored data');
+  assertLifecycleTransition(current, merged);
   return clone(merged);
 }
 
-function mergeById<T extends { id: string; version: number; updatedAt: string; lastOperationId: string }>(
+function mergeById<T extends {
+  id: string;
+  version: number;
+  updatedAt: string;
+  lastOperationId: string;
+  deletedAt?: string;
+}>(
   current: readonly T[],
   incoming: readonly T[],
 ): T[] {
@@ -577,7 +586,7 @@ function mergeById<T extends { id: string; version: number; updatedAt: string; l
     }
     const existing = merged[existingIndex];
     const updateOrder = record.version === existing.version
-      ? compareUpdateOrder(record, existing)
+      ? compareMergeOrder(record, existing)
       : 0;
     if (record.version > existing.version
       || (record.version === existing.version && updateOrder > 0)) {
@@ -610,46 +619,17 @@ function mergeSettings(current: FinanceData, incoming: FinanceData): FinanceData
   };
 }
 
-function compareUpdateOrder(
-  incoming: { updatedAt: string; lastOperationId: string },
-  current: { updatedAt: string; lastOperationId: string },
+function compareMergeOrder(
+  incoming: { lastOperationId: string; deletedAt?: string },
+  current: { lastOperationId: string; deletedAt?: string },
 ): number {
-  const incomingInstant = timestampNanoseconds(incoming.updatedAt);
-  const currentInstant = timestampNanoseconds(current.updatedAt);
-  if (incomingInstant > currentInstant) return 1;
-  if (incomingInstant < currentInstant) return -1;
+  if (incoming.lastOperationId === current.lastOperationId) return 0;
+  if (Boolean(incoming.deletedAt) !== Boolean(current.deletedAt)) {
+    return incoming.deletedAt ? 1 : -1;
+  }
   if (incoming.lastOperationId > current.lastOperationId) return 1;
   if (incoming.lastOperationId < current.lastOperationId) return -1;
   return 0;
-}
-
-function timestampNanoseconds(value: string): bigint {
-  const match = DATE_PATTERN.exec(value);
-  if (!match || match[4] === undefined) {
-    throw new BackupValidationError('updatedAt must be a valid date-time.');
-  }
-  const year = Number(match[1]);
-  const monthIndex = Number(match[2]) - 1;
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6] ?? 0);
-  const fractionNanoseconds = BigInt((match[7] ?? '').padEnd(9, '0') || '0');
-  const hasExplicitZone = value.endsWith('Z') || match[8] !== undefined;
-  const date = new Date(0);
-  if (hasExplicitZone) {
-    date.setUTCFullYear(year, monthIndex, day);
-    date.setUTCHours(hour, minute, second, 0);
-    if (match[8] !== undefined) {
-      const offsetMinutes = Number(match[9]) * 60 + Number(match[10]);
-      const direction = match[8] === '+' ? 1 : -1;
-      date.setTime(date.getTime() - direction * offsetMinutes * 60_000);
-    }
-  } else {
-    date.setFullYear(year, monthIndex, day);
-    date.setHours(hour, minute, second, 0);
-  }
-  return BigInt(date.getTime()) * 1_000_000n + fractionNanoseconds;
 }
 
 function ownerIds(data: FinanceData): Set<string> {

@@ -5,6 +5,7 @@ import {
   getNextOccurrenceDate,
   getRecurringCatchUpStatus,
   getRecurringOccurrenceDates,
+  getRecurringEditCursor,
   MAX_RECURRING_CATCH_UP_OCCURRENCES,
 } from './recurrence';
 
@@ -227,6 +228,46 @@ describe('recurring transactions', () => {
 
     expect(retry.transactions).toEqual([]);
     expect(retry.nextOccurrenceDate).toBe('2026-08-17');
+  });
+
+  it('moves an edited schedule forward past every historical or tombstoned occurrence', () => {
+    const current = createRule({ nextOccurrenceDate: '2026-08-24' });
+    const historical = catchUpRecurringTransactions(createRule(), '2026-08-17').transactions;
+    historical[1] = { ...historical[1], deletedAt: '2026-08-18T00:00:00.000Z' };
+    const edited = { ...current, frequency: 'monthly' as const, startDate: '2026-08-01', anchorDay: 1 };
+
+    expect(getRecurringEditCursor(current, edited, historical)).toBe('2026-09-01');
+    expect(catchUpRecurringTransactions(
+      { ...edited, nextOccurrenceDate: getRecurringEditCursor(current, edited, historical) },
+      '2026-09-01',
+      historical,
+    ).transactions.map((item) => item.occurrenceDate)).toEqual(['2026-09-01']);
+  });
+
+  it('never moves an edited schedule behind the currently committed cursor', () => {
+    const current = createRule({ nextOccurrenceDate: '2026-09-07' });
+    const historical = catchUpRecurringTransactions(createRule(), '2026-08-03').transactions;
+    const edited = { ...current, frequency: 'monthly' as const, startDate: '2026-08-01', anchorDay: 1 };
+
+    expect(getRecurringEditCursor(current, edited, historical)).toBe('2026-10-01');
+  });
+
+  it('uses edited values only for the next occurrence and never rewrites history', () => {
+    const original = createRule();
+    const first = catchUpRecurringTransactions(original, '2026-08-03').transactions;
+    const history = structuredClone(first);
+    const current = { ...original, nextOccurrenceDate: '2026-08-10' };
+    const edited = { ...current, name: '新版週薪', amount: 12000 };
+    const next = catchUpRecurringTransactions(
+      { ...edited, nextOccurrenceDate: getRecurringEditCursor(current, edited, first) },
+      '2026-08-10',
+      first,
+    );
+
+    expect(first).toEqual(history);
+    expect(next.transactions).toEqual([
+      expect.objectContaining({ occurrenceDate: '2026-08-10', amount: 12000 }),
+    ]);
   });
 
   it('recognizes the rule/date idempotency key even if an existing transaction ID was remapped', () => {

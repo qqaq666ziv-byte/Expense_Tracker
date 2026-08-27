@@ -402,33 +402,6 @@ export default function App() {
       isActive: false,
     });
   };
-  const archiveCategory = (record: FinanceData["categories"][number]) => {
-    const recurring = data.recurringRules.filter(
-      (rule) =>
-        !rule.deletedAt && rule.isActive && rule.categoryId === record.id,
-    );
-    if (
-      recurring.length > 0 &&
-      !window.confirm(
-        `封存「${record.name}」也會暫停 ${recurring.length} 個週期收支；過去紀錄仍會保留。要繼續嗎？`,
-      )
-    )
-      return false;
-    for (const rule of recurring)
-      if (
-        !app.put("recurringRules", {
-          ...rule,
-          ...changedRecordMeta(rule),
-          isActive: false,
-        })
-      )
-        return false;
-    return app.put("categories", {
-      ...record,
-      ...changedRecordMeta(record),
-      isActive: false,
-    });
-  };
   const nav = [
     { key: "record" as const, label: "記帳", icon: BookOpenCheck },
     { key: "insights" as const, label: "洞察", icon: BarChart3 },
@@ -440,11 +413,17 @@ export default function App() {
     <SettingsView
       data={data}
       ownerId={app.state.ownerId}
-      putAccount={(record) => app.put("accounts", record)}
       putCategory={(record) => app.put("categories", record)}
       putRecurring={(record) => app.put("recurringRules", record)}
-      archiveAccount={archiveAccount}
-      archiveCategory={archiveCategory}
+      categoryLifecycle={(record, action) => {
+        const recurringCount = data.recurringRules.filter((rule) => (
+          !rule.deletedAt && rule.isActive && rule.categoryId === record.id
+        )).length;
+        if (action === "archive" && recurringCount > 0 && !window.confirm(
+          `封存「${record.name}」也會暫停 ${recurringCount} 個週期收支；過去紀錄仍會保留。要繼續嗎？`,
+        )) return false;
+        return app.categoryLifecycle(record, action);
+      }}
       deleteRecurring={(record) => app.softDelete("recurringRules", record)}
       restore={app.setData}
     />

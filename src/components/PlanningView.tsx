@@ -1,5 +1,14 @@
 import { useMemo, useState, type FormEvent } from "react";
-import { AlertTriangle, Archive, PiggyBank, Plus, Target } from "lucide-react";
+import {
+  AlertTriangle,
+  Archive,
+  Pencil,
+  PiggyBank,
+  Plus,
+  RotateCcw,
+  Target,
+  X,
+} from "lucide-react";
 import type {
   Budget,
   FinanceData,
@@ -9,6 +18,9 @@ import type {
 } from "../domain/model";
 import {
   calculateBudgetUsage,
+  budgetSemanticId,
+  findActiveBudgetConflict,
+  findBudgetCreationCollision,
   normalizeBudgetScope,
 } from "../domain/budgetEngine";
 import { calculateFinancials } from "../domain/financeEngine";
@@ -19,6 +31,7 @@ import {
   newRecordMeta,
   releaseGoalAllocations,
 } from "../app/state";
+import { activeOperationId } from "../domain/syncEngine";
 import {
   localDate,
   money,
@@ -41,6 +54,31 @@ interface PlanningViewProps {
   deleteRecurring(record: RecurringRule): boolean;
   archiveGoal(record: SavingsGoal): boolean;
   archiveBudget(record: Budget): boolean;
+}
+
+export interface SavingsGoalEditDraft {
+  name: string;
+  targetAmount: number;
+  targetDate?: string;
+}
+
+export function buildEditedSavingsGoal(
+  goal: SavingsGoal,
+  draft: SavingsGoalEditDraft,
+  now = new Date(),
+  operationId: string = crypto.randomUUID(),
+): SavingsGoal {
+  const edited: SavingsGoal = {
+    ...goal,
+    version: goal.version + 1,
+    updatedAt: now.toISOString(),
+    lastOperationId: activeOperationId(operationId),
+    name: draft.name.trim(),
+    targetAmount: draft.targetAmount,
+  };
+  if (draft.targetDate) edited.targetDate = draft.targetDate;
+  else delete edited.targetDate;
+  return edited;
 }
 
 export function PlanningView(props: PlanningViewProps) {
@@ -112,6 +150,7 @@ function SavingsPanel({
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
   const [targetDate, setTargetDate] = useState("");
+  const [editingGoalId, setEditingGoalId] = useState("");
   const [goalId, setGoalId] = useState("");
   const [allocation, setAllocation] = useState("");
   const [message, setMessage] = useState("");
@@ -130,6 +169,21 @@ function SavingsPanel({
     data.allocations.filter((item) => item.deletedAt && item.goalId === id)
       .length;
 
+  const resetGoalForm = () => {
+    setName("");
+    setTarget("");
+    setTargetDate("");
+    setEditingGoalId("");
+  };
+
+  const startGoalEdit = (goal: SavingsGoal) => {
+    setEditingGoalId(goal.id);
+    setName(goal.name);
+    setTarget(String(goal.targetAmount));
+    setTargetDate(goal.targetDate ?? "");
+    setMessage(`正在編輯「${goal.name}」`);
+  };
+
   const createGoal = (event: FormEvent) => {
     event.preventDefault();
     const amount = parseRequiredNumberInput(target);
@@ -137,20 +191,30 @@ function SavingsPanel({
       return setMessage(
         "請輸入目標名稱與大於 0、最多兩位小數且可安全精確處理的金額",
       );
-    const applied = putGoal({
-      ...newRecordMeta(ownerId),
-      name: name.trim(),
-      targetAmount: amount,
-      targetDate: targetDate || undefined,
-      isActive: true,
-    });
+    const editingGoal = editingGoalId
+      ? visibleGoals.find((goal) => goal.id === editingGoalId)
+      : undefined;
+    if (editingGoalId && !editingGoal)
+      return setMessage("找不到要編輯的目標；資料未變更");
+    const record = editingGoal
+      ? buildEditedSavingsGoal(editingGoal, {
+          name,
+          targetAmount: amount,
+          targetDate: targetDate || undefined,
+        })
+      : {
+          ...newRecordMeta(ownerId),
+          name: name.trim(),
+          targetAmount: amount,
+          targetDate: targetDate || undefined,
+          isActive: true,
+        };
+    const applied = putGoal(record);
     completeAppliedMutation(
       applied,
       () => {
-        setName("");
-        setTarget("");
-        setTargetDate("");
-        setMessage("目標已建立");
+        resetGoalForm();
+        setMessage(editingGoal ? "目標已更新；既有配置紀錄保持不變" : "目標已建立");
       },
       setMessage,
     );
@@ -238,7 +302,9 @@ function SavingsPanel({
           <div className="section-heading">
             <div>
               <p className="eyebrow">想存下來的生活</p>
-              <h2 id="new-goal-title">建立儲蓄目標</h2>
+              <h2 id="new-goal-title">
+                {editingGoalId ? "編輯儲蓄目標" : "建立儲蓄目標"}
+              </h2>
             </div>
             <Target className="h-7 w-7 text-amber-600" />
           </div>
@@ -267,16 +333,32 @@ function SavingsPanel({
               <input
                 aria-label="目標日期"
                 type="date"
-                min={localDate(reference)}
+                min={editingGoalId ? undefined : localDate(reference)}
                 className="field mt-1"
                 value={targetDate}
                 onChange={(event) => setTargetDate(event.target.value)}
               />
             </label>
-            <button className="primary-button w-full" type="submit">
-              <Plus className="h-4 w-4" />
-              建立目標
-            </button>
+            <div className="flex gap-2">
+              <button className="primary-button flex-1" type="submit">
+                {editingGoalId ? <Pencil className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                {editingGoalId ? "儲存目標" : "建立目標"}
+              </button>
+              {editingGoalId && (
+                <button
+                  className="secondary-button"
+                  type="button"
+                  aria-label="取消編輯目標"
+                  onClick={() => {
+                    resetGoalForm();
+                    setMessage("已取消編輯目標");
+                  }}
+                >
+                  <X className="h-4 w-4" />
+                  取消
+                </button>
+              )}
+            </div>
           </form>
         </section>
         <section className="card" aria-labelledby="allocation-title">
@@ -378,6 +460,14 @@ function SavingsPanel({
                       )}
                     </div>
                     <div className="flex flex-wrap justify-end gap-2">
+                      <button
+                        className="icon-button"
+                        type="button"
+                        aria-label={`編輯${goal.name}`}
+                        onClick={() => startGoalEdit(goal)}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </button>
                       {current > 0 && (
                         <button
                           className="secondary-button"
@@ -393,7 +483,14 @@ function SavingsPanel({
                           className="icon-button"
                           type="button"
                           aria-label={`封存 ${goal.name}`}
-                          onClick={() => archiveGoal(goal)}
+                          onClick={() => completeAppliedMutation(
+                            archiveGoal(goal),
+                            () => {
+                              if (editingGoalId === goal.id) resetGoalForm();
+                              setMessage(`已封存「${goal.name}」`);
+                            },
+                            setMessage,
+                          )}
                         >
                           <Archive className="h-4 w-4" />
                         </button>
@@ -402,14 +499,17 @@ function SavingsPanel({
                           className="secondary-button"
                           type="button"
                           aria-label={`重新啟用${goal.name}`}
-                          onClick={() =>
+                          onClick={() => completeAppliedMutation(
                             putGoal({
                               ...goal,
                               ...changedRecordMeta(goal),
                               isActive: true,
-                            })
-                          }
+                            }),
+                            () => setMessage(`已重新啟用「${goal.name}」`),
+                            setMessage,
+                          )}
                         >
+                          <RotateCcw className="h-4 w-4" />
                           重新啟用
                         </button>
                       )}
@@ -432,7 +532,7 @@ function SavingsPanel({
   );
 }
 
-function BudgetPanel({
+export function BudgetPanel({
   data,
   ownerId,
   putBudget,
@@ -443,47 +543,83 @@ function BudgetPanel({
   const [categoryId, setCategoryId] = useState("");
   const [period, setPeriod] = useState<"weekly" | "monthly">("monthly");
   const [amount, setAmount] = useState("");
+  const [editingBudgetId, setEditingBudgetId] = useState("");
   const [message, setMessage] = useState("");
   const categories = sortByDisplayOrder(
     data.categories.filter(
       (item) => item.kind === "expense" && item.isActive && !item.deletedAt,
     ),
   );
-  const resolvedCategoryId = categories.some((item) => item.id === categoryId)
+  const visibleBudgets = data.budgets.filter((item) => !item.deletedAt);
+  const archivedBudgets = visibleBudgets.filter((item) => !item.isActive);
+  const editingBudget = editingBudgetId
+    ? visibleBudgets.find((item) => item.id === editingBudgetId)
+    : undefined;
+  const editingCategory = editingBudget?.scope === "category"
+    ? data.categories.find((item) => item.id === editingBudget.categoryId)
+    : undefined;
+  const categoryOptions = editingCategory && !categories.some((item) => item.id === editingCategory.id)
+    ? [editingCategory, ...categories]
+    : categories;
+  const resolvedCategoryId = categoryOptions.some((item) => item.id === categoryId)
     ? categoryId
-    : (categories[0]?.id ?? "");
+    : (categoryOptions[0]?.id ?? "");
   const usages = useMemo(
     () => calculateBudgetUsage(data, reference),
     [data, reference],
   );
 
+  const budgetName = (budget: Budget) => budget.scope === "overall"
+    ? "總預算"
+    : data.categories.find((item) => item.id === budget.categoryId)?.name
+      ?? budget.categoryName
+      ?? "未知分類";
+
+  const resetBudgetForm = () => {
+    setScope("overall");
+    setCategoryId("");
+    setPeriod("monthly");
+    setAmount("");
+    setEditingBudgetId("");
+  };
+
+  const startBudgetEdit = (budget: Budget) => {
+    setEditingBudgetId(budget.id);
+    setScope(budget.scope);
+    setCategoryId(budget.categoryId ?? "");
+    setPeriod(budget.period);
+    setAmount(String(budget.amount));
+    setMessage(`正在編輯「${budgetName(budget)}」`);
+  };
+
+  const conflictMessage = (conflict: Budget) => (
+    `已有相同範圍與週期的使用中預算「${budgetName(conflict)}」；請編輯既有預算或先封存它`
+  );
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const limit = parseRequiredNumberInput(amount);
-    const category = categories.find((item) => item.id === resolvedCategoryId);
+    const category = categoryOptions.find((item) => item.id === resolvedCategoryId);
     if (limit === null || limit <= 0 || (scope === "category" && !category))
       return setMessage(
         "請輸入大於 0、最多兩位小數且可安全精確處理的預算並選擇分類",
       );
-    const existing = data.budgets.find(
-      (item) =>
-        !item.deletedAt &&
-        item.isActive &&
-        item.scope === scope &&
-        item.period === period &&
-        (scope === "overall" || item.categoryId === category?.id),
-    );
-    const record: Budget = existing
+    if (editingBudgetId && !editingBudget)
+      return setMessage("找不到要編輯的預算；資料未變更");
+    const record: Budget = editingBudget
       ? {
-          ...existing,
-          ...changedRecordMeta(existing),
+          ...editingBudget,
+          ...changedRecordMeta(editingBudget),
+          scope,
+          period,
           amount: limit,
-          ...(category
+          ...(scope === "category" && category
             ? { categoryId: category.id, categoryName: category.name }
             : {}),
         }
       : {
           ...newRecordMeta(ownerId),
+          id: budgetSemanticId(ownerId, scope, period, category?.id),
           scope,
           period,
           amount: limit,
@@ -492,13 +628,54 @@ function BudgetPanel({
             ? { categoryId: category.id, categoryName: category.name }
             : {}),
         };
-    const applied = putBudget(normalizeBudgetScope(record));
+    const normalized = normalizeBudgetScope(record);
+    const semanticMatch = !editingBudget && findBudgetCreationCollision(data.budgets, normalized);
+    if (semanticMatch) {
+      return setMessage(semanticMatch.deletedAt
+        ? `相同範圍與週期已有同步刪除紀錄；為避免舊資料復活，未建立新預算`
+        : semanticMatch.isActive
+        ? conflictMessage(semanticMatch)
+        : `已有相同範圍與週期的已封存預算「${budgetName(semanticMatch)}」；請從已封存預算重新啟用`);
+    }
+    const conflict = findActiveBudgetConflict(data.budgets, normalized);
+    if (conflict) return setMessage(conflictMessage(conflict));
+    const applied = putBudget(normalized);
     completeAppliedMutation(
       applied,
       () => {
-        setAmount("");
-        setMessage(existing ? "已更新相同範圍預算" : "預算已建立");
+        resetBudgetForm();
+        setMessage(editingBudget ? "預算已更新" : "預算已建立");
       },
+      setMessage,
+    );
+  };
+
+  const restoreBudget = (budget: Budget) => {
+    if (budget.scope === "category") {
+      const category = data.categories.find((item) => (
+        item.id === budget.categoryId
+        && item.kind === "expense"
+        && item.isActive
+        && !item.deletedAt
+      ));
+      if (!category) {
+        setMessage(`「${budgetName(budget)}」分類目前不可用；請先重新啟用分類再恢復預算`);
+        return;
+      }
+    }
+    const restored = normalizeBudgetScope({
+      ...budget,
+      ...changedRecordMeta(budget),
+      isActive: true,
+    });
+    const conflict = findActiveBudgetConflict(data.budgets, restored);
+    if (conflict) {
+      setMessage(conflictMessage(conflict));
+      return;
+    }
+    completeAppliedMutation(
+      putBudget(restored),
+      () => setMessage(`已重新啟用「${budgetName(budget)}」`),
       setMessage,
     );
   };
@@ -509,7 +686,9 @@ function BudgetPanel({
         <div className="section-heading">
           <div>
             <p className="eyebrow">掌握這段時間</p>
-            <h2 id="budget-form-title">設定預算</h2>
+            <h2 id="budget-form-title">
+              {editingBudgetId ? "編輯預算" : "設定預算"}
+            </h2>
           </div>
           <Target className="h-7 w-7 text-amber-600" />
         </div>
@@ -519,6 +698,7 @@ function BudgetPanel({
             <select
               aria-label="預算範圍"
               className="field mt-1"
+              disabled={Boolean(editingBudgetId)}
               value={scope}
               onChange={(event) => setScope(event.target.value as typeof scope)}
             >
@@ -531,6 +711,7 @@ function BudgetPanel({
             <select
               aria-label="預算週期"
               className="field mt-1"
+              disabled={Boolean(editingBudgetId)}
               value={period}
               onChange={(event) =>
                 setPeriod(event.target.value as typeof period)
@@ -546,12 +727,13 @@ function BudgetPanel({
               <select
                 aria-label="預算分類"
                 className="field mt-1"
+                disabled={Boolean(editingBudgetId)}
                 value={resolvedCategoryId}
                 onChange={(event) => setCategoryId(event.target.value)}
               >
-                {categories.map((category) => (
+                {categoryOptions.map((category) => (
                   <option key={category.id} value={category.id}>
-                    {category.name}
+                    {category.name}{!category.isActive || category.deletedAt ? "（已封存）" : ""}
                   </option>
                 ))}
               </select>
@@ -567,11 +749,30 @@ function BudgetPanel({
               onValueChange={setAmount}
             />
           </label>
-          <button className="primary-button sm:col-span-2" type="submit">
-            儲存預算
-          </button>
+          <div className="flex gap-2 sm:col-span-2">
+            <button className="primary-button flex-1" type="submit">
+              {editingBudgetId ? <Pencil className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+              {editingBudgetId ? "儲存修改" : "建立預算"}
+            </button>
+            {editingBudgetId && (
+              <button
+                className="secondary-button"
+                type="button"
+                aria-label="取消編輯預算"
+                onClick={() => {
+                  resetBudgetForm();
+                  setMessage("已取消編輯預算");
+                }}
+              >
+                <X className="h-4 w-4" />
+                取消
+              </button>
+            )}
+          </div>
           {message && (
-            <p className="text-sm text-zinc-600 sm:col-span-2">{message}</p>
+            <p aria-live="polite" className="text-sm text-zinc-600 sm:col-span-2">
+              {message}
+            </p>
           )}
         </form>
       </section>
@@ -608,14 +809,31 @@ function BudgetPanel({
                           : `剩餘 ${money.format(usage.remaining)}`}
                       </p>
                     </div>
-                    <button
-                      type="button"
-                      className="icon-button"
-                      aria-label={`封存 ${usage.name} 預算`}
-                      onClick={() => archiveBudget(budget)}
-                    >
-                      <Archive className="h-4 w-4" />
-                    </button>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={`編輯${usage.name}預算`}
+                        onClick={() => startBudgetEdit(budget)}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={`封存 ${usage.name} 預算`}
+                        onClick={() => completeAppliedMutation(
+                          archiveBudget(budget),
+                          () => {
+                            if (editingBudgetId === budget.id) resetBudgetForm();
+                            setMessage(`已封存「${usage.name}」預算`);
+                          },
+                          setMessage,
+                        )}
+                      >
+                        <Archive className="h-4 w-4" />
+                      </button>
+                    </div>
                   </div>
                   <div
                     className={`progress-track mt-2 ${usage.overBy > 0 ? "progress-danger" : ""}`}
@@ -626,6 +844,42 @@ function BudgetPanel({
                       }}
                     />
                   </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+      <section className="card" aria-labelledby="archived-budget-list-title">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">保留過去設定</p>
+            <h2 id="archived-budget-list-title">已封存預算</h2>
+          </div>
+        </div>
+        {archivedBudgets.length === 0 ? (
+          <p className="empty-state">目前沒有已封存預算。</p>
+        ) : (
+          <div className="space-y-2">
+            {archivedBudgets.map((budget) => {
+              const name = budgetName(budget);
+              return (
+                <article className="settings-row opacity-75" key={budget.id}>
+                  <div className="min-w-0 flex-1">
+                    <strong className="block truncate">{name}</strong>
+                    <span className="text-xs text-zinc-500">
+                      {budget.period === "weekly" ? "每週" : "每月"} · {money.format(budget.amount)} · 已封存
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    aria-label={`重新啟用${name}預算`}
+                    onClick={() => restoreBudget(budget)}
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                    重新啟用
+                  </button>
                 </article>
               );
             })}

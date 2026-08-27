@@ -2,6 +2,7 @@ import { calculateFinancials } from './financeEngine';
 import { compareMoney } from './money';
 import { parseLocalDateTime } from './dateRange';
 import type { PersistedFinanceState, SavingsAllocation, Transaction } from './model';
+import { activeOperationId } from './syncEngine';
 
 export type FinanceCommand =
   | {
@@ -62,7 +63,7 @@ export function createFinanceStore(
           return { ok: false, code: 'CATEGORY_NOT_FOUND', message: '找不到分類' };
         }
         const timestamp = now().toISOString();
-        const operationId = generateId();
+        const operationId = activeOperationId(generateId());
         const updated = {
           ...state.data.categories[index],
           isActive: false,

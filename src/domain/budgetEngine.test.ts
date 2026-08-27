@@ -1,10 +1,70 @@
 import { describe, expect, it } from 'vitest';
 import type { Budget, FinanceData } from './model';
 import { createFinanceBackup, restoreFinanceBackup } from './backup';
-import { calculateBudgetUsage, normalizeBudgetScope } from './budgetEngine';
+import {
+  calculateBudgetUsage,
+  budgetSemanticId,
+  findBudgetCreationCollision,
+  findActiveBudgetConflict,
+  normalizeBudgetScope,
+} from './budgetEngine';
 import { TUTORIAL_RECORD_NOTE } from '../app/tutorial';
 
 describe('budget engine', () => {
+  it('uses one stable id for concurrent creation of the same budget semantics', () => {
+    expect(budgetSemanticId('user-a', 'category', 'monthly', 'food'))
+      .toBe(budgetSemanticId('user-a', 'category', 'monthly', 'food'));
+    expect(budgetSemanticId('user-a', 'category', 'monthly', 'food'))
+      .not.toBe(budgetSemanticId('user-a', 'category', 'weekly', 'food'));
+  });
+
+  it('blocks create when the deterministic id already belongs to an archived or tombstoned budget', () => {
+    const id = budgetSemanticId('user-a', 'overall', 'monthly');
+    const archived: Budget = {
+      id, ownerId: 'user-a', scope: 'overall', period: 'monthly', amount: 500,
+      isActive: false, version: 2, updatedAt: '2026-08-27T00:00:00.000Z',
+      lastOperationId: 'archived-budget',
+    };
+    const candidate: Budget = {
+      ...archived,
+      amount: 600,
+      isActive: true,
+      version: 1,
+      lastOperationId: 'new-budget',
+    };
+
+    expect(findBudgetCreationCollision([archived], candidate)).toBe(archived);
+    expect(findBudgetCreationCollision([{ ...archived, deletedAt: '2026-08-27T00:00:00.000Z' }], candidate))
+      .toBeDefined();
+  });
+
+  it('finds another active budget with the same semantic scope while ignoring itself and archived records', () => {
+    const active: Budget = {
+      id: 'active-food', ownerId: 'guest', scope: 'category', categoryId: 'food', categoryName: '餐飲',
+      period: 'monthly', amount: 5_000, isActive: true, version: 1,
+      updatedAt: '2026-08-01T00:00:00.000Z', lastOperationId: 'active-food-create',
+    };
+    const archived: Budget = {
+      ...active,
+      id: 'archived-food',
+      isActive: false,
+      lastOperationId: 'archived-food-archive',
+    };
+    const candidate: Budget = {
+      ...active,
+      id: 'candidate-food',
+      amount: 6_000,
+      lastOperationId: 'candidate-food-create',
+    };
+
+    expect(findActiveBudgetConflict([active, archived], candidate)?.id).toBe('active-food');
+    expect(findActiveBudgetConflict([active, archived], active)).toBeUndefined();
+    expect(findActiveBudgetConflict([archived], candidate)).toBeUndefined();
+    expect(findActiveBudgetConflict([active, archived], { ...archived, isActive: true })?.id)
+      .toBe('active-food');
+    expect(findActiveBudgetConflict([active], { ...candidate, period: 'weekly' })).toBeUndefined();
+  });
+
   it('uses shared calendar rules for overall and category budgets without counting income or adjustments', () => {
     const data: FinanceData = {
       accounts: [],

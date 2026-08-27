@@ -4,6 +4,8 @@ import { supabase, supabaseConfigured } from '../lib/supabaseClient';
 import type {
   FinanceData,
   FinanceEntityName,
+  AssetAccount,
+  Category,
   PersistedFinanceState,
   SyncRecord,
 } from '../domain/model';
@@ -17,6 +19,7 @@ import {
 } from './safeSync';
 import {
   applySyncCompletion,
+  applyCategoryLifecycleMutation,
   advanceFinanceStateRef,
   canAutoSaveFinanceState,
   changedRecordMeta,
@@ -27,9 +30,13 @@ import {
   planGuestImport,
   type LocalStateRecovery,
   putRecord,
+  putCategoryWithDependents,
+  putAccountWithDependents,
   remapOwner,
   saveFinanceState,
+  tombstoneRecordMeta,
 } from './state';
+import { assertCategoryUpsert, type CategoryAction } from '../domain/lifecycle';
 
 export interface FinanceAppController {
   state: PersistedFinanceState;
@@ -50,6 +57,7 @@ export interface FinanceAppController {
   keepCloudData(): void;
   setData(data: FinanceData): void;
   put<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
+  categoryLifecycle(record: Category, action: CategoryAction): boolean;
   softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
   syncNow(): Promise<void>;
   signIn(): Promise<void>;
@@ -390,14 +398,41 @@ export function useFinanceApp(): FinanceAppController {
       return false;
     }
     try {
+      if (entity === 'categories') {
+        assertCategoryUpsert(stateRef.current.data, record as Category);
+      }
       commitState((current) => applyFinanceMutationUnlessRecovering(
         current,
         storageRecoveryRef.current,
-        (recoverable) => putRecord(recoverable, entity, record),
+        (recoverable) => entity === 'categories'
+          ? putCategoryWithDependents(recoverable, record as Category)
+          : entity === 'accounts'
+            ? putAccountWithDependents(recoverable, record as AssetAccount)
+            : putRecord(recoverable, entity, record),
       ));
       return true;
     } catch (error) {
       setSafetyNotice(`資料未儲存：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }, [assertRenderedOwnerContext, commitState]);
+
+  const categoryLifecycle = useCallback((record: Category, action: CategoryAction) => {
+    try {
+      assertRenderedOwnerContext();
+      if (stateRef.current.legacyBootstrap?.status === 'pending') {
+        throw new Error('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
+      }
+      if (stateRef.current.initialBootstrap) {
+        throw new Error('正在先讀取雲端帳本；完成前本次修改未執行。');
+      }
+      if (storageRecoveryRef.current) {
+        throw new Error('本機快照仍在復原保護中；完成有效備份還原前，本次帳本修改未執行。');
+      }
+      commitState((current) => applyCategoryLifecycleMutation(current, record.id, action));
+      return true;
+    } catch (error) {
+      setSafetyNotice(error instanceof Error ? error.message : String(error));
       return false;
     }
   }, [assertRenderedOwnerContext, commitState]);
@@ -424,18 +459,22 @@ export function useFinanceApp(): FinanceAppController {
       setSafetyNotice('本機快照仍在復原保護中；完成有效備份還原前，本次刪除未執行。');
       return false;
     }
-    const deleted = {
-      ...record,
-      ...changedRecordMeta(record as SyncRecord),
-      deletedAt: new Date().toISOString(),
-      ...('isActive' in record ? { isActive: false } : {}),
-    } as FinanceData[E][number];
-    commitState((current) => applyFinanceMutationUnlessRecovering(
-      current,
-      storageRecoveryRef.current,
-      (recoverable) => putRecord(recoverable, entity, deleted),
-    ));
-    return true;
+    try {
+      const deleted = {
+        ...record,
+        ...tombstoneRecordMeta(record as SyncRecord),
+        ...('isActive' in record ? { isActive: false } : {}),
+      } as FinanceData[E][number];
+      commitState((current) => applyFinanceMutationUnlessRecovering(
+        current,
+        storageRecoveryRef.current,
+        (recoverable) => putRecord(recoverable, entity, deleted),
+      ));
+      return true;
+    } catch (error) {
+      setSafetyNotice(`資料未刪除：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
   }, [assertRenderedOwnerContext, commitState]);
 
   const setData = useCallback((data: FinanceData) => {
@@ -643,6 +682,7 @@ export function useFinanceApp(): FinanceAppController {
     keepCloudData,
     setData,
     put,
+    categoryLifecycle,
     softDelete,
     syncNow,
     signIn,
