@@ -29,9 +29,8 @@ import { compareMoney, sumMoney } from "../domain/money";
 import {
   changedRecordMeta,
   newRecordMeta,
-  releaseGoalAllocations,
 } from "../app/state";
-import { activeOperationId } from "../domain/syncEngine";
+import { activeOperationId, syncRecordKey } from "../domain/syncEngine";
 import {
   assertFreshEditorSnapshot,
   isEditorSnapshotStale,
@@ -57,7 +56,9 @@ interface PlanningViewProps {
   putRecurring(record: RecurringRule): boolean;
   deleteRecurring(record: RecurringRule): boolean;
   archiveGoal(record: SavingsGoal): boolean;
+  releaseGoalAllocations?(record: SavingsGoal): boolean;
   archiveBudget(record: Budget): boolean;
+  unresolvedSyncRecordKeys?: ReadonlySet<string>;
 }
 
 export interface SavingsGoalEditDraft {
@@ -72,8 +73,9 @@ export function buildEditedSavingsGoal(
   draft: SavingsGoalEditDraft,
   now = new Date(),
   operationId: string = crypto.randomUUID(),
+  hasUnresolvedConflict = false,
 ): SavingsGoal {
-  assertFreshEditorSnapshot(opened, current, "此儲蓄目標");
+  assertFreshEditorSnapshot(opened, current, "此儲蓄目標", { hasUnresolvedConflict });
   const edited: SavingsGoal = {
     ...current,
     version: current.version + 1,
@@ -101,8 +103,12 @@ export function buildEditedBudget(
   draft: BudgetEditDraft,
   now = new Date(),
   operationId: string = crypto.randomUUID(),
+  hasUnresolvedConflict = false,
 ): Budget {
-  assertFreshEditorSnapshot(opened, current, "此預算", { requireActive: true });
+  assertFreshEditorSnapshot(opened, current, "此預算", {
+    requireActive: true,
+    hasUnresolvedConflict,
+  });
   const edited: Budget = {
     ...current,
     version: current.version + 1,
@@ -169,6 +175,7 @@ export function PlanningView(props: PlanningViewProps) {
           ownerId={props.ownerId}
           putRecurring={props.putRecurring}
           deleteRecurring={props.deleteRecurring}
+          unresolvedSyncRecordKeys={props.unresolvedSyncRecordKeys}
         />
       )}
     </div>
@@ -185,7 +192,9 @@ function SavingsPanel({
   putGoal,
   putAllocation,
   archiveGoal,
+  releaseGoalAllocations = () => false,
   reference,
+  unresolvedSyncRecordKeys = new Set(),
 }: PlanningPanelProps) {
   const financials = useMemo(() => calculateFinancials(data), [data]);
   const [name, setName] = useState("");
@@ -198,9 +207,18 @@ function SavingsPanel({
   const [message, setMessage] = useState("");
   const visibleGoals = data.goals.filter((item) => !item.deletedAt);
   const goals = visibleGoals.filter((item) => item.isActive);
-  const resolvedGoalId = goals.some((goal) => goal.id === goalId)
+  const goalHasUnresolvedConflict = (candidateGoalId: string) => (
+    unresolvedSyncRecordKeys.has(syncRecordKey("goals", candidateGoalId))
+    || data.allocations.some((candidate) => (
+      !candidate.deletedAt
+      && candidate.goalId === candidateGoalId
+      && unresolvedSyncRecordKeys.has(syncRecordKey("allocations", candidate.id))
+    ))
+  );
+  const allocatableGoals = goals.filter((goal) => !goalHasUnresolvedConflict(goal.id));
+  const resolvedGoalId = allocatableGoals.some((goal) => goal.id === goalId)
     ? goalId
-    : (goals[0]?.id ?? "");
+    : (allocatableGoals[0]?.id ?? "");
   const allocatedToGoal = (id: string) =>
     sumMoney(
       data.allocations
@@ -236,6 +254,12 @@ function SavingsPanel({
     const editingGoal = editingGoalSnapshot
       ? data.goals.find((goal) => goal.id === editingGoalSnapshot.id)
       : undefined;
+    const hasUnresolvedConflict = editingGoalSnapshot
+      ? unresolvedSyncRecordKeys.has(syncRecordKey("goals", editingGoalSnapshot.id))
+      : false;
+    if (hasUnresolvedConflict) return setMessage(
+      "此儲蓄目標有未解同步衝突；資料未變更，請先從同步狀態完成處理",
+    );
     if (editingGoalSnapshot && isEditorSnapshotStale(
       editingGoalSnapshot,
       editingGoal,
@@ -247,7 +271,7 @@ function SavingsPanel({
           name,
           targetAmount: amount,
           targetDate: targetDate || undefined,
-        })
+        }, new Date(), crypto.randomUUID(), hasUnresolvedConflict)
       : {
           ...newRecordMeta(ownerId),
           name: name.trim(),
@@ -271,8 +295,13 @@ function SavingsPanel({
     const amount = parseRequiredNumberInput(allocation);
     if (!resolvedGoalId || amount === null || amount <= 0)
       return setMessage(
-        "請選擇目標並輸入大於 0、最多兩位小數且可安全精確處理的金額",
+        allocatableGoals.length === 0 && goals.length > 0
+          ? "所有可用目標目前都有未解同步衝突；請先從同步狀態完成處理"
+          : "請選擇目標並輸入大於 0、最多兩位小數且可安全精確處理的金額",
       );
+    if (goalHasUnresolvedConflict(resolvedGoalId)) return setMessage(
+      "此目標或既有配置有未解同步衝突；資料未變更，請先從同步狀態完成處理",
+    );
     if (compareMoney(amount, financials.availableAssets) > 0)
       return setMessage(
         `可配置資產僅有 ${money.format(financials.availableAssets)}，未建立配置`,
@@ -302,13 +331,15 @@ function SavingsPanel({
       )
     )
       return;
-    const releases = releaseGoalAllocations(data.allocations, goal.id);
-    const applied = releases.every(putAllocation);
+    const releaseCount = data.allocations.filter((allocation) => (
+      !allocation.deletedAt && allocation.goalId === goal.id
+    )).length;
+    const applied = releaseGoalAllocations(goal);
     completeAppliedMutation(
       applied,
       () => {
         setMessage(
-          `已釋放「${goal.name}」的 ${releases.length} 筆配置；總資產不變`,
+          `已釋放「${goal.name}」的 ${releaseCount} 筆配置；總資產不變`,
         );
       },
       setMessage,
@@ -425,8 +456,12 @@ function SavingsPanel({
                 onChange={(event) => setGoalId(event.target.value)}
               >
                 {goals.map((goal) => (
-                  <option key={goal.id} value={goal.id}>
-                    {goal.name}
+                  <option
+                    key={goal.id}
+                    value={goal.id}
+                    disabled={goalHasUnresolvedConflict(goal.id)}
+                  >
+                    {goal.name}{goalHasUnresolvedConflict(goal.id) ? "（同步衝突）" : ""}
                   </option>
                 ))}
               </select>
@@ -445,9 +480,12 @@ function SavingsPanel({
               className="primary-button w-full"
               type="submit"
               disabled={
-                goals.length === 0 ||
+                !resolvedGoalId ||
                 compareMoney(financials.availableAssets, 0) <= 0
               }
+              title={!resolvedGoalId && goals.length > 0
+                ? "目標或既有配置有未解同步衝突，請先完成同步處理。"
+                : undefined}
             >
               配置到目標
             </button>
@@ -475,6 +513,13 @@ function SavingsPanel({
               const releasedCount = releasedFromGoal(goal.id);
               const targetAmount = sumMoney([goal.targetAmount]);
               const ratio = targetAmount > 0 ? current / targetAmount : 0;
+              const conflictBlocked = unresolvedSyncRecordKeys.has(
+                syncRecordKey("goals", goal.id),
+              ) || data.allocations.some((allocation) => (
+                !allocation.deletedAt
+                && allocation.goalId === goal.id
+                && unresolvedSyncRecordKeys.has(syncRecordKey("allocations", allocation.id))
+              ));
               return (
                 <article
                   className={
@@ -510,6 +555,10 @@ function SavingsPanel({
                         className="icon-button"
                         type="button"
                         aria-label={`編輯${goal.name}`}
+                        disabled={conflictBlocked}
+                        title={conflictBlocked
+                          ? "此儲蓄目標有未解同步衝突，請先完成同步後再編輯。"
+                          : undefined}
                         onClick={() => startGoalEdit(goal)}
                       >
                         <Pencil className="h-4 w-4" />
@@ -519,6 +568,10 @@ function SavingsPanel({
                           className="secondary-button"
                           type="button"
                           aria-label={`釋放${goal.name}配置`}
+                          disabled={conflictBlocked}
+                          title={conflictBlocked
+                            ? "此儲蓄目標有未解同步衝突，請先選擇雲端版本。"
+                            : undefined}
                           onClick={() => releaseGoalAllocation(goal, current)}
                         >
                           釋放配置
@@ -529,6 +582,10 @@ function SavingsPanel({
                           className="icon-button"
                           type="button"
                           aria-label={`封存 ${goal.name}`}
+                          disabled={conflictBlocked}
+                          title={conflictBlocked
+                            ? "此儲蓄目標有未解同步衝突，請先選擇雲端版本。"
+                            : undefined}
                           onClick={() => completeAppliedMutation(
                             archiveGoal(goal),
                             () => {
@@ -545,6 +602,10 @@ function SavingsPanel({
                           className="secondary-button"
                           type="button"
                           aria-label={`重新啟用${goal.name}`}
+                          disabled={conflictBlocked}
+                          title={conflictBlocked
+                            ? "此儲蓄目標有未解同步衝突，請先選擇雲端版本。"
+                            : undefined}
                           onClick={() => completeAppliedMutation(
                             putGoal({
                               ...goal,
@@ -584,6 +645,7 @@ export function BudgetPanel({
   putBudget,
   archiveBudget,
   reference,
+  unresolvedSyncRecordKeys = new Set(),
 }: PlanningPanelProps) {
   const [scope, setScope] = useState<"overall" | "category">("overall");
   const [categoryId, setCategoryId] = useState("");
@@ -651,6 +713,12 @@ export function BudgetPanel({
       return setMessage(
         "請輸入大於 0、最多兩位小數且可安全精確處理的預算並選擇分類",
       );
+    const hasUnresolvedConflict = editingBudgetSnapshot
+      ? unresolvedSyncRecordKeys.has(syncRecordKey("budgets", editingBudgetSnapshot.id))
+      : false;
+    if (hasUnresolvedConflict) return setMessage(
+      "此預算有未解同步衝突；資料未變更，請先從同步狀態完成處理",
+    );
     if (editingBudgetSnapshot && isEditorSnapshotStale(
       editingBudgetSnapshot,
       editingBudget,
@@ -665,7 +733,7 @@ export function BudgetPanel({
           amount: limit,
           categoryId: category?.id,
           categoryName: category?.name,
-        })
+        }, new Date(), crypto.randomUUID(), hasUnresolvedConflict)
       : {
           ...newRecordMeta(ownerId),
           id: budgetSemanticId(ownerId, scope, period, category?.id),
@@ -840,6 +908,9 @@ export function BudgetPanel({
               const budget = data.budgets.find(
                 (item) => item.id === usage.budgetId,
               )!;
+              const conflictBlocked = unresolvedSyncRecordKeys.has(
+                syncRecordKey("budgets", budget.id),
+              );
               return (
                 <article key={usage.budgetId}>
                   <div className="flex justify-between gap-3">
@@ -862,7 +933,11 @@ export function BudgetPanel({
                       <button
                         type="button"
                         className="icon-button"
-                        aria-label={`編輯${usage.name}預算`}
+                        aria-label={`編輯${usage.name.endsWith("預算") ? usage.name : `${usage.name}預算`}`}
+                        disabled={conflictBlocked}
+                        title={conflictBlocked
+                          ? "此預算有未解同步衝突，請先完成同步後再編輯。"
+                          : undefined}
                         onClick={() => startBudgetEdit(budget)}
                       >
                         <Pencil className="h-4 w-4" />
@@ -871,6 +946,10 @@ export function BudgetPanel({
                         type="button"
                         className="icon-button"
                         aria-label={`封存 ${usage.name} 預算`}
+                        disabled={conflictBlocked}
+                        title={conflictBlocked
+                          ? "此預算有未解同步衝突，請先選擇雲端版本。"
+                          : undefined}
                         onClick={() => completeAppliedMutation(
                           archiveBudget(budget),
                           () => {
@@ -912,6 +991,9 @@ export function BudgetPanel({
           <div className="space-y-2">
             {archivedBudgets.map((budget) => {
               const name = budgetName(budget);
+              const conflictBlocked = unresolvedSyncRecordKeys.has(
+                syncRecordKey("budgets", budget.id),
+              );
               return (
                 <article className="settings-row opacity-75" key={budget.id}>
                   <div className="min-w-0 flex-1">
@@ -924,6 +1006,10 @@ export function BudgetPanel({
                     type="button"
                     className="secondary-button"
                     aria-label={`重新啟用${name}預算`}
+                    disabled={conflictBlocked}
+                    title={conflictBlocked
+                      ? "此預算有未解同步衝突，請先選擇雲端版本。"
+                      : undefined}
                     onClick={() => restoreBudget(budget)}
                   >
                     <RotateCcw className="h-4 w-4" />

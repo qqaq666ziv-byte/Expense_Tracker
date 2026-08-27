@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   applySyncCompletion,
+  applyAccountArchiveMutation,
+  applyGoalAllocationReleaseMutation,
   applyRestoredData,
   applyCategoryLifecycleMutation,
   advanceFinanceStateRef,
@@ -40,6 +42,81 @@ function readyAuthenticatedState(ownerId = 'user-a') {
 }
 
 describe('owner-scoped local state', () => {
+  it('quarantines an impossible guest conflict lock so backup recovery remains available', () => {
+    const impossible = createInitialState('guest');
+    impossible.unresolvedSyncRecordKeys = [`accounts:${impossible.data.accounts[0].id}`];
+    const storage = {
+      getItem: (key: string) => key === storageKey('guest') ? JSON.stringify(impossible) : null,
+    };
+
+    const loaded = loadFinanceStateWithRecovery('guest', storage);
+
+    expect(loaded.recovery?.message).toMatch(/unresolved sync record keys/);
+    expect(loaded.recovery?.raw).toContain('unresolvedSyncRecordKeys');
+    expect(loaded.state.unresolvedSyncRecordKeys).toBeUndefined();
+  });
+
+  it('archives an account and pauses its active recurring rules atomically', () => {
+    const state = readyAuthenticatedState();
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.recurringRules = [{
+      id: 'rule-account', ownerId: state.ownerId, version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-created',
+      name: '月租', type: 'expense', amount: 10_000,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    }];
+
+    const next = applyAccountArchiveMutation(
+      state,
+      account.id,
+      new Date('2026-08-27T01:00:00.000Z'),
+      () => 'account-archive',
+    );
+
+    expect(next.data.accounts[0].isActive).toBe(false);
+    expect(next.data.recurringRules[0].isActive).toBe(false);
+    expect(next.outbox.map((operation) => operation.recordId)).toEqual([
+      'rule-account',
+      account.id,
+    ]);
+    expect(state.data.accounts[0].isActive).toBe(true);
+    expect(state.data.recurringRules[0].isActive).toBe(true);
+  });
+
+  it('releases every goal allocation in one authenticated outbox batch', () => {
+    const state = readyAuthenticatedState();
+    state.data.goals = [{
+      id: 'goal-trip', ownerId: state.ownerId, version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'goal-create',
+      name: '旅行', targetAmount: 10_000, isActive: true,
+    }];
+    state.data.allocations = ['a1', 'a2'].map((id) => ({
+      id, ownerId: state.ownerId, version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: `${id}-create`,
+      goalId: 'goal-trip', amountDelta: 500, occurredAt: '2026-08-27 08:00',
+    }));
+
+    const next = applyGoalAllocationReleaseMutation(
+      state,
+      'goal-trip',
+      new Date('2026-08-27T01:00:00.000Z'),
+      (() => {
+        let index = 0;
+        return () => `release-${++index}`;
+      })(),
+      'release-goal-batch',
+    );
+
+    expect(next.data.allocations.every((allocation) => Boolean(allocation.deletedAt))).toBe(true);
+    expect(next.outbox).toHaveLength(2);
+    expect(next.outbox.every((operation) => operation.batchId === 'release-goal-batch')).toBe(true);
+    expect(state.data.allocations.every((allocation) => !allocation.deletedAt)).toBe(true);
+  });
+
   it('archives a category and pauses its active recurring rules in one state transition', () => {
     const state = createInitialState('guest');
     const category = state.data.categories.find((item) => item.kind === 'expense')!;

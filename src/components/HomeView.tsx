@@ -26,6 +26,7 @@ import {
 } from "../app/tutorial";
 import { FinanceIcon } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
+import { syncRecordKey } from "../domain/syncEngine";
 
 interface HomeViewProps {
   data: FinanceData;
@@ -34,6 +35,8 @@ interface HomeViewProps {
   deleteTransaction(record: Transaction): boolean;
   tutorial?: TutorialProgress | null;
   onTutorialEvent?(event: TutorialEvent): void;
+  unresolvedSyncRecordKeys?: ReadonlySet<string>;
+  acceptRemoteConflict?(recordId: string): void;
 }
 
 const ledgerPageSize = 30;
@@ -45,6 +48,8 @@ export function HomeView({
   deleteTransaction,
   tutorial,
   onTutorialEvent,
+  unresolvedSyncRecordKeys = new Set(),
+  acceptRemoteConflict,
 }: HomeViewProps) {
   const amountRef = useRef<HTMLInputElement>(null);
   const [type, setType] = useState<"expense" | "income">("expense");
@@ -160,6 +165,10 @@ export function HomeView({
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
+    if (editing && unresolvedSyncRecordKeys.has(syncRecordKey("transactions", editing.id))) {
+      setError("這筆交易有未解同步衝突；請先選擇雲端版本，本次修改未執行。");
+      return;
+    }
     const numericAmount = parseRequiredNumberInput(amount);
     const category = data.categories.find(
       (item) => item.id === resolvedCategoryId,
@@ -405,6 +414,9 @@ export function HomeView({
               className={`save-entry ${type}`}
               type="submit"
               data-tutorial="create"
+              disabled={Boolean(editing && unresolvedSyncRecordKeys.has(
+                syncRecordKey("transactions", editing.id),
+              ))}
             >
               {editing
                 ? "儲存修改"
@@ -485,6 +497,9 @@ export function HomeView({
                 );
               }
               const transaction = entry.record;
+              const hasUnresolvedConflict = unresolvedSyncRecordKeys.has(
+                syncRecordKey("transactions", transaction.id),
+              );
               const tutorialRow = isTutorialTransaction(transaction);
               const category = data.categories.find(
                 (item) => item.id === transaction.categoryId,
@@ -520,6 +535,20 @@ export function HomeView({
                         ? ` · ${transaction.note}`
                         : ""}
                     </small>
+                    {hasUnresolvedConflict && (
+                      <small role="status">
+                        同步衝突：編輯與刪除已暫停。
+                        {acceptRemoteConflict && (
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => acceptRemoteConflict(transaction.id)}
+                          >
+                            使用雲端版本
+                          </button>
+                        )}
+                      </small>
+                    )}
                   </div>
                   <b className={transaction.type}>
                     {transaction.type === "income" ? "+" : "−"}
@@ -529,6 +558,10 @@ export function HomeView({
                     <button
                       type="button"
                       aria-label={`編輯 ${category?.name ?? transaction.categoryName}`}
+                      disabled={hasUnresolvedConflict}
+                      title={hasUnresolvedConflict
+                        ? "此交易有未解同步衝突，請先選擇雲端版本。"
+                        : undefined}
                       onClick={() => beginEdit(transaction)}
                     >
                       <Pencil className="h-4 w-4" />
@@ -536,6 +569,10 @@ export function HomeView({
                     <button
                       type="button"
                       aria-label={`刪除 ${category?.name ?? transaction.categoryName}`}
+                      disabled={hasUnresolvedConflict}
+                      title={hasUnresolvedConflict
+                        ? "此交易有未解同步衝突，請先選擇雲端版本。"
+                        : undefined}
                       onClick={() => {
                         if (
                           window.confirm("刪除這筆紀錄？它不會再出現在帳本中。")

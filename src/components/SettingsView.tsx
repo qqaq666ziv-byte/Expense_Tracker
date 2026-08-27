@@ -18,6 +18,7 @@ import type {
   RecurringRule,
 } from "../domain/model";
 import { isEditorSnapshotStale } from "../domain/staleEditor";
+import { syncRecordKey } from "../domain/syncEngine";
 import {
   BackupSizeLimitError,
   exportFinanceBackup,
@@ -55,6 +56,7 @@ interface SettingsViewProps {
   categoryLifecycle(record: Category, action: CategoryAction): boolean;
   deleteRecurring(record: RecurringRule): boolean;
   restore(data: FinanceData): void;
+  unresolvedSyncRecordKeys?: ReadonlySet<string>;
 }
 
 type Section = "categories" | "recurring" | "backup";
@@ -93,6 +95,7 @@ function CategoriesPanel({
   ownerId,
   putCategory,
   categoryLifecycle,
+  unresolvedSyncRecordKeys = new Set(),
 }: SettingsViewProps) {
   const [kind, setKind] = useState<"expense" | "income">("expense");
   const [editing, setEditing] = useState<Category | null>(null);
@@ -114,6 +117,10 @@ function CategoriesPanel({
     const parsedOrder = Number(sortOrder);
     if (!Number.isInteger(parsedOrder) || parsedOrder < 1) {
       setMessage("顯示順序必須是大於 0 的整數");
+      return;
+    }
+    if (editing && unresolvedSyncRecordKeys.has(syncRecordKey("categories", editing.id))) {
+      setMessage("此分類有未解同步衝突；資料未變更，請先從同步狀態完成處理");
       return;
     }
     const record: Category = editing
@@ -250,6 +257,9 @@ function CategoriesPanel({
                   const duplicate = findCategoryNameConflict(categories, category.kind, category.name, category.id);
                   const archiveBlock = getCategoryActionBlock(data, category, "archive");
                   const deleteBlock = getCategoryActionBlock(data, category, "delete");
+                  const conflictBlocked = unresolvedSyncRecordKeys.has(
+                    syncRecordKey("categories", category.id),
+                  );
                   return <article
                     className={`settings-row ${category.isActive ? "" : "opacity-55"}`}
                     key={category.id}
@@ -264,16 +274,27 @@ function CategoriesPanel({
                         {duplicate ? " · 名稱重複，請手動處理" : ""}
                       </span>
                     </span>
-                    <button type="button" className="icon-button" aria-label={`編輯 ${category.name}`} onClick={() => edit(category)}>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      aria-label={`編輯 ${category.name}`}
+                      disabled={conflictBlocked}
+                      title={conflictBlocked
+                        ? "此分類有未解同步衝突，請先完成同步後再編輯。"
+                        : undefined}
+                      onClick={() => edit(category)}
+                    >
                       <Pencil className="h-4 w-4" />
                     </button>
                     {category.isActive ? (
                       <button
                         className="icon-button"
                         type="button"
-                        aria-disabled={Boolean(archiveBlock)}
+                        disabled={Boolean(archiveBlock) || conflictBlocked}
                         aria-label={`封存 ${category.name}`}
-                        title={archiveBlock?.message ?? "封存"}
+                        title={conflictBlocked
+                          ? "此分類有未解同步衝突，請先選擇雲端版本。"
+                          : archiveBlock?.message ?? "封存"}
                         onClick={() => {
                           if (archiveBlock) return setMessage(archiveBlock.message);
                           completeAppliedMutation(
@@ -290,6 +311,10 @@ function CategoriesPanel({
                         type="button"
                         className="secondary-button"
                         aria-label={`重新啟用 ${category.name}`}
+                        disabled={conflictBlocked}
+                        title={conflictBlocked
+                          ? "此分類有未解同步衝突，請先選擇雲端版本。"
+                          : undefined}
                         onClick={() => completeAppliedMutation(
                           categoryLifecycle(category, "restore"),
                           () => setMessage(`已重新啟用「${category.name}」`),
@@ -303,8 +328,10 @@ function CategoriesPanel({
                       type="button"
                       className="icon-button danger"
                       aria-label={`刪除 ${category.name}`}
-                      aria-disabled={Boolean(deleteBlock)}
-                      title={deleteBlock?.message ?? "刪除未使用分類"}
+                      disabled={Boolean(deleteBlock) || conflictBlocked}
+                      title={conflictBlocked
+                        ? "此分類有未解同步衝突，請先選擇雲端版本。"
+                        : deleteBlock?.message ?? "刪除未使用分類"}
                       onClick={() => {
                         if (deleteBlock) return setMessage(deleteBlock.message);
                         if (!window.confirm(`刪除未使用分類「${category.name}」？此操作會以同步刪除標記保留防復活紀錄，不代表立即永久抹除。`)) return;
@@ -332,6 +359,7 @@ export interface RecurringPanelProps {
   ownerId: string;
   putRecurring(record: RecurringRule): boolean;
   deleteRecurring(record: RecurringRule): boolean;
+  unresolvedSyncRecordKeys?: ReadonlySet<string>;
 }
 
 export function includeCurrentInactiveOption<T extends { id: string }>(
@@ -361,8 +389,9 @@ export function getRecurringResumeBlock(
 export function isRecurringEditStale(
   opened: RecurringRule,
   current: RecurringRule | undefined,
+  hasUnresolvedConflict = false,
 ): boolean {
-  return isEditorSnapshotStale(opened, current);
+  return isEditorSnapshotStale(opened, current, { hasUnresolvedConflict });
 }
 
 export function RecurringPanel({
@@ -370,6 +399,7 @@ export function RecurringPanel({
   ownerId,
   putRecurring,
   deleteRecurring,
+  unresolvedSyncRecordKeys = new Set(),
 }: RecurringPanelProps) {
   const [editing, setEditing] = useState<RecurringRule | null>(null);
   const [type, setType] = useState<"expense" | "income">("expense");
@@ -398,10 +428,16 @@ export function RecurringPanel({
     ? data.accounts.find((item) => item.id === editing.accountId && !item.deletedAt)
     : undefined;
   const accounts = includeCurrentInactiveOption(activeAccounts, editingAccount);
+  const selectableCategories = categories.filter((item) => (
+    !unresolvedSyncRecordKeys.has(syncRecordKey("categories", item.id))
+  ));
+  const selectableAccounts = accounts.filter((item) => (
+    !unresolvedSyncRecordKeys.has(syncRecordKey("accounts", item.id))
+  ));
   const resolvedCategory =
-    categories.find((item) => item.id === categoryId) ?? categories[0];
+    selectableCategories.find((item) => item.id === categoryId) ?? selectableCategories[0];
   const resolvedAccount =
-    accounts.find((item) => item.id === accountId) ?? accounts[0];
+    selectableAccounts.find((item) => item.id === accountId) ?? selectableAccounts[0];
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const numeric = parseRequiredNumberInput(amount);
@@ -421,11 +457,22 @@ export function RecurringPanel({
     const currentRule = editing
       ? data.recurringRules.find((item) => item.id === editing.id && !item.deletedAt)
       : undefined;
+    const hasUnresolvedConflict = editing
+      ? unresolvedSyncRecordKeys.has(syncRecordKey("recurringRules", editing.id))
+      : false;
+    if (hasUnresolvedConflict) {
+      setMessage("此週期規則有未解同步衝突；資料未變更，請先從同步狀態完成處理");
+      return;
+    }
     if (editing && !currentRule) {
       setMessage("找不到要編輯的週期規則；資料未變更");
       return;
     }
-    if (editing && currentRule && isRecurringEditStale(editing, currentRule)) {
+    if (editing && currentRule && isRecurringEditStale(
+      editing,
+      currentRule,
+      hasUnresolvedConflict,
+    )) {
       setMessage("此週期規則已在背景更新；為避免覆蓋較新排程，請取消後重新開啟編輯");
       return;
     }
@@ -566,8 +613,13 @@ export function RecurringPanel({
                 onChange={(event) => setCategoryId(event.target.value)}
               >
                 {categories.map((item) => (
-                  <option value={item.id} key={item.id}>
+                  <option
+                    value={item.id}
+                    key={item.id}
+                    disabled={unresolvedSyncRecordKeys.has(syncRecordKey("categories", item.id))}
+                  >
                     {item.name}{!item.isActive ? "（已封存）" : ""}
+                    {unresolvedSyncRecordKeys.has(syncRecordKey("categories", item.id)) ? "（同步批次待完成）" : ""}
                   </option>
                 ))}
               </select>
@@ -581,8 +633,13 @@ export function RecurringPanel({
                 onChange={(event) => setAccountId(event.target.value)}
               >
                 {accounts.map((item) => (
-                  <option value={item.id} key={item.id}>
+                  <option
+                    value={item.id}
+                    key={item.id}
+                    disabled={unresolvedSyncRecordKeys.has(syncRecordKey("accounts", item.id))}
+                  >
                     {item.name}{!item.isActive ? "（已封存）" : ""}
+                    {unresolvedSyncRecordKeys.has(syncRecordKey("accounts", item.id)) ? "（同步批次待完成）" : ""}
                   </option>
                 ))}
               </select>
@@ -622,7 +679,14 @@ export function RecurringPanel({
             筆，超過時不會建立或跳過任何期數。
           </p>
           <div className="flex gap-2">
-            <button className="primary-button flex-1" type="submit">
+            <button
+              className="primary-button flex-1"
+              type="submit"
+              disabled={!resolvedCategory || !resolvedAccount}
+              title={!resolvedCategory || !resolvedAccount
+                ? "分類或帳戶仍有同步批次待完成，暫時不能建立或更新週期規則。"
+                : undefined}
+            >
               {editing ? <Save className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
               {editing ? "儲存週期規則" : "建立週期規則"}
             </button>
@@ -664,6 +728,9 @@ export function RecurringPanel({
                 rule,
                 today,
               ).blocked;
+              const conflictBlocked = unresolvedSyncRecordKeys.has(
+                syncRecordKey("recurringRules", rule.id),
+              );
               return (
                 <article
                   className={`settings-row ${rule.isActive ? "" : "opacity-60"}`}
@@ -696,6 +763,10 @@ export function RecurringPanel({
                     type="button"
                     className="icon-button"
                     aria-label={`編輯 ${rule.name}`}
+                    disabled={conflictBlocked}
+                    title={conflictBlocked
+                      ? "此週期規則有未解同步衝突，請先完成同步後再編輯。"
+                      : undefined}
                     onClick={() => edit(rule)}
                   >
                     <Pencil className="h-4 w-4" />
@@ -706,6 +777,10 @@ export function RecurringPanel({
                     aria-label={
                       rule.isActive ? `暫停 ${rule.name}` : `恢復 ${rule.name}`
                     }
+                    disabled={conflictBlocked}
+                    title={conflictBlocked
+                      ? "此週期規則有未解同步衝突，請先選擇雲端版本。"
+                      : undefined}
                     onClick={() => toggle(rule)}
                   >
                     {rule.isActive ? (
@@ -718,6 +793,10 @@ export function RecurringPanel({
                     type="button"
                     className="icon-button danger"
                     aria-label={`刪除 ${rule.name}`}
+                    disabled={conflictBlocked}
+                    title={conflictBlocked
+                      ? "此週期規則有未解同步衝突，請先選擇雲端版本。"
+                      : undefined}
                     onClick={() => {
                       if (
                         window.confirm(

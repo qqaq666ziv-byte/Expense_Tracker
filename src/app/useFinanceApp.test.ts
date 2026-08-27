@@ -8,12 +8,199 @@ import {
 } from './state';
 import {
   applyFinanceMutationUnlessRecovering,
+  assertFinanceMutationNotSyncing,
+  assertSyncRecordMutationAllowed,
+  assertSyncRecordMutationsAllowed,
   assertCurrentOwnerContext,
   clearSuccessfulRecoveryUiState,
   materializeRecurringTransactionsUnlessRecovering,
+  materializeRecurringTransactionsUnlessSyncing,
   resolveLegacyBootstrapState,
   restoreFinanceStateUnlessLegacyBootstrap,
+  syncMutationTargets,
 } from './useFinanceApp';
+
+describe('unresolved sync conflict mutation lock', () => {
+  it('blocks a new local winner for a record with a durable same-clock payload conflict', () => {
+    const state = createInitialState('user-a');
+    const account = state.data.accounts[0];
+    state.outbox = [];
+    state.unresolvedSyncRecordKeys = [`accounts:${account.id}`];
+
+    expect(() => assertSyncRecordMutationAllowed(state, 'accounts', account.id))
+      .toThrow(/未解同步衝突/);
+  });
+
+  it('serializes financial mutations behind an in-flight sync', () => {
+    expect(() => assertFinanceMutationNotSyncing(true)).toThrow(/同步正在比對/);
+    expect(() => assertFinanceMutationNotSyncing(false)).not.toThrow();
+  });
+
+  it('rechecks the authoritative sync token before recurrence materialization', () => {
+    const state = createInitialState('guest');
+    const syncInProgress = vi.fn(() => true);
+
+    expect(materializeRecurringTransactionsUnlessSyncing(
+      state,
+      '2026-08-27',
+      undefined,
+      syncInProgress,
+    )).toBe(state);
+    expect(syncInProgress).toHaveBeenCalledOnce();
+  });
+
+  it('includes dependent recurring rules and reordered siblings in a category mutation lock', () => {
+    const state = createInitialState('guest');
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const sibling = state.data.categories.find((item) => item.kind === 'expense' && item.id !== category.id)!;
+    const account = state.data.accounts[0];
+    state.data.recurringRules = [{
+      id: 'rule-dependent', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-create',
+      name: '依賴規則', type: 'expense', amount: 100,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    }];
+    state.unresolvedSyncRecordKeys = ['recurringRules:rule-dependent'];
+    const targets = syncMutationTargets(state, 'categories', {
+      ...category,
+      name: '改名後分類',
+      sortOrder: sibling.sortOrder,
+    });
+
+    expect(targets).toEqual(expect.arrayContaining([
+      { entity: 'categories', recordId: sibling.id },
+      { entity: 'recurringRules', recordId: 'rule-dependent' },
+    ]));
+    expect(() => assertSyncRecordMutationsAllowed(state, targets)).toThrow(/未解同步衝突/);
+  });
+
+  it('allows an appended replacement category without touching a locked tombstoned sibling', () => {
+    const state = createInitialState('user-a');
+    state.initialBootstrap = undefined;
+    state.outbox = [];
+    const expenseCategories = state.data.categories
+      .filter((category) => category.kind === 'expense' && !category.deletedAt);
+    const locked = expenseCategories[0];
+    state.unresolvedSyncRecordKeys = [`categories:${locked.id}`];
+    const replacement = {
+      id: 'replacement-expense', ownerId: 'user-a', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'replacement-create',
+      name: '替代支出', kind: 'expense' as const,
+      icon: { type: 'emoji' as const, value: '🧾' }, isActive: true,
+      sortOrder: Math.max(...expenseCategories.map((category) => category.sortOrder)) + 1,
+    };
+
+    const targets = syncMutationTargets(state, 'categories', replacement);
+
+    expect(targets).toEqual([{ entity: 'categories', recordId: replacement.id }]);
+    expect(() => assertSyncRecordMutationsAllowed(state, targets)).not.toThrow();
+  });
+
+  it('expands a persisted conflict lock to every still-pending batch member', () => {
+    const state = createInitialState('user-a');
+    state.initialBootstrap = undefined;
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const rule: RecurringRule = {
+      id: 'rule-batch-member', ownerId: 'user-a', version: 2,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-pause',
+      name: '批次規則', type: 'expense', amount: 100,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: false,
+    };
+    state.data.recurringRules = [rule];
+    state.outbox = [{
+      id: account.lastOperationId, entity: 'accounts', recordId: account.id,
+      record: account, attempts: 1, queuedAt: account.updatedAt, batchId: 'archive-batch',
+      batchBeforeRecord: account,
+    }, {
+      id: rule.lastOperationId, entity: 'recurringRules', recordId: rule.id,
+      record: rule, attempts: 1, queuedAt: rule.updatedAt, batchId: 'archive-batch',
+      batchBeforeRecord: { ...rule, version: 1, lastOperationId: 'rule-active', isActive: true },
+    }];
+    state.unresolvedSyncRecordKeys = [`accounts:${account.id}`];
+
+    expect(() => assertSyncRecordMutationAllowed(state, 'recurringRules', rule.id))
+      .toThrow(/未解同步衝突/);
+  });
+
+  it('blocks a new recurring rule while either selected parent belongs to a pending batch', () => {
+    const state = createInitialState('user-a');
+    state.initialBootstrap = undefined;
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.outbox = [{
+      id: account.lastOperationId,
+      entity: 'accounts',
+      recordId: account.id,
+      record: account,
+      attempts: 0,
+      queuedAt: account.updatedAt,
+      batchId: 'pending-account-batch',
+      batchBeforeRecord: structuredClone(account),
+    }];
+    const rule: RecurringRule = {
+      id: 'new-rule-under-pending-parent', ownerId: 'user-a', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-create',
+      name: '新規則', type: 'expense', amount: 100,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-09-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    };
+    const targets = syncMutationTargets(state, 'recurringRules', rule);
+
+    expect(targets).toEqual(expect.arrayContaining([
+      { entity: 'accounts', recordId: account.id },
+      { entity: 'categories', recordId: category.id },
+    ]));
+    expect(() => assertSyncRecordMutationsAllowed(state, targets)).toThrow(/未解同步衝突/);
+  });
+
+  it('locks a new allocation behind its parent goal and every active sibling allocation', () => {
+    const state = createInitialState('guest');
+    state.data.goals = [{
+      id: 'goal-a', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'goal-create',
+      name: '緊急預備金', targetAmount: 5_000, isActive: true,
+    }];
+    state.data.allocations = [{
+      id: 'allocation-existing', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'allocation-create',
+      goalId: 'goal-a', amountDelta: 500, occurredAt: '2026-08-27 08:00',
+    }];
+    state.unresolvedSyncRecordKeys = ['allocations:allocation-existing'];
+    const targets = syncMutationTargets(state, 'allocations', {
+      id: 'allocation-new', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T01:00:00.000Z', lastOperationId: 'allocation-new',
+      goalId: 'goal-a', amountDelta: 300, occurredAt: '2026-08-27 09:00',
+    });
+
+    expect(targets).toEqual(expect.arrayContaining([
+      { entity: 'goals', recordId: 'goal-a' },
+      { entity: 'allocations', recordId: 'allocation-existing' },
+    ]));
+    expect(() => assertSyncRecordMutationsAllowed(state, targets)).toThrow(/未解同步衝突/);
+  });
+
+  it('blocks backup restore until every record conflict has an explicit resolution', () => {
+    const state = createInitialState('user-a');
+    state.initialBootstrap = undefined;
+    state.unresolvedSyncRecordKeys = [`accounts:${state.data.accounts[0].id}`];
+
+    expect(() => restoreFinanceStateUnlessLegacyBootstrap(
+      state,
+      structuredClone(state.data),
+      vi.fn(),
+      vi.fn(),
+    )).toThrow(/先.*選擇雲端版本/);
+  });
+});
 
 function corruptedGuestLoad() {
   const raw = '{broken-json';

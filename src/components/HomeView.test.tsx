@@ -80,4 +80,32 @@ describe('HomeView ledger access', () => {
     expect(tutorialHtml).toContain('教學紀錄 · 完成後刪除');
     expect(tutorialHtml).toContain('data-tutorial="tutorial-record"');
   });
+
+  it('shows a record-level conflict and disables transaction edit and delete actions', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.transactions = [{
+      id: 'transaction-conflict', ownerId: 'guest', version: 3,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'same-clock',
+      amount: 100, type: 'expense', categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name, occurredAt: '2026-08-27 08:00',
+    }];
+
+    const html = renderToStaticMarkup(
+      <HomeView
+        data={state.data}
+        ownerId="guest"
+        put={() => true}
+        deleteTransaction={() => true}
+        unresolvedSyncRecordKeys={new Set(['transactions:transaction-conflict'])}
+        acceptRemoteConflict={() => undefined}
+      />,
+    );
+
+    expect(html).toContain('同步衝突：編輯與刪除已暫停');
+    expect(html).toContain('使用雲端版本');
+    expect(html.match(/<button[^>]*aria-label="編輯 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
+    expect(html.match(/<button[^>]*aria-label="刪除 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
+  });
 });

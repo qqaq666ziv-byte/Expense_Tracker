@@ -802,5 +802,40 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
         );
       }
     },
+
+    async compareAndSwap(ownerId, expected, replacement) {
+      await assertAuthenticatedOwner(client, ownerId);
+      validateOperation(ownerId, replacement);
+      if (expected.entity !== replacement.entity
+        || expected.record.ownerId !== ownerId
+        || expected.record.id !== replacement.recordId) {
+        throw new Error('Conditional compensation target does not match the expected remote record');
+      }
+      const table = TABLE_BY_ENTITY[replacement.entity];
+      const row = encodeRecord(replacement.entity, replacement.record);
+      const { data, error } = await client
+        .from(table)
+        .update(row)
+        .eq('user_id', ownerId)
+        .eq('id', replacement.recordId)
+        .eq('version', expected.record.version)
+        .eq('last_operation_id', expected.record.lastOperationId)
+        .select(selectProjection(replacement.entity))
+        .maybeSingle();
+      if (error) throw new Error(applyErrorText(error, replacement));
+      if (!data) return undefined;
+      const persisted = decodeRemoteRecord(replacement.entity, data as unknown as DatabaseRow).record;
+      if (persisted.ownerId !== ownerId
+        || persisted.id !== replacement.recordId
+        || persisted.version !== replacement.record.version
+        || persisted.lastOperationId !== replacement.id
+        || differingPayloadColumns(
+          encodeRecord(replacement.entity, replacement.record),
+          encodeRecord(replacement.entity, persisted),
+        ).length > 0) {
+        throw new Error(`Supabase conditional compensation verification failed for ${replacement.entity}/${replacement.recordId}`);
+      }
+      return { entity: replacement.entity, record: persisted } as RemoteRecord;
+    },
   };
 }

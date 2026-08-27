@@ -6,12 +6,20 @@ import type {
   FinanceEntityName,
   AssetAccount,
   Category,
+  SavingsAllocation,
+  SavingsGoal,
   PersistedFinanceState,
   SyncRecord,
 } from '../domain/model';
 import { catchUpRecurringTransactions } from '../domain/recurrence';
 import { recurringRuleParentIssue } from '../domain/recurringSafety';
-import type { SyncReport } from '../domain/syncEngine';
+import {
+  acceptRemoteConflictRecord,
+  hasUnresolvedPayloadConflict,
+  syncRecordKey,
+  unresolvedPayloadConflictKeys,
+  type SyncReport,
+} from '../domain/syncEngine';
 import { createSupabaseRemoteAdapter } from '../data/supabaseRemote';
 import {
   restoreFinanceStateAndClearRecovery,
@@ -19,6 +27,8 @@ import {
 } from './safeSync';
 import {
   applySyncCompletion,
+  applyAccountArchiveMutation,
+  applyGoalAllocationReleaseMutation,
   applyCategoryLifecycleMutation,
   advanceFinanceStateRef,
   canAutoSaveFinanceState,
@@ -45,6 +55,9 @@ export interface FinanceAppController {
   cloudEnabled: boolean;
   syncBusy: boolean;
   syncReport: SyncReport | null;
+  unresolvedSyncRecordKeys: ReadonlySet<string>;
+  mutationLockedRecordKeys: ReadonlySet<string>;
+  conflictResolutionImpact: ReadonlyMap<string, number>;
   storageError?: string;
   storageRecovery?: LocalStateRecovery;
   guestImportNotice?: string;
@@ -58,7 +71,10 @@ export interface FinanceAppController {
   setData(data: FinanceData): void;
   put<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
   categoryLifecycle(record: Category, action: CategoryAction): boolean;
+  archiveAccount(record: AssetAccount): boolean;
+  releaseGoalAllocations(goal: SavingsGoal): boolean;
   softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
+  acceptRemoteConflict(entity: FinanceEntityName, recordId: string): Promise<boolean>;
   syncNow(): Promise<void>;
   signIn(): Promise<void>;
   signOut(): Promise<void>;
@@ -148,6 +164,9 @@ export function restoreFinanceStateUnlessLegacyBootstrap(
   if (state.legacyBootstrap) {
     throw new Error('請先完成舊版候選資料決策，再執行一般備份還原');
   }
+  if ((state.unresolvedSyncRecordKeys?.length ?? 0) > 0) {
+    throw new Error('仍有未解同步衝突；請先在衝突提示中明確選擇雲端版本，再還原備份。');
+  }
   return restoreFinanceStateAndClearRecovery(state, data, persist, clearRecovery);
 }
 
@@ -164,6 +183,96 @@ export function applyFinanceMutationUnlessRecovering(
   return recovery ? state : mutate(state);
 }
 
+export function assertSyncRecordMutationAllowed(
+  state: PersistedFinanceState,
+  entity: FinanceEntityName,
+  recordId: string,
+): void {
+  if (hasUnresolvedPayloadConflict(
+    state.outbox,
+    entity,
+    recordId,
+    state.unresolvedSyncRecordKeys,
+  )) {
+    throw new Error(`此筆${entity}資料有未解同步衝突；為避免覆蓋另一裝置內容，本次操作未執行。`);
+  }
+}
+
+export function assertSyncRecordMutationsAllowed(
+  state: PersistedFinanceState,
+  targets: readonly { entity: FinanceEntityName; recordId: string }[],
+): void {
+  for (const target of targets) {
+    assertSyncRecordMutationAllowed(state, target.entity, target.recordId);
+  }
+}
+
+export function assertFinanceMutationNotSyncing(syncInProgress: boolean): void {
+  if (syncInProgress) {
+    throw new Error('同步正在比對另一台裝置的版本；請等同步完成後再操作。');
+  }
+}
+
+export function syncMutationTargets<E extends FinanceEntityName>(
+  state: PersistedFinanceState,
+  entity: E,
+  record: FinanceData[E][number],
+): { entity: FinanceEntityName; recordId: string }[] {
+  const targets: { entity: FinanceEntityName; recordId: string }[] = [
+    { entity, recordId: record.id },
+  ];
+  if (entity === 'categories') {
+    const category = record as Category;
+    const existing = state.data.categories.find((candidate) => candidate.id === category.id);
+    const siblings = state.data.categories
+      .filter((candidate) => (
+        !candidate.deletedAt && candidate.kind === category.kind && candidate.id !== category.id
+      ))
+      .sort((left, right) => left.sortOrder - right.sortOrder || left.id.localeCompare(right.id));
+    const desiredIndex = Math.max(0, Math.min(category.sortOrder, siblings.length));
+    const ordered = [...siblings];
+    ordered.splice(desiredIndex, 0, category);
+    targets.push(...ordered.flatMap((candidate, sortOrder) => (
+      candidate.id !== category.id && candidate.sortOrder !== sortOrder
+        ? [{ entity: 'categories' as const, recordId: candidate.id }]
+        : []
+    )));
+    if (existing && existing.name !== category.name) {
+      targets.push(...state.data.recurringRules
+        .filter((rule) => !rule.deletedAt && rule.categoryId === category.id)
+        .map((rule) => ({ entity: 'recurringRules' as const, recordId: rule.id })));
+    }
+  }
+  if (entity === 'accounts') {
+    const account = record as AssetAccount;
+    const existing = state.data.accounts.find((candidate) => candidate.id === account.id);
+    if (existing && existing.name !== account.name) {
+      targets.push(...state.data.recurringRules
+        .filter((rule) => !rule.deletedAt && rule.accountId === account.id)
+        .map((rule) => ({ entity: 'recurringRules' as const, recordId: rule.id })));
+    }
+  }
+  if (entity === 'allocations') {
+    const allocation = record as SavingsAllocation;
+    targets.push({ entity: 'goals', recordId: allocation.goalId });
+    targets.push(...state.data.allocations
+      .filter((candidate) => (
+        !candidate.deletedAt
+        && candidate.goalId === allocation.goalId
+        && candidate.id !== allocation.id
+      ))
+      .map((candidate) => ({ entity: 'allocations' as const, recordId: candidate.id })));
+  }
+  if (entity === 'recurringRules') {
+    const rule = record as FinanceData['recurringRules'][number];
+    targets.push(
+      { entity: 'accounts', recordId: rule.accountId },
+      { entity: 'categories', recordId: rule.categoryId },
+    );
+  }
+  return targets;
+}
+
 export function materializeRecurringTransactionsUnlessRecovering(
   state: PersistedFinanceState,
   calendarDay: string,
@@ -175,6 +284,12 @@ export function materializeRecurringTransactionsUnlessRecovering(
     let next = current;
     let changed = false;
     for (const rule of current.data.recurringRules.filter((item) => !item.deletedAt && item.isActive)) {
+      if (hasUnresolvedPayloadConflict(
+        current.outbox,
+        'recurringRules',
+        rule.id,
+        current.unresolvedSyncRecordKeys,
+      )) continue;
       if (recurringRuleParentIssue(next.data, rule)) {
         next = putRecord(next, 'recurringRules', {
           ...rule,
@@ -200,6 +315,16 @@ export function materializeRecurringTransactionsUnlessRecovering(
     }
     return changed ? next : current;
   });
+}
+
+export function materializeRecurringTransactionsUnlessSyncing(
+  state: PersistedFinanceState,
+  calendarDay: string,
+  recovery: LocalStateRecovery | undefined,
+  syncInProgress: () => boolean,
+): PersistedFinanceState {
+  if (syncInProgress()) return state;
+  return materializeRecurringTransactionsUnlessRecovering(state, calendarDay, recovery);
 }
 
 function localDateString(date = new Date()): string {
@@ -398,6 +523,11 @@ export function useFinanceApp(): FinanceAppController {
       return false;
     }
     try {
+      assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertSyncRecordMutationsAllowed(
+        stateRef.current,
+        syncMutationTargets(stateRef.current, entity, record),
+      );
       if (entity === 'categories') {
         assertCategoryUpsert(stateRef.current.data, record as Category);
       }
@@ -420,6 +550,7 @@ export function useFinanceApp(): FinanceAppController {
   const categoryLifecycle = useCallback((record: Category, action: CategoryAction) => {
     try {
       assertRenderedOwnerContext();
+      assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
       if (stateRef.current.legacyBootstrap?.status === 'pending') {
         throw new Error('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
       }
@@ -429,10 +560,77 @@ export function useFinanceApp(): FinanceAppController {
       if (storageRecoveryRef.current) {
         throw new Error('本機快照仍在復原保護中；完成有效備份還原前，本次帳本修改未執行。');
       }
+      const targets = [
+        { entity: 'categories' as const, recordId: record.id },
+        ...(action === 'archive'
+          ? stateRef.current.data.recurringRules
+            .filter((rule) => !rule.deletedAt && rule.isActive && rule.categoryId === record.id)
+            .map((rule) => ({ entity: 'recurringRules' as const, recordId: rule.id }))
+          : []),
+      ];
+      assertSyncRecordMutationsAllowed(stateRef.current, targets);
       commitState((current) => applyCategoryLifecycleMutation(current, record.id, action));
       return true;
     } catch (error) {
       setSafetyNotice(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }, [assertRenderedOwnerContext, commitState]);
+
+  const archiveAccount = useCallback((record: AssetAccount) => {
+    try {
+      assertRenderedOwnerContext();
+      assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      const current = stateRef.current;
+      if (current.legacyBootstrap?.status === 'pending' || current.initialBootstrap) {
+        throw new Error('雲端帳本尚在安全讀取；完成前本次封存未執行。');
+      }
+      if (storageRecoveryRef.current) {
+        throw new Error('本機快照仍在復原保護中；本次封存未執行。');
+      }
+      const targets = [
+        { entity: 'accounts' as const, recordId: record.id },
+        ...current.data.recurringRules
+          .filter((rule) => !rule.deletedAt && rule.isActive && rule.accountId === record.id)
+          .map((rule) => ({ entity: 'recurringRules' as const, recordId: rule.id })),
+      ];
+      assertSyncRecordMutationsAllowed(current, targets);
+      commitState((latest) => {
+        assertSyncRecordMutationsAllowed(latest, targets);
+        return applyAccountArchiveMutation(latest, record.id);
+      });
+      return true;
+    } catch (error) {
+      setSafetyNotice(`帳戶未封存：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }, [assertRenderedOwnerContext, commitState]);
+
+  const releaseGoalAllocationRecords = useCallback((goal: SavingsGoal) => {
+    try {
+      assertRenderedOwnerContext();
+      assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      const current = stateRef.current;
+      if (current.legacyBootstrap?.status === 'pending' || current.initialBootstrap) {
+        throw new Error('雲端帳本尚在安全讀取；完成前本次釋放未執行。');
+      }
+      if (storageRecoveryRef.current) {
+        throw new Error('本機快照仍在復原保護中；本次釋放未執行。');
+      }
+      const targets = [
+        { entity: 'goals' as const, recordId: goal.id },
+        ...current.data.allocations
+          .filter((allocation) => !allocation.deletedAt && allocation.goalId === goal.id)
+          .map((allocation) => ({ entity: 'allocations' as const, recordId: allocation.id })),
+      ];
+      assertSyncRecordMutationsAllowed(current, targets);
+      commitState((latest) => {
+        assertSyncRecordMutationsAllowed(latest, targets);
+        return applyGoalAllocationReleaseMutation(latest, goal.id);
+      });
+      return true;
+    } catch (error) {
+      setSafetyNotice(`目標配置未釋放：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
   }, [assertRenderedOwnerContext, commitState]);
@@ -460,6 +658,8 @@ export function useFinanceApp(): FinanceAppController {
       return false;
     }
     try {
+      assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertSyncRecordMutationAllowed(stateRef.current, entity, record.id);
       const deleted = {
         ...record,
         ...tombstoneRecordMeta(record as SyncRecord),
@@ -480,6 +680,7 @@ export function useFinanceApp(): FinanceAppController {
   const setData = useCallback((data: FinanceData) => {
     try {
       assertRenderedOwnerContext();
+      assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setSafetyNotice(message);
@@ -505,16 +706,96 @@ export function useFinanceApp(): FinanceAppController {
     commitState(() => restored);
   }, [assertRenderedOwnerContext, commitState]);
 
+  const acceptRemoteConflict = useCallback(async (
+    entity: FinanceEntityName,
+    recordId: string,
+  ): Promise<boolean> => {
+    let resolutionToken: { generation: number; ownerId: string; id: symbol } | undefined;
+    try {
+      assertRenderedOwnerContext();
+      if (!supabase || stateRef.current.ownerId === 'guest') {
+        throw new Error('目前沒有可用的雲端帳本。');
+      }
+      if (syncTokenRef.current) throw new Error('同步進行中，請稍後再選擇雲端版本。');
+      const startedOwnerId = stateRef.current.ownerId;
+      const generation = ownerGenerationRef.current;
+      resolutionToken = { generation, ownerId: startedOwnerId, id: Symbol('resolve-sync-conflict') };
+      syncTokenRef.current = resolutionToken;
+      setSyncBusy(true);
+      const response = await createSupabaseRemoteAdapter(supabase).pull(startedOwnerId);
+      const pull = 'records' in response
+        ? response
+        : { records: [...response], issues: [] };
+      const broadIssue = pull.issues.find((candidate) => candidate.recordId === undefined);
+      if (broadIssue) throw new Error(broadIssue.message);
+      const requestedOperation = stateRef.current.outbox.find((operation) => (
+        operation.entity === entity && operation.recordId === recordId
+      ));
+      const directResolutionOperation = requestedOperation?.batchId
+        ? stateRef.current.outbox.find((operation) => (
+            operation.batchId === requestedOperation.batchId
+            && stateRef.current.unresolvedSyncRecordKeys?.includes(
+              syncRecordKey(operation.entity, operation.recordId),
+            )
+          ))
+        : undefined;
+      const resolutionEntity = directResolutionOperation?.entity ?? entity;
+      const resolutionRecordId = directResolutionOperation?.recordId ?? recordId;
+      const remoteRecord = pull.records.find((candidate) => (
+        candidate.entity === resolutionEntity && candidate.record.id === resolutionRecordId
+      ));
+      if (!remoteRecord) throw new Error('雲端回應中找不到這筆資料，衝突未解除。');
+      const resolutionBatchId = directResolutionOperation?.batchId ?? requestedOperation?.batchId;
+      const batchIssue = resolutionBatchId
+        ? pull.issues.find((candidate) => stateRef.current.outbox.some((operation) => (
+            operation.batchId === resolutionBatchId
+            && operation.entity === candidate.entity
+            && operation.recordId === candidate.recordId
+          )))
+        : undefined;
+      if (batchIssue) throw new Error(batchIssue.message);
+      const recordIssue = pull.issues.find((candidate) => (
+        candidate.entity === remoteRecord.entity && candidate.recordId === remoteRecord.record.id
+      ));
+      if (recordIssue) throw new Error(recordIssue.message);
+      if (ownerGenerationRef.current !== generation || activeOwnerRef.current !== startedOwnerId) {
+        throw new Error('帳戶已切換，衝突未解除。');
+      }
+      commitState((current) => acceptRemoteConflictRecord(
+        current,
+        remoteRecord,
+        pull.records,
+      ));
+      setSafetyNotice(undefined);
+      setSyncReport(null);
+      return true;
+    } catch (error) {
+      setSafetyNotice(`同步衝突未解除：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    } finally {
+      if (resolutionToken && syncTokenRef.current === resolutionToken) {
+        syncTokenRef.current = null;
+        setSyncBusy(false);
+      }
+    }
+  }, [assertRenderedOwnerContext, commitState]);
+
   useEffect(() => {
     if (storageRecovery
+      || syncBusy
+      || syncTokenRef.current !== null
       || state.legacyBootstrap?.status === 'pending'
       || state.initialBootstrap) return;
-    commitState((current) => materializeRecurringTransactionsUnlessRecovering(
-      current,
-      calendarDay,
-      storageRecoveryRef.current,
-    ));
-  }, [state.ownerId, state.legacyBootstrap?.status, state.initialBootstrap?.status, recurrenceCursorKey, calendarDay, commitState, storageRecovery]);
+    commitState((current) => {
+      if (syncTokenRef.current !== null) return current;
+      return materializeRecurringTransactionsUnlessSyncing(
+        current,
+        calendarDay,
+        storageRecoveryRef.current,
+        () => syncTokenRef.current !== null,
+      );
+    });
+  }, [state.ownerId, state.legacyBootstrap?.status, state.initialBootstrap?.status, recurrenceCursorKey, calendarDay, commitState, storageRecovery, syncBusy]);
 
   const guestLoad = useMemo(() => loadFinanceStateWithRecovery('guest'), [state.ownerId, state.data.transactions.length]);
   const guestFingerprint = guestSnapshotFingerprint(guestLoad.state.data);
@@ -553,6 +834,10 @@ export function useFinanceApp(): FinanceAppController {
     }
     if (stateRef.current.ownerId === 'guest') return;
     setGuestImportNotice(undefined);
+    if (syncTokenRef.current) {
+      setGuestImportNotice('同步正在比對雲端版本；完成前不會匯入訪客資料。');
+      return;
+    }
     if (stateRef.current.legacyBootstrap) {
       setGuestImportNotice('請先完成舊版帳本候選資料的匯入或保留雲端決定，再處理訪客資料。');
       return;
@@ -662,6 +947,35 @@ export function useFinanceApp(): FinanceAppController {
   }, []);
 
   const exposedState = state.ownerId === activeOwnerRef.current ? state : stateRef.current;
+  const unresolvedSyncRecordKeys = useMemo(() => unresolvedPayloadConflictKeys(
+    exposedState.outbox,
+    syncReport?.conflicts,
+    exposedState.unresolvedSyncRecordKeys,
+  ), [exposedState.outbox, exposedState.unresolvedSyncRecordKeys, syncReport]);
+  const conflictResolutionImpact = useMemo(() => {
+    const result = new Map<string, number>();
+    for (const key of unresolvedSyncRecordKeys) {
+      const operation = exposedState.outbox.find((candidate) => (
+        syncRecordKey(candidate.entity, candidate.recordId) === key
+      ));
+      result.set(key, operation?.batchId
+        ? exposedState.outbox.filter((candidate) => candidate.batchId === operation.batchId).length
+        : 1);
+    }
+    return result;
+  }, [exposedState.outbox, unresolvedSyncRecordKeys]);
+  const mutationLockedRecordKeys = useMemo(() => {
+    const keys = new Set(unresolvedSyncRecordKeys);
+    const pendingBatchIds = new Set(exposedState.outbox.flatMap((operation) => (
+      operation.batchId ? [operation.batchId] : []
+    )));
+    for (const operation of exposedState.outbox) {
+      if (operation.batchId && pendingBatchIds.has(operation.batchId)) {
+        keys.add(syncRecordKey(operation.entity, operation.recordId));
+      }
+    }
+    return keys;
+  }, [exposedState.outbox, unresolvedSyncRecordKeys]);
 
   return {
     state: exposedState,
@@ -670,6 +984,9 @@ export function useFinanceApp(): FinanceAppController {
     cloudEnabled: supabaseConfigured,
     syncBusy,
     syncReport,
+    unresolvedSyncRecordKeys,
+    mutationLockedRecordKeys,
+    conflictResolutionImpact,
     storageError,
     storageRecovery,
     guestImportNotice,
@@ -683,7 +1000,10 @@ export function useFinanceApp(): FinanceAppController {
     setData,
     put,
     categoryLifecycle,
+    archiveAccount,
+    releaseGoalAllocations: releaseGoalAllocationRecords,
     softDelete,
+    acceptRemoteConflict,
     syncNow,
     signIn,
     signOut,

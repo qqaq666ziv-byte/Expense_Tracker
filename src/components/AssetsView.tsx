@@ -24,6 +24,7 @@ import { completeAppliedMutation } from "../app/mutationResult";
 import { isFinancialTransaction } from "../domain/tutorialRecord";
 import { FinanceIcon, IconPicker } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
+import { syncRecordKey } from "../domain/syncEngine";
 import {
   assertFreshEditorSnapshot,
   isEditorSnapshotStale,
@@ -35,6 +36,7 @@ interface AssetsViewProps {
   putAccount(record: AssetAccount): boolean;
   putAdjustment(record: BalanceAdjustment): boolean;
   archiveAccount(record: AssetAccount): boolean;
+  unresolvedSyncRecordKeys?: ReadonlySet<string>;
 }
 
 const COLORS = [
@@ -138,8 +140,12 @@ export function buildEditedAccount(
   current: AssetAccount | undefined,
   draft: AccountEditDraft,
   now = new Date(),
+  hasUnresolvedConflict = false,
 ): AssetAccount {
-  assertFreshEditorSnapshot(opened, current, "此帳戶", { requireActive: true });
+  assertFreshEditorSnapshot(opened, current, "此帳戶", {
+    requireActive: true,
+    hasUnresolvedConflict,
+  });
   return {
     ...current,
     ...changedRecordMeta(current, now),
@@ -157,6 +163,7 @@ export function AssetsView({
   putAccount,
   putAdjustment,
   archiveAccount,
+  unresolvedSyncRecordKeys = new Set(),
 }: AssetsViewProps) {
   const financials = useMemo(() => calculateFinancials(data), [data]);
   const accounts = data.accounts.filter((item) => !item.deletedAt);
@@ -254,6 +261,15 @@ export function AssetsView({
     const currentAccount = editing
       ? data.accounts.find((account) => account.id === editing.id)
       : undefined;
+    const hasUnresolvedConflict = editing
+      ? unresolvedSyncRecordKeys.has(syncRecordKey("accounts", editing.id))
+      : false;
+    if (hasUnresolvedConflict) {
+      setMessage(
+        "此帳戶有未解同步衝突；資料未變更，請先從同步狀態完成處理",
+      );
+      return;
+    }
     if (editing && isEditorSnapshotStale(editing, currentAccount, { requireActive: true })) {
       setMessage(
         "此帳戶已在其他裝置或背景更新、封存或刪除；資料未變更，請關閉後重新開啟編輯",
@@ -268,7 +284,7 @@ export function AssetsView({
           name: name.trim(),
           icon,
           includeInTotalAssets: included,
-        })
+        }, new Date(), hasUnresolvedConflict)
       : {
           ...newRecordMeta(ownerId),
           name: name.trim(),
@@ -375,6 +391,9 @@ export function AssetsView({
                   isFinancialTransaction(item) && item.accountId === account.id,
               )
               .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+            const conflictBlocked = unresolvedSyncRecordKeys.has(
+              syncRecordKey("accounts", account.id),
+            );
             const colorIndex = Math.max(
               0,
               visibleBalances.findIndex(
@@ -419,7 +438,14 @@ export function AssetsView({
                   <div className="asset-detail">
                     <div className="asset-detail-actions">
                       {isAccountEditable(account) && (
-                        <button type="button" onClick={() => openEdit(account)}>
+                        <button
+                          type="button"
+                          disabled={conflictBlocked}
+                          title={conflictBlocked
+                            ? "此帳戶有未解同步衝突，請先完成同步後再編輯。"
+                            : undefined}
+                          onClick={() => openEdit(account)}
+                        >
                           <Pencil className="h-4 w-4" />
                           編輯帳戶
                         </button>
@@ -427,6 +453,10 @@ export function AssetsView({
                       {account.isActive && (
                         <button
                           type="button"
+                          disabled={conflictBlocked}
+                          title={conflictBlocked
+                            ? "此帳戶有未解同步衝突，請先選擇雲端版本。"
+                            : undefined}
                           onClick={() => openAdjustment(account, balance)}
                         >
                           <Scale className="h-4 w-4" />
@@ -437,8 +467,11 @@ export function AssetsView({
                         <button
                           type="button"
                           disabled={
-                            accounts.filter((item) => item.isActive).length <= 1
+                            conflictBlocked || accounts.filter((item) => item.isActive).length <= 1
                           }
+                          title={conflictBlocked
+                            ? "此帳戶有未解同步衝突，請先選擇雲端版本。"
+                            : undefined}
                           onClick={() => archiveAccount(account)}
                         >
                           <Archive className="h-4 w-4" />
@@ -447,6 +480,10 @@ export function AssetsView({
                       ) : (
                         <button
                           type="button"
+                          disabled={conflictBlocked}
+                          title={conflictBlocked
+                            ? "此帳戶有未解同步衝突，請先選擇雲端版本。"
+                            : undefined}
                           onClick={() =>
                             putAccount({
                               ...account,

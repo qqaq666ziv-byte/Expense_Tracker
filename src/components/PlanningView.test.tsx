@@ -60,6 +60,19 @@ describe('PlanningView goal lifecycle', () => {
     expect(current).toEqual(before);
   });
 
+  it('rejects a goal editor while its same-clock payload conflict is unresolved', () => {
+    const goal = {
+      id: 'goal-conflict', ownerId: 'guest', version: 3,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'same-clock',
+      name: '本機目標', targetAmount: 5_000, isActive: true,
+    };
+
+    expect(() => buildEditedSavingsGoal(goal, goal, {
+      name: '不應儲存',
+      targetAmount: 8_000,
+    }, new Date(), 'blocked-goal-edit', true)).toThrow(/未解同步衝突/);
+  });
+
   it('allows editing a goal that was already archived when the editor opened', () => {
     const archived = {
       id: 'goal-archived', ownerId: 'guest', version: 3,
@@ -78,6 +91,72 @@ describe('PlanningView goal lifecycle', () => {
       isActive: false,
       version: 4,
     });
+  });
+
+  it('disables the goal edit action while a same-clock payload conflict is unresolved', () => {
+    const state = createInitialState('guest');
+    state.data.goals = [{
+      id: 'goal-conflict', ownerId: 'guest', version: 3,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'same-clock',
+      name: '同步衝突目標', targetAmount: 5_000, isActive: true,
+    }];
+
+    const html = renderToStaticMarkup(
+      <PlanningView
+        data={state.data}
+        ownerId="guest"
+        putGoal={() => true}
+        putAllocation={() => true}
+        putBudget={() => true}
+        putRecurring={() => true}
+        deleteRecurring={() => true}
+        archiveGoal={() => true}
+        archiveBudget={() => true}
+        unresolvedSyncRecordKeys={new Set(['goals:goal-conflict'])}
+      />,
+    );
+
+    const editButton = html.match(/<button[^>]*aria-label="編輯同步衝突目標"[^>]*>/)?.[0];
+    expect(editButton).toContain('disabled=""');
+    expect(html).toContain('此儲蓄目標有未解同步衝突');
+  });
+
+  it('disables goal lifecycle actions when one child allocation has an unresolved conflict', () => {
+    const state = createInitialState('guest');
+    state.data.goals = [{
+      id: 'goal-child-conflict', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'goal-create',
+      name: '子配置衝突目標', targetAmount: 5_000, isActive: true,
+    }];
+    state.data.allocations = [{
+      id: 'allocation-conflict', ownerId: 'guest', version: 2,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'same-clock',
+      goalId: 'goal-child-conflict', amountDelta: 500, occurredAt: '2026-08-27 08:00',
+    }];
+
+    const html = renderToStaticMarkup(
+      <PlanningView
+        data={state.data}
+        ownerId="guest"
+        putGoal={() => true}
+        putAllocation={() => true}
+        putBudget={() => true}
+        putRecurring={() => true}
+        deleteRecurring={() => true}
+        archiveGoal={() => true}
+        archiveBudget={() => true}
+        releaseGoalAllocations={() => true}
+        unresolvedSyncRecordKeys={new Set(['allocations:allocation-conflict'])}
+      />,
+    );
+
+    expect(html.match(/<button[^>]*aria-label="釋放子配置衝突目標配置"[^>]*>/)?.[0])
+      .toContain('disabled=""');
+    expect(html.match(/<button[^>]*aria-label="封存 子配置衝突目標"[^>]*>/)?.[0])
+      .toContain('disabled=""');
+    expect(html.match(/<button[^>]*>配置到目標<\/button>/)?.[0])
+      .toContain('disabled=""');
+    expect(html).toContain('子配置衝突目標（同步衝突）');
   });
 });
 
@@ -224,6 +303,35 @@ describe('PlanningView budget lifecycle', () => {
     expect(html).toContain('重新啟用餐飲預算');
   });
 
+  it('disables the budget edit action while a same-clock payload conflict is unresolved', () => {
+    const state = createInitialState('guest');
+    state.data.budgets = [{
+      id: 'budget-conflict', ownerId: 'guest', version: 3,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'same-clock',
+      scope: 'overall', period: 'monthly', amount: 12_000, isActive: true,
+    }];
+
+    const html = renderToStaticMarkup(
+      <BudgetPanel
+        data={state.data}
+        ownerId="guest"
+        putGoal={() => true}
+        putAllocation={() => true}
+        putBudget={() => true}
+        putRecurring={() => true}
+        deleteRecurring={() => true}
+        archiveGoal={() => true}
+        archiveBudget={() => true}
+        unresolvedSyncRecordKeys={new Set(['budgets:budget-conflict'])}
+        reference={new Date(2026, 7, 21, 12)}
+      />,
+    );
+
+    const editButton = html.match(/<button[^>]*aria-label="編輯總預算"[^>]*>/)?.[0];
+    expect(editButton).toContain('disabled=""');
+    expect(html).toContain('此預算有未解同步衝突');
+  });
+
   it('rejects a stale budget editor without overwriting the N+1 record', () => {
     const opened = {
       id: 'budget-monthly', ownerId: 'guest', version: 4,
@@ -244,5 +352,19 @@ describe('PlanningView budget lifecycle', () => {
       amount: 9_000,
     })).toThrow(/背景更新/);
     expect(current).toEqual(before);
+  });
+
+  it('rejects a budget editor while its same-clock payload conflict is unresolved', () => {
+    const budget = {
+      id: 'budget-conflict', ownerId: 'guest', version: 3,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'same-clock',
+      scope: 'overall' as const, period: 'monthly' as const, amount: 12_000, isActive: true,
+    };
+
+    expect(() => buildEditedBudget(budget, budget, {
+      scope: 'overall',
+      period: 'monthly',
+      amount: 15_000,
+    }, new Date(), 'blocked-budget-edit', true)).toThrow(/未解同步衝突/);
   });
 });

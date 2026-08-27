@@ -224,6 +224,8 @@ class FakeSupabaseClient {
 
   from(table: string) {
     let upserted: Record<string, unknown> | undefined;
+    let updated: Record<string, unknown> | undefined;
+    const filters = new Map<string, unknown>();
     let projection = '*';
     const moneyColumn = new Map([
       ['accounts', 'opening_balance'],
@@ -244,7 +246,7 @@ class FakeSupabaseClient {
     );
     const builder = {
       select: (value = '*') => { projection = value; return builder; },
-      eq: () => builder,
+      eq: (column: string, value: unknown) => { filters.set(column, value); return builder; },
       order: () => builder,
       range: async (from: number, to: number) => ({
         data: (this.tables.get(table) ?? []).slice(from, to + 1).map(project),
@@ -252,6 +254,10 @@ class FakeSupabaseClient {
       }),
       upsert: (row: Record<string, unknown>) => {
         upserted = row;
+        return builder;
+      },
+      update: (row: Record<string, unknown>) => {
+        updated = row;
         return builder;
       },
       single: async () => {
@@ -264,6 +270,17 @@ class FakeSupabaseClient {
             : project(this.applyResponse?.(table, upserted) ?? upserted),
           error,
         };
+      },
+      maybeSingle: async () => {
+        if (!updated) return { data: null, error: null };
+        const rows = this.tables.get(table) ?? [];
+        const index = rows.findIndex((row) => (
+          [...filters].every(([column, value]) => row[column] === value)
+        ));
+        if (index < 0) return { data: null, error: null };
+        const next = { ...rows[index], ...updated };
+        this.tables.set(table, rows.map((row, rowIndex) => rowIndex === index ? next : row));
+        return { data: project(next), error: null };
       },
     };
     return builder;
@@ -316,6 +333,39 @@ describe('Supabase remote adapter', () => {
     await expect(remote.apply('user-a', operation(record))).rejects.toThrow(
       /persisted payload differs.*name/i,
     );
+  });
+
+  it('conditionally compensates only while the expected remote clock is unchanged', async () => {
+    const client = new FakeSupabaseClient();
+    const expected = account({ version: 2, lastOperationId: 'forward-v2', isActive: false });
+    const compensated = account({
+      version: 3,
+      lastOperationId: '00000000-0000-0000-0000-000000000000:active:batch-compensation:test',
+      isActive: true,
+    });
+    client.tables.set('accounts', [accountRow(expected)]);
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    await expect(remote.compareAndSwap!(
+      'user-a',
+      { entity: 'accounts', record: expected },
+      operation(compensated),
+    )).resolves.toEqual({
+      entity: 'accounts',
+      record: { ...compensated, requiresReview: false },
+    });
+    expect(client.tables.get('accounts')?.[0]).toEqual(accountRow(compensated));
+
+    const staleReplacement = account({
+      version: 4,
+      lastOperationId: '00000000-0000-0000-0000-000000000000:active:batch-compensation:stale',
+    });
+    await expect(remote.compareAndSwap!(
+      'user-a',
+      { entity: 'accounts', record: expected },
+      operation(staleReplacement),
+    )).resolves.toBeUndefined();
+    expect(client.tables.get('accounts')?.[0]).toEqual(accountRow(compensated));
   });
 
   it('isolates one malformed legacy row while returning other valid remote records with diagnostics', async () => {

@@ -32,4 +32,10 @@ describe('stale editor snapshot guard', () => {
     expect(isEditorSnapshotStale(opened, { ...opened }, { requireActive: true })).toBe(false);
     expect(isEditorSnapshotStale(opened, { ...opened, isActive: false })).toBe(false);
   });
+
+  it('fails closed when the same record key has an unresolved payload conflict', () => {
+    expect(isEditorSnapshotStale(opened, { ...opened }, {
+      hasUnresolvedConflict: true,
+    })).toBe(true);
+  });
 });

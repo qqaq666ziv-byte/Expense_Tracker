@@ -36,6 +36,26 @@ describe('SettingsView category lifecycle', () => {
     expect(html).toContain('分類顯示順序');
     expect(html).not.toContain('新增資產帳戶');
   });
+
+  it('disables category editing while a same-clock payload conflict is unresolved', () => {
+    const state = createInitialState('guest');
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const html = renderToStaticMarkup(
+      <SettingsView
+        data={state.data}
+        ownerId="guest"
+        putCategory={() => true}
+        putRecurring={() => true}
+        categoryLifecycle={() => true}
+        deleteRecurring={() => true}
+        restore={() => undefined}
+        unresolvedSyncRecordKeys={new Set([`categories:${category.id}`])}
+      />,
+    );
+
+    expect(html).toMatch(new RegExp(`<button[^>]*aria-label="編輯 ${category.name}"[^>]*disabled=""`));
+    expect(html).toContain('此分類有未解同步衝突');
+  });
 });
 
 describe('SettingsView backup safety', () => {
@@ -131,6 +151,7 @@ describe('SettingsView recurring safety', () => {
     expect(isRecurringEditStale(rule, { ...rule })).toBe(false);
     expect(isRecurringEditStale(rule, { ...rule, deletedAt: '2026-08-27T02:00:00.000Z' })).toBe(true);
     expect(isRecurringEditStale(rule, undefined)).toBe(true);
+    expect(isRecurringEditStale(rule, { ...rule }, true)).toBe(true);
   });
 
   it('shows an explicit recurring-rule edit action', () => {

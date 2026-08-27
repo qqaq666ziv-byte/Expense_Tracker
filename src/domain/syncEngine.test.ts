@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type {
   AssetAccount,
   Budget,
@@ -11,7 +11,13 @@ import type {
   Transaction,
 } from './model';
 import type { RemoteAdapter, RemoteRecord } from './syncEngine';
-import { compareSyncRecords, enqueueSyncRecord, syncFinanceState } from './syncEngine';
+import {
+  acceptRemoteConflictRecord,
+  compareSyncRecords,
+  enqueueSyncRecord,
+  syncFinanceState,
+  UNRESOLVED_PAYLOAD_CONFLICT_PREFIX,
+} from './syncEngine';
 
 const NOW = '2026-08-21T10:00:00.000Z';
 
@@ -103,6 +109,7 @@ class InMemoryRemote implements RemoteAdapter {
   private readonly acceptedOperationIds = new Set<string>();
   readonly failBeforeApplyOnce = new Set<string>();
   readonly failAfterApplyOnce = new Set<string>();
+  failAfterCompareAndSwapOnce = false;
 
   constructor(records: RemoteRecord[] = []) {
     for (const record of records) {
@@ -144,12 +151,71 @@ class InMemoryRemote implements RemoteAdapter {
     }
   }
 
+  async compareAndSwap(
+    ownerId: string,
+    expected: RemoteRecord,
+    replacement: PendingOperation,
+  ): Promise<RemoteRecord | undefined> {
+    if (expected.record.ownerId !== ownerId || replacement.record.ownerId !== ownerId) {
+      throw new Error('owner mismatch');
+    }
+    const key = this.key(expected);
+    const current = this.records.get(key);
+    if (!current || JSON.stringify(current) !== JSON.stringify(expected)) return undefined;
+    const persisted = {
+      entity: replacement.entity,
+      record: replacement.record,
+    } as RemoteRecord;
+    this.records.set(key, persisted);
+    if (this.failAfterCompareAndSwapOnce) {
+      this.failAfterCompareAndSwapOnce = false;
+      throw new Error('connection dropped after conditional compensation');
+    }
+    return persisted;
+  }
+
   private key({ entity, record }: RemoteRecord): string {
     return `${entity}:${record.id}`;
   }
 }
 
 describe('offline sync engine', () => {
+  it('preserves the original batch manifest across a later offline edit', () => {
+    const before = account('offline-batch-edit', 'user-a', 1, 'create');
+    const first = { ...before, version: 2, lastOperationId: 'first-batch-edit', name: '第一次' };
+    const later = { ...first, version: 3, lastOperationId: 'later-offline-edit', name: '第二次' };
+    const batched = enqueueSyncRecord(
+      state('user-a', [before], []),
+      'accounts',
+      first,
+      NOW,
+      'original-batch',
+    );
+
+    const updated = enqueueSyncRecord(batched, 'accounts', later, NOW);
+
+    expect(updated.outbox).toEqual([expect.objectContaining({
+      id: later.lastOperationId,
+      batchId: 'original-batch',
+      batchBeforeRecord: before,
+      record: later,
+    })]);
+  });
+
+  it('rejects incomplete batch recovery metadata before any remote write', async () => {
+    const local = account('missing-before', 'user-a', 2, 'batched-edit');
+    const apply = vi.fn(async () => undefined);
+    const result = await syncFinanceState({
+      ...state('user-a', [local], [{ ...operation(local), batchId: 'broken-batch' }]),
+    }, 'user-a', { apply, pull: async () => [] }, () => NOW);
+
+    expect(apply).not.toHaveBeenCalled();
+    expect(result.report.status).toBe('rejected');
+    expect(result.report.failures).toEqual([
+      expect.objectContaining({ message: expect.stringContaining('incomplete batch recovery metadata') }),
+    ]);
+  });
+
   it('keeps an equal-version tombstone ahead of an active edit in either comparison direction', () => {
     const active = account('wallet', 'user-a', 2, 'ffffffff-ffff-4fff-8fff-ffffffffffff');
     const tombstone = { ...active, lastOperationId: 'tombstone:aaaa-delete', deletedAt: NOW };
@@ -730,10 +796,44 @@ describe('offline sync engine', () => {
       }),
     ]);
     expect(result.state.lastSyncError).toMatch(/pending local mutation/i);
+    expect(result.state.unresolvedSyncRecordKeys).toEqual(['accounts:wallet']);
     expect(result.report.conflicts).toEqual([
       expect.objectContaining({ recordId: 'wallet', winner: 'unresolved', reason: 'pending-local' }),
     ]);
     expect(await remote.pull('user-a')).toEqual([{ entity: 'accounts', record: remoteNewer }]);
+
+    const accepted = acceptRemoteConflictRecord(result.state, {
+      entity: 'accounts',
+      record: remoteNewer,
+    });
+    expect(accepted.data.accounts).toEqual([remoteNewer]);
+    expect(accepted.outbox).toEqual([]);
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+  });
+
+  it('removes a resolved conflict error while preserving an unrelated pending write', async () => {
+    const remoteAccount = { ...account('conflict-account', 'user-a', 3, 'remote-winner'), name: '雲端' };
+    const localAccount = { ...remoteAccount, version: 2, lastOperationId: 'local-stale', name: '本機' };
+    const unrelated = account('unrelated-pending', 'user-a', 1, 'unrelated-create');
+    const conflicted: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [localAccount, unrelated] },
+      outbox: [{
+        ...operation(localAccount),
+        lastError: `${UNRESOLVED_PAYLOAD_CONFLICT_PREFIX} for accounts/conflict-account`,
+      }, operation(unrelated)],
+      unresolvedSyncRecordKeys: ['accounts:conflict-account'],
+      lastSyncError: 'old resolved conflict detail',
+    };
+
+    const accepted = acceptRemoteConflictRecord(conflicted, {
+      entity: 'accounts', record: remoteAccount,
+    });
+
+    expect(accepted.data.accounts).toEqual([remoteAccount, unrelated]);
+    expect(accepted.outbox).toEqual([operation(unrelated)]);
+    expect(accepted.lastSyncError).toBeUndefined();
   });
 
   it('does not silently resurrect a locally deleted record when the remote clock is newer', async () => {
@@ -1071,6 +1171,682 @@ describe('offline sync engine', () => {
     expect(remoteBudgets.filter((budget) => budget.isActive)).toEqual([legacyBudget]);
   });
 
+  it('accepts a newer remote reactivation when the semantic budget conflict was already resolved', async () => {
+    const staleRollback: Budget = {
+      id: 'resolved-budget-conflict', ownerId: 'user-a', version: 2,
+      updatedAt: NOW,
+      lastOperationId: '00000000-0000-0000-0000-000000000000:active:budget-conflict-rollback:stale',
+      scope: 'overall', period: 'monthly', amount: 6_000, isActive: false,
+    };
+    const remoteReactivation: Budget = {
+      ...staleRollback,
+      version: 4,
+      lastOperationId: 'remote-user-reactivation',
+      isActive: true,
+    };
+    const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteReactivation }]);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [staleRollback] },
+      outbox: [budgetOperation(staleRollback)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.data.budgets).toEqual([remoteReactivation]);
+    expect((await remote.pull('user-a'))[0]).toEqual({
+      entity: 'budgets',
+      record: remoteReactivation,
+    });
+  });
+
+  it('evaluates a stale rollback against the latest remote budget semantics', async () => {
+    const category: Category = {
+      id: 'category-food', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'category-food-create',
+      name: '餐飲', kind: 'expense', icon: { type: 'emoji', value: '🍚' },
+      isActive: true, sortOrder: 0,
+    };
+    const staleRollback: Budget = {
+      id: 'budget-semantic-change', ownerId: 'user-a', version: 2,
+      updatedAt: NOW,
+      lastOperationId: '00000000-0000-0000-0000-000000000000:active:budget-conflict-rollback:stale-semantics',
+      scope: 'overall', period: 'monthly', amount: 6_000, isActive: false,
+    };
+    const remoteReactivation: Budget = {
+      ...staleRollback,
+      version: 4,
+      lastOperationId: 'remote-category-weekly-reactivation',
+      scope: 'category',
+      period: 'weekly',
+      categoryId: 'category-food',
+      categoryName: '餐飲',
+      isActive: true,
+    };
+    const oldSemanticBudget: Budget = {
+      ...staleRollback,
+      id: 'still-active-overall-monthly',
+      version: 3,
+      lastOperationId: 'other-active-budget',
+      isActive: true,
+    };
+    const remote = new InMemoryRemote([
+      { entity: 'categories', record: category },
+      { entity: 'budgets', record: remoteReactivation },
+      { entity: 'budgets', record: oldSemanticBudget },
+    ]);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: {
+        ...emptyData(),
+        categories: [category],
+        budgets: [staleRollback, oldSemanticBudget],
+      },
+      outbox: [budgetOperation(staleRollback)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.data.budgets.find((budget) => budget.id === staleRollback.id))
+      .toEqual(remoteReactivation);
+  });
+
+  it('accepts every still-pending record from the same local mutation batch atomically', () => {
+    const category: Category = {
+      id: 'category-food', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'category-create',
+      name: '餐飲', kind: 'expense', icon: { type: 'emoji', value: '🍚' },
+      isActive: true, sortOrder: 0,
+    };
+    const remoteAccount = account('wallet-batch', 'user-a', 4, 'remote-account-active');
+    const localAccount = {
+      ...remoteAccount,
+      version: 3,
+      lastOperationId: 'local-account-archive',
+      isActive: false,
+    };
+    const remoteRule = {
+      id: 'rule-batch', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'remote-rule-active',
+      name: '月租', type: 'expense' as const, amount: 10_000,
+      categoryId: category.id, categoryName: category.name,
+      accountId: remoteAccount.id, accountName: remoteAccount.name,
+      frequency: 'monthly' as const, startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    };
+    const localRule = {
+      ...remoteRule,
+      version: 2,
+      lastOperationId: 'local-rule-pause',
+      isActive: false,
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: {
+        ...emptyData(),
+        accounts: [localAccount],
+        categories: [category],
+        recurringRules: [localRule],
+      },
+      outbox: [{ ...operation(localAccount), batchId: 'archive-account-batch' }, {
+        id: localRule.lastOperationId,
+        entity: 'recurringRules',
+        recordId: localRule.id,
+        record: localRule,
+        attempts: 0,
+        queuedAt: NOW,
+        batchId: 'archive-account-batch',
+      }],
+      unresolvedSyncRecordKeys: ['accounts:wallet-batch'],
+      lastSyncError: 'unresolved sync conflict for accounts/wallet-batch',
+    };
+
+    const accepted = acceptRemoteConflictRecord(
+      localState,
+      { entity: 'accounts', record: remoteAccount },
+      [
+        { entity: 'accounts', record: remoteAccount },
+        { entity: 'recurringRules', record: remoteRule },
+      ],
+    );
+
+    expect(accepted.data.accounts).toEqual([remoteAccount]);
+    expect(accepted.data.recurringRules).toEqual([remoteRule]);
+    expect(accepted.outbox).toEqual([]);
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(accepted.lastSyncError).toBeUndefined();
+  });
+
+  it('retains the complete batch manifest when a conflict appears after the first member applies', async () => {
+    const goal: SavingsGoal = {
+      id: 'goal-race', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'goal-create', name: '競態目標',
+      targetAmount: 5_000, isActive: true,
+    };
+    const sourceA: SavingsAllocation = {
+      id: 'allocation-race-a', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'create-a', goalId: 'goal-race',
+      amountDelta: 300, occurredAt: '2026-08-27 08:00',
+    };
+    const sourceB: SavingsAllocation = {
+      id: 'allocation-race-b', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'create-b', goalId: 'goal-race',
+      amountDelta: 500, occurredAt: '2026-08-27 08:01',
+    };
+    const releasedA: SavingsAllocation = {
+      ...sourceA, version: 2, updatedAt: '2026-08-27T10:00:00.000Z',
+      lastOperationId: 'release-a', deletedAt: '2026-08-27T10:00:00.000Z',
+    };
+    const releasedB: SavingsAllocation = {
+      ...sourceB, version: 2, updatedAt: '2026-08-27T10:00:00.000Z',
+      lastOperationId: 'release-b', deletedAt: '2026-08-27T10:00:00.000Z',
+    };
+    const concurrentRemoteB: SavingsAllocation = {
+      ...releasedB, amountDelta: 900, lastOperationId: 'release-z',
+    };
+    const records = new Map<string, RemoteRecord>([
+      ['goals:goal-race', { entity: 'goals', record: goal }],
+      ['allocations:allocation-race-a', { entity: 'allocations', record: sourceA }],
+      ['allocations:allocation-race-b', { entity: 'allocations', record: sourceB }],
+    ]);
+    let applyCount = 0;
+    const remote: RemoteAdapter = {
+      pull: async () => [...records.values()],
+      apply: async (_ownerId, pending) => {
+        if (pending.record.lastOperationId.includes('batch-compensation:')) {
+          records.set(`allocations:${pending.recordId}`, {
+            entity: pending.entity,
+            record: pending.record,
+          } as RemoteRecord);
+          return;
+        }
+        applyCount += 1;
+        if (applyCount === 1) {
+          records.set(`allocations:${pending.recordId}`, {
+            entity: pending.entity,
+            record: pending.record,
+          } as RemoteRecord);
+          return;
+        }
+        records.set('allocations:allocation-race-b', {
+          entity: 'allocations', record: concurrentRemoteB,
+        });
+      },
+      compareAndSwap: async (_ownerId, expected, replacement) => {
+        const key = `${expected.entity}:${expected.record.id}`;
+        if (JSON.stringify(records.get(key)) !== JSON.stringify(expected)) return undefined;
+        const persisted = {
+          entity: replacement.entity,
+          record: replacement.record,
+        } as RemoteRecord;
+        records.set(key, persisted);
+        return persisted;
+      },
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), goals: [goal], allocations: [releasedA, releasedB] },
+      outbox: [{
+        ...allocationOperation(releasedA),
+        batchId: 'release-race',
+        batchBeforeRecord: sourceA,
+      }, {
+        ...allocationOperation(releasedB),
+        batchId: 'release-race',
+        batchBeforeRecord: sourceB,
+      }],
+    };
+
+    const conflicted = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(conflicted.state.outbox).toHaveLength(2);
+    expect(conflicted.state.outbox.every((operation) => operation.batchId === 'release-race')).toBe(true);
+    expect(conflicted.state.unresolvedSyncRecordKeys).toContain('allocations:allocation-race-b');
+    const retainedLocalA = conflicted.state.data.allocations.find((record) => record.id === sourceA.id)!;
+    expect(retainedLocalA).toEqual(expect.objectContaining({
+      id: releasedA.id,
+      amountDelta: releasedA.amountDelta,
+      version: 4,
+      deletedAt: releasedA.deletedAt,
+      lastOperationId: expect.stringContaining('tombstone:'),
+    }));
+    expect(conflicted.state.outbox.find((operation) => operation.recordId === sourceA.id)?.record)
+      .toEqual(retainedLocalA);
+    const compensatedA = records.get('allocations:allocation-race-a')?.record as SavingsAllocation;
+    expect(compensatedA).toEqual(expect.objectContaining({
+      id: sourceA.id,
+      amountDelta: sourceA.amountDelta,
+      version: 3,
+      lastOperationId: expect.stringContaining('batch-compensation:'),
+    }));
+    expect(compensatedA.deletedAt).toBeUndefined();
+
+    const accepted = acceptRemoteConflictRecord(
+      conflicted.state,
+      { entity: 'allocations', record: concurrentRemoteB },
+      [...records.values()],
+    );
+    expect(accepted.outbox).toEqual([]);
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(accepted.data.allocations).toEqual([compensatedA, concurrentRemoteB]);
+  });
+
+  it('compensates a successful batch member when a later member fails transiently', async () => {
+    const beforeA = account('transient-batch-a', 'user-a', 1, 'create-a');
+    const beforeB = account('transient-batch-b', 'user-a', 1, 'create-b');
+    const desiredA = { ...beforeA, version: 2, lastOperationId: 'archive-a', isActive: false };
+    const desiredB = { ...beforeB, version: 2, lastOperationId: 'archive-b', isActive: false };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: beforeA },
+      { entity: 'accounts', record: beforeB },
+    ]);
+    remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [desiredA, desiredB] },
+      outbox: [{
+        ...operation(desiredA), batchId: 'transient-batch', batchBeforeRecord: beforeA,
+      }, {
+        ...operation(desiredB), batchId: 'transient-batch', batchBeforeRecord: beforeB,
+      }],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+    const compensatedRemoteAccounts = (await remote.pull('user-a'))
+      .filter((entry): entry is Extract<RemoteRecord, { entity: 'accounts' }> => entry.entity === 'accounts')
+      .map((entry) => entry.record);
+
+    expect(result.state.outbox).toHaveLength(2);
+    expect(result.state.data.accounts.find((record) => record.id === desiredA.id)).toEqual(expect.objectContaining({
+      id: desiredA.id,
+      isActive: false,
+      version: 4,
+      lastOperationId: expect.stringContaining('batch-retry:'),
+    }));
+    expect(compensatedRemoteAccounts.find((record) => record.id === beforeA.id)).toEqual(expect.objectContaining({
+      id: beforeA.id,
+      name: beforeA.name,
+      isActive: true,
+      version: 3,
+      lastOperationId: expect.stringContaining('batch-compensation:'),
+    }));
+    expect(compensatedRemoteAccounts.find((record) => record.id === beforeB.id)).toEqual(beforeB);
+
+    const retried = await syncFinanceState(result.state, 'user-a', remote, () => NOW);
+    const completedRemoteAccounts = (await remote.pull('user-a'))
+      .filter((entry): entry is Extract<RemoteRecord, { entity: 'accounts' }> => entry.entity === 'accounts')
+      .map((entry) => entry.record);
+    expect(retried.state.outbox).toEqual([]);
+    expect(completedRemoteAccounts.every((record) => !record.isActive)).toBe(true);
+  });
+
+  it('does not compensate over a concurrent write that lands after the exact pull', async () => {
+    const beforeA = account('cas-batch-a', 'user-a', 1, 'create-a');
+    const beforeB = account('cas-batch-b', 'user-a', 1, 'create-b');
+    const desiredA = { ...beforeA, version: 2, lastOperationId: 'archive-a', isActive: false };
+    const desiredB = { ...beforeB, version: 2, lastOperationId: 'archive-b', isActive: false };
+    const concurrentA = {
+      ...beforeA, name: '另一裝置最新名稱', version: 3,
+      lastOperationId: 'zzzz-concurrent-a',
+    };
+    const records = new Map<string, RemoteRecord>([
+      [`accounts:${beforeA.id}`, { entity: 'accounts', record: beforeA }],
+      [`accounts:${beforeB.id}`, { entity: 'accounts', record: beforeB }],
+    ]);
+    let applyCount = 0;
+    const remote: RemoteAdapter = {
+      pull: async () => [...records.values()],
+      apply: async (_ownerId, pending) => {
+        applyCount += 1;
+        if (applyCount === 2) throw new Error('offline before second apply');
+        records.set(`${pending.entity}:${pending.recordId}`, {
+          entity: pending.entity, record: pending.record,
+        } as RemoteRecord);
+      },
+      compareAndSwap: async () => {
+        records.set(`accounts:${beforeA.id}`, { entity: 'accounts', record: concurrentA });
+        return undefined;
+      },
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [desiredA, desiredB] },
+      outbox: [{
+        ...operation(desiredA), batchId: 'cas-batch', batchBeforeRecord: beforeA,
+      }, {
+        ...operation(desiredB), batchId: 'cas-batch', batchBeforeRecord: beforeB,
+      }],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(records.get(`accounts:${beforeA.id}`)).toEqual({ entity: 'accounts', record: concurrentA });
+    expect(result.state.outbox).toHaveLength(2);
+    expect(result.state.lastSyncError).toMatch(/補償前遠端版本已再次變更/);
+  });
+
+  it('recovers a committed compensation after its response is lost', async () => {
+    const beforeA = account('lost-response-a', 'user-a', 1, 'create-a');
+    const beforeB = account('lost-response-b', 'user-a', 1, 'create-b');
+    const desiredA = { ...beforeA, version: 2, lastOperationId: 'archive-a', isActive: false };
+    const desiredB = { ...beforeB, version: 2, lastOperationId: 'archive-b', isActive: false };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: beforeA },
+      { entity: 'accounts', record: beforeB },
+    ]);
+    remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
+    remote.failAfterCompareAndSwapOnce = true;
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [desiredA, desiredB] },
+      outbox: [{
+        ...operation(desiredA), batchId: 'lost-response-batch', batchBeforeRecord: beforeA,
+      }, {
+        ...operation(desiredB), batchId: 'lost-response-batch', batchBeforeRecord: beforeB,
+      }],
+    };
+
+    const ambiguous = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+    expect(ambiguous.state.outbox.find((pending) => pending.recordId === desiredA.id)?.record.version)
+      .toBe(2);
+    expect(ambiguous.state.lastSyncError).toMatch(/connection dropped after conditional compensation/);
+
+    const recovered = await syncFinanceState(ambiguous.state, 'user-a', remote, () => NOW);
+    const remoteAccounts = (await remote.pull('user-a'))
+      .filter((entry): entry is Extract<RemoteRecord, { entity: 'accounts' }> => entry.entity === 'accounts')
+      .map((entry) => entry.record);
+    expect(recovered.state.outbox).toEqual([]);
+    expect(remoteAccounts.every((record) => !record.isActive)).toBe(true);
+  });
+
+  it('recovers a committed create compensation tombstone after its response is lost', async () => {
+    const createdA = account('lost-create-a', 'user-a', 1, 'create-new-a');
+    const beforeB = account('lost-create-b', 'user-a', 1, 'create-b');
+    const desiredB = { ...beforeB, version: 2, lastOperationId: 'archive-b', isActive: false };
+    const remote = new InMemoryRemote([{ entity: 'accounts', record: beforeB }]);
+    remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
+    remote.failAfterCompareAndSwapOnce = true;
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [createdA, desiredB] },
+      outbox: [{
+        ...operation(createdA), batchId: 'lost-create-batch', batchBeforeRecord: null,
+      }, {
+        ...operation(desiredB), batchId: 'lost-create-batch', batchBeforeRecord: beforeB,
+      }],
+    };
+
+    const ambiguous = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+    const compensatedCreate = (await remote.pull('user-a')).find((entry) => (
+      entry.entity === 'accounts' && entry.record.id === createdA.id
+    ));
+    expect(compensatedCreate?.record).toEqual(expect.objectContaining({
+      deletedAt: NOW,
+      version: 2,
+      lastOperationId: expect.stringContaining('tombstone:batch-compensation:'),
+    }));
+    expect(ambiguous.state.outbox).toHaveLength(2);
+
+    const recovered = await syncFinanceState(ambiguous.state, 'user-a', remote, () => NOW);
+    const remoteAccounts = (await remote.pull('user-a'))
+      .filter((entry): entry is Extract<RemoteRecord, { entity: 'accounts' }> => entry.entity === 'accounts')
+      .map((entry) => entry.record);
+    expect(recovered.state.outbox).toEqual([]);
+    expect(remoteAccounts.find((record) => record.id === createdA.id)?.deletedAt).toBeUndefined();
+    expect(remoteAccounts.find((record) => record.id === beforeB.id)?.isActive).toBe(false);
+  });
+
+  it('compensates an effective recovered retry when another batch member fails again', async () => {
+    const beforeA = account('lost-repeat-a', 'user-a', 1, 'create-a');
+    const beforeB = account('lost-repeat-b', 'user-a', 1, 'create-b');
+    const desiredA = { ...beforeA, version: 2, lastOperationId: 'archive-a', isActive: false };
+    const desiredB = { ...beforeB, version: 2, lastOperationId: 'archive-b', isActive: false };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: beforeA },
+      { entity: 'accounts', record: beforeB },
+    ]);
+    remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
+    remote.failAfterCompareAndSwapOnce = true;
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [desiredA, desiredB] },
+      outbox: [{
+        ...operation(desiredA), batchId: 'lost-repeat-batch', batchBeforeRecord: beforeA,
+      }, {
+        ...operation(desiredB), batchId: 'lost-repeat-batch', batchBeforeRecord: beforeB,
+      }],
+    };
+
+    const ambiguous = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+    remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
+    const failedAgain = await syncFinanceState(ambiguous.state, 'user-a', remote, () => NOW);
+    const compensatedAgain = (await remote.pull('user-a')).find((entry) => (
+      entry.entity === 'accounts' && entry.record.id === desiredA.id
+    ));
+    expect(failedAgain.state.outbox).toHaveLength(2);
+    expect(compensatedAgain?.record).toEqual(expect.objectContaining({
+      name: beforeA.name,
+      isActive: true,
+      lastOperationId: expect.stringContaining('batch-compensation:'),
+    }));
+    expect(compensatedAgain?.record.version).toBeGreaterThan(desiredA.version);
+
+    const completed = await syncFinanceState(failedAgain.state, 'user-a', remote, () => NOW);
+    expect(completed.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).filter((entry) => entry.entity === 'accounts')
+      .every((entry) => !(entry.record as ReturnType<typeof account>).isActive)).toBe(true);
+  });
+
+  it('does not recover a compensation created for another batch intent', async () => {
+    const beforeA = account('foreign-comp-a', 'user-a', 1, 'create-a');
+    const beforeB = account('foreign-comp-b', 'user-a', 1, 'create-b');
+    const foreignA = { ...beforeA, version: 2, lastOperationId: 'foreign-archive-a', isActive: false };
+    const desiredA = { ...foreignA, lastOperationId: 'local-archive-a' };
+    const desiredB = { ...beforeB, version: 2, lastOperationId: 'archive-b', isActive: false };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: beforeA },
+      { entity: 'accounts', record: beforeB },
+    ]);
+    remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
+    const foreignState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [foreignA, desiredB] },
+      outbox: [{
+        ...operation(foreignA), batchId: 'foreign-batch', batchBeforeRecord: beforeA,
+      }, {
+        ...operation(desiredB), batchId: 'foreign-batch', batchBeforeRecord: beforeB,
+      }],
+    };
+    await syncFinanceState(foreignState, 'user-a', remote, () => NOW);
+    const foreignCompensation = (await remote.pull('user-a')).find((entry) => (
+      entry.entity === 'accounts' && entry.record.id === beforeA.id
+    ));
+
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [desiredA, desiredB] },
+      outbox: [{
+        ...operation(desiredA), batchId: 'local-batch', batchBeforeRecord: beforeA,
+      }, {
+        ...operation(desiredB), batchId: 'local-batch', batchBeforeRecord: beforeB,
+      }],
+    };
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+    const currentRemoteA = (await remote.pull('user-a')).find((entry) => (
+      entry.entity === 'accounts' && entry.record.id === beforeA.id
+    ));
+
+    expect(result.state.outbox).toHaveLength(2);
+    expect(result.state.data.accounts.find((record) => record.id === desiredA.id)?.version).toBe(2);
+    expect(currentRemoteA).toEqual(foreignCompensation);
+    expect(result.state.lastSyncError).toMatch(/整批未上傳|同步衝突/);
+  });
+
+  it('blocks every operation in a batch when one member has a persisted conflict lock', async () => {
+    const category: Category = {
+      id: 'category-batch-lock', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'category-create',
+      name: '餐飲', kind: 'expense', icon: { type: 'emoji', value: '🍚' },
+      isActive: true, sortOrder: 0,
+    };
+    const lockedAccount = { ...account('batch-locked-account', 'user-a', 3, 'account-archive'), isActive: false };
+    const pausedRule = {
+      id: 'batch-locked-rule', ownerId: 'user-a', version: 2,
+      updatedAt: NOW, lastOperationId: 'rule-pause',
+      name: '月租', type: 'expense' as const, amount: 10_000,
+      categoryId: category.id, categoryName: category.name,
+      accountId: lockedAccount.id, accountName: lockedAccount.name,
+      frequency: 'monthly' as const, startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: false,
+    };
+    const apply = vi.fn(async () => undefined);
+    const remote: RemoteAdapter = { apply, pull: async () => [] };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: {
+        ...emptyData(),
+        accounts: [lockedAccount],
+        categories: [category],
+        recurringRules: [pausedRule],
+      },
+      outbox: [{
+        ...operation(lockedAccount),
+        batchId: 'locked-batch',
+        batchBeforeRecord: { ...lockedAccount, version: 2, lastOperationId: 'account-active', isActive: true },
+      }, {
+        id: pausedRule.lastOperationId,
+        entity: 'recurringRules',
+        recordId: pausedRule.id,
+        record: pausedRule,
+        attempts: 0,
+        queuedAt: NOW,
+        batchId: 'locked-batch',
+        batchBeforeRecord: { ...pausedRule, version: 1, lastOperationId: 'rule-active', isActive: true },
+      }],
+      unresolvedSyncRecordKeys: ['accounts:batch-locked-account'],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(apply).not.toHaveBeenCalled();
+    expect(result.state.outbox).toHaveLength(2);
+    expect(result.report.failures.filter((failure) => failure.stage === 'conflict')).toHaveLength(2);
+  });
+
+  it('keeps retained batch payloads reload-safe when a remote tombstone wins', async () => {
+    const beforeA = account('remote-deleted-batch-a', 'user-a', 1, 'create-a');
+    const beforeB = account('remote-deleted-batch-b', 'user-a', 1, 'create-b');
+    const localA = { ...beforeA, version: 2, lastOperationId: 'local-edit-a', name: '本機 A' };
+    const localB = { ...beforeB, version: 2, lastOperationId: 'local-edit-b', name: '本機 B' };
+    const remoteDeletedA = {
+      ...beforeA, version: 3, lastOperationId: 'tombstone:remote-delete-a',
+      deletedAt: NOW, isActive: false,
+    };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: remoteDeletedA },
+      { entity: 'accounts', record: beforeB },
+    ]);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), accounts: [localA, localB] },
+      outbox: [{
+        ...operation(localA), batchId: 'edit-batch', batchBeforeRecord: beforeA,
+      }, {
+        ...operation(localB), batchId: 'edit-batch', batchBeforeRecord: beforeB,
+      }],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(result.state.outbox).toHaveLength(2);
+    for (const pending of result.state.outbox) {
+      expect(result.state.data.accounts.find((record) => record.id === pending.recordId))
+        .toEqual(pending.record);
+    }
+    expect(result.state.data.accounts.find((record) => record.id === localA.id)).toEqual(localA);
+    expect(result.state.unresolvedSyncRecordKeys).toContain(`accounts:${localA.id}`);
+  });
+
+  it('keeps a local-only dependent rule when accepting its parent cloud version', () => {
+    const category: Category = {
+      id: 'category-local-rule', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'category-create',
+      name: '餐飲', kind: 'expense', icon: { type: 'emoji', value: '🍚' },
+      isActive: true, sortOrder: 0,
+    };
+    const remoteAccount = { ...account('account-local-rule', 'user-a', 4, 'remote-account'), name: '雲端帳戶' };
+    const localAccount = {
+      ...remoteAccount,
+      version: 3,
+      lastOperationId: 'local-account-rename',
+      name: '本機改名',
+    };
+    const localRule = {
+      id: 'local-only-rule', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'local-rule-create',
+      name: '本機新規則', type: 'expense' as const, amount: 500,
+      categoryId: category.id, categoryName: category.name,
+      accountId: localAccount.id, accountName: localAccount.name,
+      frequency: 'monthly' as const, startDate: '2026-09-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: {
+        ...emptyData(),
+        accounts: [localAccount],
+        categories: [category],
+        recurringRules: [localRule],
+      },
+      outbox: [{ ...operation(localAccount), batchId: 'rename-parent-batch' }, {
+        id: localRule.lastOperationId,
+        entity: 'recurringRules',
+        recordId: localRule.id,
+        record: localRule,
+        attempts: 0,
+        queuedAt: NOW,
+        batchId: 'rename-parent-batch',
+      }],
+      unresolvedSyncRecordKeys: ['accounts:account-local-rule'],
+    };
+
+    const accepted = acceptRemoteConflictRecord(
+      localState,
+      { entity: 'accounts', record: remoteAccount },
+      [{ entity: 'accounts', record: remoteAccount }],
+    );
+
+    expect(accepted.data.accounts).toEqual([remoteAccount]);
+    expect(accepted.data.recurringRules).toEqual([
+      expect.objectContaining({ id: localRule.id, accountName: remoteAccount.name }),
+    ]);
+    expect(accepted.outbox).toEqual([
+      expect.objectContaining({
+        entity: 'recurringRules',
+        recordId: localRule.id,
+        batchId: undefined,
+        record: expect.objectContaining({ accountName: remoteAccount.name }),
+      }),
+    ]);
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+  });
+
   it('preserves a newer queued inactive budget edit when an older remote budget is already inactive', async () => {
     const remoteBudget: Budget = {
       id: 'budget-offline-edit', ownerId: 'user-a', version: 2,
@@ -1175,6 +1951,37 @@ describe('offline sync engine', () => {
     expect(result.state.data.budgets).toEqual([remoteBudget]);
   });
 
+  it('does not let an ordinary stale archive overwrite a newer remote reactivation', async () => {
+    const localArchive: Budget = {
+      id: 'budget-reactivated-remotely', ownerId: 'user-a', version: 3,
+      updatedAt: NOW, lastOperationId: 'local-stale-archive',
+      scope: 'overall', period: 'monthly', amount: 8_000, isActive: false,
+    };
+    const remoteReactivation: Budget = {
+      ...localArchive,
+      version: 4,
+      lastOperationId: 'remote-reactivation',
+      amount: 9_000,
+      isActive: true,
+    };
+    const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteReactivation }]);
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: { ...emptyData(), budgets: [localArchive] },
+      outbox: [budgetOperation(localArchive)],
+    };
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(result.state.outbox).toEqual([]);
+    expect(result.state.data.budgets).toEqual([remoteReactivation]);
+    expect((await remote.pull('user-a'))[0]).toEqual({
+      entity: 'budgets',
+      record: remoteReactivation,
+    });
+  });
+
   it('keeps a same-clock divergent payload pending as a visible unresolved conflict', async () => {
     const local = {
       ...account('wallet', 'user-a', 3, 'op-same-clock'),
@@ -1198,7 +2005,9 @@ describe('offline sync engine', () => {
     expect(result.state.outbox[0]).toMatchObject({
       id: 'op-same-clock',
       attempts: 1,
+      lastError: expect.stringContaining('unresolved same-clock payload conflict'),
     });
+    expect(result.state.unresolvedSyncRecordKeys).toEqual(['accounts:wallet']);
     expect(result.report.status).toBe('partial');
     expect(result.report.conflicts).toEqual([
       expect.objectContaining({
@@ -1245,6 +2054,76 @@ describe('offline sync engine', () => {
     expect(result.report.conflicts).toEqual([
       expect.objectContaining({ winner: 'unresolved', reason: 'payload' }),
     ]);
+  });
+
+  it('never sends a pending write whose persisted conflict lock is unresolved', async () => {
+    const local = {
+      ...account('wallet-locked', 'user-a', 4, 'local-after-conflict'),
+      name: 'local winner that must remain blocked',
+    };
+    const remoteRecord = {
+      ...local,
+      version: 3,
+      lastOperationId: 'remote-conflicted-value',
+      name: 'remote value',
+    };
+    const apply = vi.fn(async () => undefined);
+    const remote: RemoteAdapter = {
+      apply,
+      pull: async () => [{ entity: 'accounts', record: remoteRecord }],
+    };
+    const localState = state('user-a', [local], [operation(local)]);
+    localState.unresolvedSyncRecordKeys = ['accounts:wallet-locked'];
+
+    const result = await syncFinanceState(localState, 'user-a', remote, () => NOW);
+
+    expect(apply).not.toHaveBeenCalled();
+    expect(result.state.outbox).toHaveLength(1);
+    expect(result.state.unresolvedSyncRecordKeys).toEqual(['accounts:wallet-locked']);
+    expect(result.report.failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stage: 'conflict', recordId: 'wallet-locked' }),
+    ]));
+  });
+
+  it('persists a pulled same-clock payload conflict until the user explicitly accepts the cloud record', async () => {
+    const local = {
+      ...account('wallet-no-outbox', 'user-a', 3, 'op-same-clock-no-outbox'),
+      name: 'local value',
+    };
+    let remoteRecord = { ...local, name: 'remote divergent value' };
+    const remote: RemoteAdapter = {
+      apply: async () => {},
+      pull: async () => [{ entity: 'accounts', record: remoteRecord }],
+    };
+
+    const conflicted = await syncFinanceState(
+      state('user-a', [local], []),
+      'user-a',
+      remote,
+      () => NOW,
+    );
+
+    expect(conflicted.state.outbox).toEqual([]);
+    expect(conflicted.state.unresolvedSyncRecordKeys).toEqual(['accounts:wallet-no-outbox']);
+
+    remoteRecord = local;
+    const resolved = await syncFinanceState(
+      conflicted.state,
+      'user-a',
+      remote,
+      () => NOW,
+    );
+
+    expect(resolved.state.unresolvedSyncRecordKeys).toEqual(['accounts:wallet-no-outbox']);
+    expect(resolved.report.conflicts).toEqual([]);
+
+    remoteRecord = { ...local, name: 'explicitly accepted cloud value' };
+    const accepted = acceptRemoteConflictRecord(resolved.state, {
+      entity: 'accounts',
+      record: remoteRecord,
+    });
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(accepted.data.accounts).toEqual([remoteRecord]);
   });
 
   it('keeps valid pulled records when the adapter isolates a malformed row and exposes its diagnostic', async () => {

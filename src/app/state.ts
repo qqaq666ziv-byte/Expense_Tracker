@@ -206,6 +206,14 @@ export function loadFinanceStateWithRecovery(
         || operation.record.ownerId !== ownerId
         || operation.recordId !== operation.record.id
         || operation.id !== operation.record.lastOperationId
+        || (operation.batchId !== undefined
+          && (typeof operation.batchId !== 'string' || operation.batchId.length === 0))
+        || (operation.batchId === undefined && operation.batchBeforeRecord !== undefined)
+        || (operation.batchId !== undefined && operation.batchBeforeRecord === undefined)
+        || (operation.batchBeforeRecord !== undefined
+          && operation.batchBeforeRecord !== null
+          && (operation.batchBeforeRecord.ownerId !== ownerId
+            || operation.batchBeforeRecord.id !== operation.recordId))
         || !entityNames.includes(operation.entity)) {
         throw new Error('invalid or foreign operation in outbox');
       }
@@ -215,6 +223,25 @@ export function loadFinanceStateWithRecovery(
         || currentRecord.lastOperationId !== operation.id
         || JSON.stringify(currentRecord) !== JSON.stringify(operation.record)) {
         throw new Error('outbox does not match the current local record');
+      }
+      validateBatchBeforeRecord(parsed.data, operation, 'local outbox batch before-record');
+    }
+    if (parsed.unresolvedSyncRecordKeys !== undefined) {
+      if (!Array.isArray(parsed.unresolvedSyncRecordKeys)) {
+        throw new Error('invalid unresolved sync record keys');
+      }
+      const validRecordKeys = new Set(entityNames.flatMap((entity) => (
+        (parsed.data[entity] as SyncRecord[]).map((record) => `${entity}:${record.id}`)
+      )));
+      if (
+        ownerId === 'guest'
+        ||
+        new Set(parsed.unresolvedSyncRecordKeys).size !== parsed.unresolvedSyncRecordKeys.length
+        || parsed.unresolvedSyncRecordKeys.some((key) => (
+          typeof key !== 'string' || !validRecordKeys.has(key)
+        ))
+      ) {
+        throw new Error('invalid unresolved sync record keys');
       }
     }
     if (parsed.initialBootstrap !== undefined) {
@@ -241,10 +268,23 @@ export function loadFinanceStateWithRecovery(
           || operation.record.ownerId !== ownerId
           || operation.recordId !== operation.record.id
           || operation.id !== operation.record.lastOperationId
+          || (operation.batchId !== undefined
+            && (typeof operation.batchId !== 'string' || operation.batchId.length === 0))
+          || (operation.batchId === undefined && operation.batchBeforeRecord !== undefined)
+          || (operation.batchId !== undefined && operation.batchBeforeRecord === undefined)
+          || (operation.batchBeforeRecord !== undefined
+            && operation.batchBeforeRecord !== null
+            && (operation.batchBeforeRecord.ownerId !== ownerId
+              || operation.batchBeforeRecord.id !== operation.recordId))
           || !entityNames.includes(operation.entity)
           || pendingKeys.has(key)) {
           throw new Error('invalid or duplicate operation in authenticated initial bootstrap');
         }
+        validateBatchBeforeRecord(
+          bootstrap.candidate,
+          operation,
+          'authenticated initial bootstrap batch before-record',
+        );
         pendingKeys.add(key);
       }
     }
@@ -475,16 +515,36 @@ export const entityNames: readonly FinanceEntityName[] = [
   'recurringRules',
 ];
 
+function validateBatchBeforeRecord(
+  data: FinanceData,
+  operation: PendingOperation,
+  context: string,
+): void {
+  if (operation.batchBeforeRecord === undefined || operation.batchBeforeRecord === null) return;
+  const records = [...data[operation.entity]] as SyncRecord[];
+  const index = records.findIndex((record) => record.id === operation.recordId);
+  if (index < 0) throw new Error(`${context} before-record target is missing`);
+  records[index] = operation.batchBeforeRecord;
+  validateFinanceData({ ...data, [operation.entity]: records } as FinanceData, context);
+}
+
 export function putRecord<E extends FinanceEntityName>(
   state: PersistedFinanceState,
   entity: E,
   record: FinanceData[E][number],
+  batchId?: string,
 ): PersistedFinanceState {
   if (record.ownerId !== state.ownerId) throw new Error('拒絕寫入其他使用者的資料');
   assertFinanceRecordWithinWriteLimits(entity, record);
   const records = state.data[entity] as FinanceData[E][number][];
   assertFinanceOwnerRowLimit(entity, records as FinanceData[E], record.id);
-  if (state.ownerId !== 'guest') return enqueueSyncRecord(state, entity, record);
+  if (state.ownerId !== 'guest') return enqueueSyncRecord(
+    state,
+    entity,
+    record,
+    record.updatedAt,
+    batchId,
+  );
 
   const index = records.findIndex((candidate) => candidate.id === record.id);
   const nextRecords = [...records];
@@ -591,7 +651,10 @@ export function applyRestoredData(
 ): PersistedFinanceState {
   validateFinanceData(restoredData, 'restored data');
   if (state.ownerId === 'guest') {
-    return { ...state, data: structuredClone(restoredData) };
+    return {
+      ...state,
+      data: structuredClone(restoredData),
+    };
   }
 
   const timestamp = now.toISOString();
@@ -655,6 +718,7 @@ export function putCategoryWithDependents(
   category: Category,
   now = new Date(),
   operationId: () => string = () => crypto.randomUUID(),
+  batchId: string = crypto.randomUUID(),
 ): PersistedFinanceState {
   assertCategoryUpsert(state.data, category);
   const timestamp = now.toISOString();
@@ -673,7 +737,7 @@ export function putCategoryWithDependents(
   let next = state;
   for (const [sortOrder, record] of ordered.entries()) {
     if (record.id === category.id) {
-      next = putRecord(next, 'categories', { ...category, sortOrder });
+      next = putRecord(next, 'categories', { ...category, sortOrder }, batchId);
     } else if (record.sortOrder !== sortOrder) {
       next = putRecord(next, 'categories', {
         ...record,
@@ -681,7 +745,7 @@ export function putCategoryWithDependents(
         updatedAt: timestamp,
         lastOperationId: activeOperationId(operationId()),
         sortOrder,
-      });
+      }, batchId);
     }
   }
   if (existing && existing.name !== category.name) {
@@ -694,7 +758,7 @@ export function putCategoryWithDependents(
         updatedAt: timestamp,
         lastOperationId: activeOperationId(operationId()),
         categoryName: category.name,
-      });
+      }, batchId);
     }
   }
   return next;
@@ -706,9 +770,10 @@ export function putAccountWithDependents(
   account: AssetAccount,
   now = new Date(),
   operationId: () => string = () => crypto.randomUUID(),
+  batchId: string = crypto.randomUUID(),
 ): PersistedFinanceState {
   const existing = state.data.accounts.find((candidate) => candidate.id === account.id);
-  let next = putRecord(state, 'accounts', account);
+  let next = putRecord(state, 'accounts', account, batchId);
   if (!existing || existing.name === account.name) return next;
   const timestamp = now.toISOString();
   for (const rule of state.data.recurringRules.filter((candidate) => (
@@ -720,7 +785,7 @@ export function putAccountWithDependents(
       updatedAt: timestamp,
       lastOperationId: activeOperationId(operationId()),
       accountName: account.name,
-    });
+    }, batchId);
   }
   return next;
 }
@@ -751,6 +816,7 @@ export function applyCategoryLifecycleMutation(
   action: CategoryAction,
   now = new Date(),
   operationId: () => string = () => crypto.randomUUID(),
+  batchId: string = crypto.randomUUID(),
 ): PersistedFinanceState {
   const category = state.data.categories.find((candidate) => candidate.id === categoryId);
   if (!category) throw new Error('找不到分類，本次操作未執行。');
@@ -768,18 +834,44 @@ export function applyCategoryLifecycleMutation(
     for (const rule of state.data.recurringRules.filter((candidate) => (
       !candidate.deletedAt && candidate.isActive && candidate.categoryId === category.id
     ))) {
-      next = putRecord(next, 'recurringRules', { ...rule, ...changed(rule), isActive: false });
+      next = putRecord(next, 'recurringRules', { ...rule, ...changed(rule), isActive: false }, batchId);
     }
-    return putRecord(next, 'categories', { ...category, ...changed(category), isActive: false });
+    return putRecord(next, 'categories', { ...category, ...changed(category), isActive: false }, batchId);
   }
   if (action === 'restore') {
-    return putRecord(next, 'categories', { ...category, ...changed(category), isActive: true });
+    return putRecord(next, 'categories', { ...category, ...changed(category), isActive: true }, batchId);
   }
   return putRecord(next, 'categories', {
     ...category,
     ...tombstoneRecordMeta(category, now, operationId),
     isActive: false,
+  }, batchId);
+}
+
+/** Pause future recurring writes and archive an account in one local commit. */
+export function applyAccountArchiveMutation(
+  state: PersistedFinanceState,
+  accountId: string,
+  now = new Date(),
+  operationId: () => string = () => crypto.randomUUID(),
+  batchId: string = crypto.randomUUID(),
+): PersistedFinanceState {
+  const account = state.data.accounts.find((candidate) => candidate.id === accountId);
+  if (!account || account.deletedAt) throw new Error('找不到帳戶，本次操作未執行。');
+  if (!account.isActive) throw new Error('帳戶已封存，本次操作未執行。');
+  const timestamp = now.toISOString();
+  const changed = <T extends SyncRecord>(record: T) => ({
+    version: record.version + 1,
+    updatedAt: timestamp,
+    lastOperationId: activeOperationId(operationId()),
   });
+  let next = state;
+  for (const rule of state.data.recurringRules.filter((candidate) => (
+    !candidate.deletedAt && candidate.isActive && candidate.accountId === accountId
+  ))) {
+    next = putRecord(next, 'recurringRules', { ...rule, ...changed(rule), isActive: false }, batchId);
+  }
+  return putRecord(next, 'accounts', { ...account, ...changed(account), isActive: false }, batchId);
 }
 
 /**
@@ -804,6 +896,24 @@ export function releaseGoalAllocations(
       lastOperationId: `tombstone:${operationId()}`,
       deletedAt: timestamp,
     }));
+}
+
+/** Tombstone every active allocation for one goal in a single local batch. */
+export function applyGoalAllocationReleaseMutation(
+  state: PersistedFinanceState,
+  goalId: string,
+  now = new Date(),
+  operationId: () => string = () => crypto.randomUUID(),
+  batchId: string = crypto.randomUUID(),
+): PersistedFinanceState {
+  const goal = state.data.goals.find((candidate) => candidate.id === goalId && !candidate.deletedAt);
+  if (!goal) throw new Error('找不到儲蓄目標，本次釋放未執行。');
+  const releases = releaseGoalAllocations(state.data.allocations, goalId, now, operationId);
+  let next = state;
+  for (const allocation of releases) {
+    next = putRecord(next, 'allocations', allocation, batchId);
+  }
+  return next;
 }
 
 export function hasUserContent(data: FinanceData): boolean {

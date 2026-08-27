@@ -68,6 +68,16 @@ describe('AssetsView product language', () => {
     expect(current.openingBalance).toBe(12_345);
   });
 
+  it('rejects an account editor while its same-clock payload conflict is unresolved', () => {
+    const account = createInitialState('guest').data.accounts[0];
+
+    expect(() => buildEditedAccount(account, account, {
+      name: '不應儲存',
+      icon: account.icon,
+      includeInTotalAssets: account.includeInTotalAssets,
+    }, new Date(), true)).toThrow(/未解同步衝突/);
+  });
+
   it('edits from the latest account while keeping opening balance and adjustment history immutable', () => {
     const state = createInitialState('guest');
     const opened = state.data.accounts[0];
