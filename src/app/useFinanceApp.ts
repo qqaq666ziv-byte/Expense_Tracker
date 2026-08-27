@@ -254,23 +254,60 @@ export function syncMutationTargets<E extends FinanceEntityName>(
   }
   if (entity === 'allocations') {
     const allocation = record as SavingsAllocation;
-    targets.push({ entity: 'goals', recordId: allocation.goalId });
+    const existing = state.data.allocations.find((candidate) => candidate.id === allocation.id);
+    const goalIds = new Set([allocation.goalId, existing?.goalId].filter(Boolean) as string[]);
+    targets.push(...[...goalIds].map((goalId) => ({ entity: 'goals' as const, recordId: goalId })));
     targets.push(...state.data.allocations
       .filter((candidate) => (
         !candidate.deletedAt
-        && candidate.goalId === allocation.goalId
+        && goalIds.has(candidate.goalId)
         && candidate.id !== allocation.id
       ))
       .map((candidate) => ({ entity: 'allocations' as const, recordId: candidate.id })));
   }
+  if (entity === 'transactions') {
+    const transaction = record as FinanceData['transactions'][number];
+    const existing = state.data.transactions.find((candidate) => candidate.id === transaction.id);
+    for (const candidate of [transaction, existing].filter(Boolean) as FinanceData['transactions']) {
+      targets.push(
+        { entity: 'accounts', recordId: candidate.accountId },
+        { entity: 'categories', recordId: candidate.categoryId },
+      );
+      if (candidate.recurringRuleId) {
+        targets.push({ entity: 'recurringRules', recordId: candidate.recurringRuleId });
+      }
+    }
+  }
+  if (entity === 'adjustments') {
+    const adjustment = record as FinanceData['adjustments'][number];
+    const existing = state.data.adjustments.find((candidate) => candidate.id === adjustment.id);
+    targets.push(...[...new Set([adjustment.accountId, existing?.accountId]
+      .filter(Boolean) as string[])]
+      .map((accountId) => ({ entity: 'accounts' as const, recordId: accountId })));
+  }
+  if (entity === 'budgets') {
+    const budget = record as FinanceData['budgets'][number];
+    const existing = state.data.budgets.find((candidate) => candidate.id === budget.id);
+    for (const candidate of [budget, existing].filter(Boolean) as FinanceData['budgets']) {
+      if (candidate.scope === 'category' && candidate.categoryId) {
+        targets.push({ entity: 'categories', recordId: candidate.categoryId });
+      }
+    }
+  }
   if (entity === 'recurringRules') {
     const rule = record as FinanceData['recurringRules'][number];
-    targets.push(
-      { entity: 'accounts', recordId: rule.accountId },
-      { entity: 'categories', recordId: rule.categoryId },
-    );
+    const existing = state.data.recurringRules.find((candidate) => candidate.id === rule.id);
+    for (const candidate of [rule, existing].filter(Boolean) as FinanceData['recurringRules']) {
+      targets.push(
+        { entity: 'accounts', recordId: candidate.accountId },
+        { entity: 'categories', recordId: candidate.categoryId },
+      );
+    }
   }
-  return targets;
+  return [...new Map(targets.map((target) => [
+    syncRecordKey(target.entity, target.recordId),
+    target,
+  ])).values()];
 }
 
 export function materializeRecurringTransactionsUnlessRecovering(
@@ -284,12 +321,16 @@ export function materializeRecurringTransactionsUnlessRecovering(
     let next = current;
     let changed = false;
     for (const rule of current.data.recurringRules.filter((item) => !item.deletedAt && item.isActive)) {
-      if (hasUnresolvedPayloadConflict(
+      if ([
+        ['recurringRules', rule.id],
+        ['accounts', rule.accountId],
+        ['categories', rule.categoryId],
+      ].some(([entity, recordId]) => hasUnresolvedPayloadConflict(
         current.outbox,
-        'recurringRules',
-        rule.id,
+        entity as FinanceEntityName,
+        recordId,
         current.unresolvedSyncRecordKeys,
-      )) continue;
+      ))) continue;
       if (recurringRuleParentIssue(next.data, rule)) {
         next = putRecord(next, 'recurringRules', {
           ...rule,
@@ -659,16 +700,30 @@ export function useFinanceApp(): FinanceAppController {
     }
     try {
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
-      assertSyncRecordMutationAllowed(stateRef.current, entity, record.id);
-      const deleted = {
-        ...record,
-        ...tombstoneRecordMeta(record as SyncRecord),
-        ...('isActive' in record ? { isActive: false } : {}),
-      } as FinanceData[E][number];
+      assertSyncRecordMutationsAllowed(
+        stateRef.current,
+        syncMutationTargets(stateRef.current, entity, record),
+      );
       commitState((current) => applyFinanceMutationUnlessRecovering(
         current,
         storageRecoveryRef.current,
-        (recoverable) => putRecord(recoverable, entity, deleted),
+        (recoverable) => {
+          const currentRecord = (recoverable.data[entity] as FinanceData[E][number][])
+            .find((candidate) => candidate.id === record.id);
+          if (!currentRecord || currentRecord.deletedAt) {
+            throw new Error('找不到可刪除的最新資料，本次刪除未執行。');
+          }
+          assertSyncRecordMutationsAllowed(
+            recoverable,
+            syncMutationTargets(recoverable, entity, currentRecord),
+          );
+          const deleted = {
+            ...currentRecord,
+            ...tombstoneRecordMeta(currentRecord as SyncRecord),
+            ...('isActive' in currentRecord ? { isActive: false } : {}),
+          } as FinanceData[E][number];
+          return putRecord(recoverable, entity, deleted);
+        },
       ));
       return true;
     } catch (error) {

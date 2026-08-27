@@ -910,7 +910,9 @@ export function BudgetPanel({
               )!;
               const conflictBlocked = unresolvedSyncRecordKeys.has(
                 syncRecordKey("budgets", budget.id),
-              );
+              ) || Boolean(budget.categoryId && unresolvedSyncRecordKeys.has(
+                syncRecordKey("categories", budget.categoryId),
+              ));
               return (
                 <article key={usage.budgetId}>
                   <div className="flex justify-between gap-3">
@@ -993,7 +995,9 @@ export function BudgetPanel({
               const name = budgetName(budget);
               const conflictBlocked = unresolvedSyncRecordKeys.has(
                 syncRecordKey("budgets", budget.id),
-              );
+              ) || Boolean(budget.categoryId && unresolvedSyncRecordKeys.has(
+                syncRecordKey("categories", budget.categoryId),
+              ));
               return (
                 <article className="settings-row opacity-75" key={budget.id}>
                   <div className="min-w-0 flex-1">

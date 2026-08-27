@@ -108,4 +108,52 @@ describe('HomeView ledger access', () => {
     expect(html.match(/<button[^>]*aria-label="編輯 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
     expect(html.match(/<button[^>]*aria-label="刪除 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
   });
+
+  it('disables conflicted account and category choices for new transactions', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const html = renderToStaticMarkup(
+      <HomeView
+        data={state.data}
+        ownerId="guest"
+        put={() => true}
+        deleteTransaction={() => true}
+        unresolvedSyncRecordKeys={new Set([
+          `accounts:${account.id}`,
+          `categories:${category.id}`,
+        ])}
+      />,
+    );
+
+    expect(html).toContain('title="此分類有未解同步衝突，暫時無法用於新交易。"');
+    expect(html).toContain('title="此帳戶有未解同步衝突，暫時無法用於新交易。"');
+    expect(html.match(/<button[^>]*title="此分類有未解同步衝突[^>]*>/)?.[0]).toContain('disabled=""');
+    expect(html.match(/<button[^>]*title="此帳戶有未解同步衝突[^>]*>/)?.[0]).toContain('disabled=""');
+  });
+
+  it('disables transaction edit and delete when an existing parent is conflicted', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.transactions = [{
+      id: 'transaction-parent-conflict', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'transaction-create',
+      amount: 100, type: 'expense', categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name, occurredAt: '2026-08-27 08:00',
+    }];
+    const html = renderToStaticMarkup(
+      <HomeView
+        data={state.data}
+        ownerId="guest"
+        put={() => true}
+        deleteTransaction={() => true}
+        unresolvedSyncRecordKeys={new Set([`accounts:${account.id}`])}
+      />,
+    );
+
+    expect(html).toContain('關聯帳戶、分類或週期規則有同步衝突：編輯與刪除已暫停。');
+    expect(html.match(/<button[^>]*aria-label="編輯 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
+    expect(html.match(/<button[^>]*aria-label="刪除 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
+  });
 });

@@ -162,6 +162,115 @@ describe('unresolved sync conflict mutation lock', () => {
     expect(() => assertSyncRecordMutationsAllowed(state, targets)).toThrow(/未解同步衝突/);
   });
 
+  it('locks transactions, adjustments, and category budgets behind their referenced parents', () => {
+    const state = createInitialState('user-a');
+    state.initialBootstrap = undefined;
+    state.outbox = [];
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.unresolvedSyncRecordKeys = [
+      `accounts:${account.id}`,
+      `categories:${category.id}`,
+    ];
+    const meta = {
+      ownerId: 'user-a', version: 1, updatedAt: '2026-08-27T00:00:00.000Z',
+    } as const;
+    const transactionTargets = syncMutationTargets(state, 'transactions', {
+      ...meta, id: 'new-transaction', lastOperationId: 'transaction-create',
+      amount: 100, type: 'expense', categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name, occurredAt: '2026-08-27 08:00',
+    });
+    const adjustmentTargets = syncMutationTargets(state, 'adjustments', {
+      ...meta, id: 'new-adjustment', lastOperationId: 'adjustment-create',
+      accountId: account.id, amountDelta: 50, occurredAt: '2026-08-27 08:01',
+    });
+    const budgetTargets = syncMutationTargets(state, 'budgets', {
+      ...meta, id: 'new-budget', lastOperationId: 'budget-create',
+      scope: 'category', categoryId: category.id, categoryName: category.name,
+      period: 'monthly', amount: 5_000, isActive: true,
+    });
+
+    expect(transactionTargets).toEqual(expect.arrayContaining([
+      { entity: 'accounts', recordId: account.id },
+      { entity: 'categories', recordId: category.id },
+    ]));
+    expect(adjustmentTargets).toContainEqual({ entity: 'accounts', recordId: account.id });
+    expect(budgetTargets).toContainEqual({ entity: 'categories', recordId: category.id });
+    expect(() => assertSyncRecordMutationsAllowed(state, transactionTargets)).toThrow(/未解同步衝突/);
+    expect(() => assertSyncRecordMutationsAllowed(state, adjustmentTargets)).toThrow(/未解同步衝突/);
+    expect(() => assertSyncRecordMutationsAllowed(state, budgetTargets)).toThrow(/未解同步衝突/);
+  });
+
+  it('keeps old parents locked when an edit changes references or a delete tombstones the child', () => {
+    const state = createInitialState('user-a');
+    state.initialBootstrap = undefined;
+    state.outbox = [];
+    const oldAccount = state.data.accounts[0];
+    const newAccount = { ...oldAccount, id: 'safe-account', lastOperationId: 'safe-account-create' };
+    const oldCategory = state.data.categories.find((item) => item.kind === 'expense')!;
+    const newCategory = {
+      ...oldCategory, id: 'safe-category', lastOperationId: 'safe-category-create', name: '安全分類',
+    };
+    state.data.accounts.push(newAccount);
+    state.data.categories.push(newCategory);
+    const existing: Transaction = {
+      id: 'transaction-old-parents', ownerId: 'user-a', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'transaction-create',
+      amount: 100, type: 'expense', categoryId: oldCategory.id, categoryName: oldCategory.name,
+      accountId: oldAccount.id, accountName: oldAccount.name, occurredAt: '2026-08-27 08:00',
+    };
+    state.data.transactions = [existing];
+    state.unresolvedSyncRecordKeys = [
+      `accounts:${oldAccount.id}`,
+      `categories:${oldCategory.id}`,
+    ];
+    const moved = {
+      ...existing, version: 2, lastOperationId: 'transaction-move',
+      accountId: newAccount.id, accountName: newAccount.name,
+      categoryId: newCategory.id, categoryName: newCategory.name,
+    };
+
+    const editTargets = syncMutationTargets(state, 'transactions', moved);
+    const deleteTargets = syncMutationTargets(state, 'transactions', existing);
+
+    expect(editTargets).toEqual(expect.arrayContaining([
+      { entity: 'accounts', recordId: oldAccount.id },
+      { entity: 'categories', recordId: oldCategory.id },
+      { entity: 'accounts', recordId: newAccount.id },
+      { entity: 'categories', recordId: newCategory.id },
+    ]));
+    expect(() => assertSyncRecordMutationsAllowed(state, editTargets)).toThrow(/未解同步衝突/);
+    expect(() => assertSyncRecordMutationsAllowed(state, deleteTargets)).toThrow(/未解同步衝突/);
+  });
+
+  it('does not materialize a recurring transaction while a referenced parent is conflicted', () => {
+    const state = createInitialState('user-a');
+    state.initialBootstrap = undefined;
+    state.outbox = [];
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.recurringRules = [{
+      id: 'rule-conflicted-parent', ownerId: 'user-a', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-create',
+      name: '房租', type: 'expense', amount: 10_000,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-08-01',
+      isActive: true,
+    }];
+    state.unresolvedSyncRecordKeys = [`accounts:${account.id}`];
+
+    const result = materializeRecurringTransactionsUnlessRecovering(
+      state,
+      '2026-08-27',
+      undefined,
+    );
+
+    expect(result).toBe(state);
+    expect(result.data.transactions).toEqual([]);
+    expect(result.data.recurringRules[0].nextOccurrenceDate).toBe('2026-08-01');
+  });
+
   it('locks a new allocation behind its parent goal and every active sibling allocation', () => {
     const state = createInitialState('guest');
     state.data.goals = [{

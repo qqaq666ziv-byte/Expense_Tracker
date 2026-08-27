@@ -80,10 +80,14 @@ export function HomeView({
   );
   const resolvedCategoryId = categories.some((item) => item.id === categoryId)
     ? categoryId
-    : (categories[0]?.id ?? "");
+    : (categories.find((item) => !unresolvedSyncRecordKeys.has(
+        syncRecordKey("categories", item.id),
+      ))?.id ?? "");
   const resolvedAccountId = accounts.some((item) => item.id === accountId)
     ? accountId
-    : (accounts[0]?.id ?? "");
+    : (accounts.find((item) => !unresolvedSyncRecordKeys.has(
+        syncRecordKey("accounts", item.id),
+      ))?.id ?? "");
 
   useEffect(() => {
     try {
@@ -177,6 +181,12 @@ export function HomeView({
     if (numericAmount === null || numericAmount <= 0)
       return setError("請輸入大於 0、最多兩位小數的金額");
     if (!category || !account) return setError("請先建立可用的資產帳戶與分類");
+    if (
+      unresolvedSyncRecordKeys.has(syncRecordKey("categories", category.id))
+      || unresolvedSyncRecordKeys.has(syncRecordKey("accounts", account.id))
+    ) {
+      return setError("所選帳戶或分類有未解同步衝突；請先選擇雲端版本，本次交易未儲存。");
+    }
     if (!occurredAt) return setError("請選擇交易時間");
 
     const editingTutorial = Boolean(editing && isTutorialTransaction(editing));
@@ -328,6 +338,10 @@ export function HomeView({
                   key={category.id}
                   className={`category-choice ${resolvedCategoryId === category.id ? "selected" : ""}`}
                   aria-pressed={resolvedCategoryId === category.id}
+                  disabled={unresolvedSyncRecordKeys.has(syncRecordKey("categories", category.id))}
+                  title={unresolvedSyncRecordKeys.has(syncRecordKey("categories", category.id))
+                    ? "此分類有未解同步衝突，暫時無法用於新交易。"
+                    : undefined}
                   onClick={() => {
                     setCategoryId(category.id);
                     onTutorialEvent?.({ type: "category-selected" });
@@ -356,6 +370,10 @@ export function HomeView({
                   key={account.id}
                   className={`account-chip ${resolvedAccountId === account.id ? "selected" : ""}`}
                   aria-pressed={resolvedAccountId === account.id}
+                  disabled={unresolvedSyncRecordKeys.has(syncRecordKey("accounts", account.id))}
+                  title={unresolvedSyncRecordKeys.has(syncRecordKey("accounts", account.id))
+                    ? "此帳戶有未解同步衝突，暫時無法用於新交易。"
+                    : undefined}
                   onClick={() => {
                     setAccountId(account.id);
                     onTutorialEvent?.({ type: "account-selected" });
@@ -416,7 +434,9 @@ export function HomeView({
               data-tutorial="create"
               disabled={Boolean(editing && unresolvedSyncRecordKeys.has(
                 syncRecordKey("transactions", editing.id),
-              ))}
+              )) || !resolvedCategoryId || !resolvedAccountId
+                || unresolvedSyncRecordKeys.has(syncRecordKey("categories", resolvedCategoryId))
+                || unresolvedSyncRecordKeys.has(syncRecordKey("accounts", resolvedAccountId))}
             >
               {editing
                 ? "儲存修改"
@@ -500,6 +520,14 @@ export function HomeView({
               const hasUnresolvedConflict = unresolvedSyncRecordKeys.has(
                 syncRecordKey("transactions", transaction.id),
               );
+              const hasParentConflict = unresolvedSyncRecordKeys.has(
+                syncRecordKey("accounts", transaction.accountId),
+              ) || unresolvedSyncRecordKeys.has(
+                syncRecordKey("categories", transaction.categoryId),
+              ) || Boolean(transaction.recurringRuleId && unresolvedSyncRecordKeys.has(
+                syncRecordKey("recurringRules", transaction.recurringRuleId),
+              ));
+              const mutationBlocked = hasUnresolvedConflict || hasParentConflict;
               const tutorialRow = isTutorialTransaction(transaction);
               const category = data.categories.find(
                 (item) => item.id === transaction.categoryId,
@@ -549,6 +577,9 @@ export function HomeView({
                         )}
                       </small>
                     )}
+                    {!hasUnresolvedConflict && hasParentConflict && (
+                      <small role="status">關聯帳戶、分類或週期規則有同步衝突：編輯與刪除已暫停。</small>
+                    )}
                   </div>
                   <b className={transaction.type}>
                     {transaction.type === "income" ? "+" : "−"}
@@ -558,9 +589,9 @@ export function HomeView({
                     <button
                       type="button"
                       aria-label={`編輯 ${category?.name ?? transaction.categoryName}`}
-                      disabled={hasUnresolvedConflict}
-                      title={hasUnresolvedConflict
-                        ? "此交易有未解同步衝突，請先選擇雲端版本。"
+                      disabled={mutationBlocked}
+                      title={mutationBlocked
+                        ? "此交易或其關聯資料有未解同步衝突，請先完成處理。"
                         : undefined}
                       onClick={() => beginEdit(transaction)}
                     >
@@ -569,9 +600,9 @@ export function HomeView({
                     <button
                       type="button"
                       aria-label={`刪除 ${category?.name ?? transaction.categoryName}`}
-                      disabled={hasUnresolvedConflict}
-                      title={hasUnresolvedConflict
-                        ? "此交易有未解同步衝突，請先選擇雲端版本。"
+                      disabled={mutationBlocked}
+                      title={mutationBlocked
+                        ? "此交易或其關聯資料有未解同步衝突，請先完成處理。"
                         : undefined}
                       onClick={() => {
                         if (

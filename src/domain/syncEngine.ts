@@ -319,9 +319,23 @@ export function acceptRemoteConflictRecord(
     syncRecordKey(candidate.entity, candidate.record.id),
     candidate,
   ]));
+  const preservedBeforeByKey = new Map<string, SyncEntityRecord>();
   const acceptedRemoteRecords = [...acceptedKeys].flatMap((acceptedKey) => {
     const accepted = remoteByKey.get(acceptedKey);
-    if (!accepted) return [];
+    if (!accepted) {
+      const relatedOperation = acceptedOperations.find((operation) => (
+        syncRecordKey(operation.entity, operation.recordId) === acceptedKey
+      ));
+      if (acceptedKey !== key && relatedOperation?.batchBeforeRecord) {
+        // No cloud row cannot acknowledge an independently queued create/edit
+        // that existed before the lifecycle batch absorbed this member.
+        preservedBeforeByKey.set(
+          acceptedKey,
+          structuredClone(relatedOperation.batchBeforeRecord),
+        );
+      }
+      return [];
+    }
     if (accepted.record.ownerId !== state.ownerId) {
       throw new Error('關聯雲端資料不屬於目前使用者，衝突未解除。');
     }
@@ -331,6 +345,22 @@ export function acceptRemoteConflictRecord(
       acceptedKey === key && compareSyncRecords(accepted.record, current) < 0
     )) {
       throw new Error('雲端版本比本機舊，為避免資料回滾，衝突未解除。');
+    }
+    const relatedOperation = acceptedOperations.find((operation) => (
+      syncRecordKey(operation.entity, operation.recordId) === acceptedKey
+    ));
+    const before = relatedOperation?.batchBeforeRecord;
+    if (acceptedKey !== key && before) {
+      const comparison = compareSyncRecords(accepted.record, before);
+      const sameClockExactPayload = comparison === 0
+        && differingSyncRecordFields(accepted.entity, accepted.record, before).length === 0;
+      if (comparison < 0 || (comparison === 0 && !sameClockExactPayload)) {
+        // A lifecycle batch may have absorbed an independently queued edit.
+        // Accepting the conflicted parent must not discard that earlier intent;
+        // restore it as a standalone operation and let normal sync reconcile it.
+        preservedBeforeByKey.set(acceptedKey, structuredClone(before));
+        return [];
+      }
     }
     return [accepted];
   });
@@ -349,36 +379,62 @@ export function acceptRemoteConflictRecord(
   for (const operation of acceptedOperations) {
     const operationKey = syncRecordKey(operation.entity, operation.recordId);
     if (acceptedRemoteKeys.has(operationKey)) continue;
-    let record = operation.record;
+    const preservedBefore = preservedBeforeByKey.get(operationKey);
+    let record = preservedBefore ?? operation.record;
     if (operation.entity === 'recurringRules') {
-      const rule = operation.record as FinanceData['recurringRules'][number];
+      const rule = record as FinanceData['recurringRules'][number];
       if (remoteRecord.entity === 'accounts' && rule.accountId === remoteRecord.record.id) {
         const account = remoteRecord.record as FinanceData['accounts'][number];
-        record = {
-          ...rule,
-          accountName: account.name,
-          ...(!account.isActive || account.deletedAt ? { isActive: false } : {}),
-        };
+        const mustPause = Boolean((!account.isActive || account.deletedAt) && rule.isActive);
+        const mustRefreshMirror = !preservedBefore && rule.accountName !== account.name;
+        if (mustPause || mustRefreshMirror) {
+          record = {
+            ...rule,
+            ...(mustRefreshMirror ? { accountName: account.name } : {}),
+            ...(mustPause ? { isActive: false } : {}),
+            version: rule.version + 1,
+            updatedAt: new Date().toISOString(),
+            lastOperationId: activeOperationId(`accept-cloud-parent:${crypto.randomUUID()}`),
+          };
+        }
       }
       if (remoteRecord.entity === 'categories' && rule.categoryId === remoteRecord.record.id) {
         const category = remoteRecord.record as FinanceData['categories'][number];
-        record = {
-          ...rule,
-          categoryName: category.name,
-          ...(!category.isActive || category.deletedAt ? { isActive: false } : {}),
-        };
+        const mustPause = Boolean((!category.isActive || category.deletedAt) && rule.isActive);
+        const mustRefreshMirror = !preservedBefore && rule.categoryName !== category.name;
+        if (mustPause || mustRefreshMirror) {
+          record = {
+            ...rule,
+            ...(mustRefreshMirror ? { categoryName: category.name } : {}),
+            ...(mustPause ? { isActive: false } : {}),
+            version: rule.version + 1,
+            updatedAt: new Date().toISOString(),
+            lastOperationId: activeOperationId(`accept-cloud-parent:${crypto.randomUUID()}`),
+          };
+        }
       }
     }
     data = replaceRecord(data, { entity: operation.entity, record } as RemoteRecord);
     outbox = outbox.map((candidate) => (
       candidate.entity === operation.entity && candidate.recordId === operation.recordId
-        ? { ...candidate, record, batchId: undefined }
+        ? {
+            ...candidate,
+            id: record.lastOperationId,
+            record,
+            attempts: preservedBefore ? 0 : candidate.attempts,
+            queuedAt: preservedBefore ? record.updatedAt : candidate.queuedAt,
+            batchId: undefined,
+            batchBeforeRecord: undefined,
+            lastError: preservedBefore
+              ? '已採用批次的雲端版本；批次前已排隊的獨立修改仍保留等待同步。'
+              : candidate.lastError,
+          }
         : candidate
     ));
   }
   validateFinanceData(data, 'accepted remote conflict record');
   assertLifecycleTransition(state.data, data);
-  const unresolvedSyncRecordKeys = state.unresolvedSyncRecordKeys.filter((candidate) => (
+  const unresolvedSyncRecordKeys = (state.unresolvedSyncRecordKeys ?? []).filter((candidate) => (
     !acceptedRemoteKeys.has(candidate)
   ));
   const remainingErrors = new Set(outbox.flatMap((operation) => (

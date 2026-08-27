@@ -459,6 +459,8 @@ export function RecurringPanel({
       : undefined;
     const hasUnresolvedConflict = editing
       ? unresolvedSyncRecordKeys.has(syncRecordKey("recurringRules", editing.id))
+        || unresolvedSyncRecordKeys.has(syncRecordKey("accounts", editing.accountId))
+        || unresolvedSyncRecordKeys.has(syncRecordKey("categories", editing.categoryId))
       : false;
     if (hasUnresolvedConflict) {
       setMessage("此週期規則有未解同步衝突；資料未變更，請先從同步狀態完成處理");
@@ -730,6 +732,10 @@ export function RecurringPanel({
               ).blocked;
               const conflictBlocked = unresolvedSyncRecordKeys.has(
                 syncRecordKey("recurringRules", rule.id),
+              ) || unresolvedSyncRecordKeys.has(
+                syncRecordKey("accounts", rule.accountId),
+              ) || unresolvedSyncRecordKeys.has(
+                syncRecordKey("categories", rule.categoryId),
               );
               return (
                 <article

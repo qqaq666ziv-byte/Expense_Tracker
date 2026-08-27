@@ -201,6 +201,12 @@ export function AssetsView({
   const [adjusting, setAdjusting] = useState<AssetAccount | null>(null);
   const [actualBalance, setActualBalance] = useState("");
   const [reason, setReason] = useState("盤點調整");
+  const accountConflictBlocked = editing
+    ? unresolvedSyncRecordKeys.has(syncRecordKey("accounts", editing.id))
+    : false;
+  const adjustmentConflictBlocked = adjusting
+    ? unresolvedSyncRecordKeys.has(syncRecordKey("accounts", adjusting.id))
+    : false;
   const accountTriggerRef = useRef<HTMLElement | null>(null);
   const adjustmentTriggerRef = useRef<HTMLElement | null>(null);
 
@@ -307,6 +313,16 @@ export function AssetsView({
   const submitAdjustment = (event: FormEvent) => {
     event.preventDefault();
     if (!adjusting) return;
+    const currentAccount = data.accounts.find((account) => account.id === adjusting.id);
+    if (
+      !currentAccount
+      || currentAccount.deletedAt
+      || !currentAccount.isActive
+      || unresolvedSyncRecordKeys.has(syncRecordKey("accounts", adjusting.id))
+    ) {
+      setMessage("此帳戶已更新、封存、刪除或有未解同步衝突；餘額未調整，請關閉後再試。");
+      return;
+    }
     const balance =
       financials.accountBalances.find((item) => item.accountId === adjusting.id)
         ?.balance ?? 0;
@@ -600,7 +616,14 @@ export function AssetsView({
                 <IconPicker value={icon} onChange={setIcon} />
               </details>
               {message && <p aria-live="polite" className="error-message">{message}</p>}
-              <button className="primary-button w-full" type="submit">
+              <button
+                className="primary-button w-full"
+                type="submit"
+                disabled={accountConflictBlocked}
+                title={accountConflictBlocked
+                  ? "此帳戶有未解同步衝突，暫時無法儲存編輯。"
+                  : undefined}
+              >
                 儲存帳戶
               </button>
             </form>
@@ -652,7 +675,14 @@ export function AssetsView({
                 />
               </label>
               {message && <p aria-live="polite" className="error-message">{message}</p>}
-              <button className="primary-button w-full" type="submit">
+              <button
+                className="primary-button w-full"
+                type="submit"
+                disabled={adjustmentConflictBlocked}
+                title={adjustmentConflictBlocked
+                  ? "此帳戶有未解同步衝突，暫時無法調整餘額。"
+                  : undefined}
+              >
                 確認調整
               </button>
             </form>

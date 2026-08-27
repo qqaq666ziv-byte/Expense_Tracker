@@ -1322,6 +1322,140 @@ describe('offline sync engine', () => {
     expect(accepted.lastSyncError).toBeUndefined();
   });
 
+  it('restores a pre-batch pending edit instead of discarding it when accepting a related cloud record', async () => {
+    const category: Category = {
+      id: 'category-pre-batch', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'category-create',
+      name: '餐飲', kind: 'expense', icon: { type: 'emoji', value: '🍚' },
+      isActive: true, sortOrder: 0,
+    };
+    const remoteAccount = account('account-pre-batch', 'user-a', 4, 'remote-account');
+    const localAccount = {
+      ...remoteAccount, name: '本機帳戶改名', version: 3,
+      lastOperationId: 'local-account-rename',
+    };
+    const remoteRule = {
+      id: 'rule-pre-batch', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'remote-rule',
+      name: '月租', type: 'expense' as const, amount: 10_000,
+      categoryId: category.id, categoryName: category.name,
+      accountId: remoteAccount.id, accountName: remoteAccount.name,
+      frequency: 'monthly' as const, startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    };
+    const preBatchRule = {
+      ...remoteRule, name: '月租（已校正）', amount: 12_000,
+      accountName: '離線編輯時的帳戶名稱', version: 2,
+      lastOperationId: 'offline-rule-edit',
+    };
+    const batchedRule = {
+      ...preBatchRule, accountName: localAccount.name, version: 3,
+      lastOperationId: 'rule-account-mirror',
+    };
+    const localState: PersistedFinanceState = {
+      schemaVersion: 3,
+      ownerId: 'user-a',
+      data: {
+        ...emptyData(), accounts: [localAccount], categories: [category], recurringRules: [batchedRule],
+      },
+      outbox: [{
+        ...operation(localAccount), batchId: 'rename-account-batch',
+        batchBeforeRecord: { ...remoteAccount, version: 2, lastOperationId: 'account-before-rename' },
+      }, {
+        id: batchedRule.lastOperationId,
+        entity: 'recurringRules',
+        recordId: batchedRule.id,
+        record: batchedRule,
+        attempts: 0,
+        queuedAt: batchedRule.updatedAt,
+        batchId: 'rename-account-batch',
+        batchBeforeRecord: preBatchRule,
+      }],
+      unresolvedSyncRecordKeys: [`accounts:${localAccount.id}`],
+    };
+
+    const accepted = acceptRemoteConflictRecord(
+      localState,
+      { entity: 'accounts', record: remoteAccount },
+      [
+        { entity: 'accounts', record: remoteAccount },
+        { entity: 'categories', record: category },
+        { entity: 'recurringRules', record: remoteRule },
+      ],
+    );
+
+    expect(accepted.data.accounts).toEqual([remoteAccount]);
+    expect(accepted.data.recurringRules).toEqual([preBatchRule]);
+    expect(accepted.outbox).toEqual([expect.objectContaining({
+      id: preBatchRule.lastOperationId,
+      entity: 'recurringRules',
+      recordId: preBatchRule.id,
+      record: preBatchRule,
+      batchId: undefined,
+      batchBeforeRecord: undefined,
+    })]);
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: remoteAccount },
+      { entity: 'categories', record: category },
+      { entity: 'recurringRules', record: remoteRule },
+    ]);
+    const synced = await syncFinanceState(accepted, 'user-a', remote, () => NOW);
+    expect(synced.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).find((entry) => (
+      entry.entity === 'recurringRules' && entry.record.id === preBatchRule.id
+    ))?.record).toEqual(preBatchRule);
+
+    const acceptedWithoutRemoteRule = acceptRemoteConflictRecord(
+      localState,
+      { entity: 'accounts', record: remoteAccount },
+      [
+        { entity: 'accounts', record: remoteAccount },
+        { entity: 'categories', record: category },
+      ],
+    );
+    expect(acceptedWithoutRemoteRule.data.recurringRules).toEqual([preBatchRule]);
+    expect(acceptedWithoutRemoteRule.outbox).toEqual([expect.objectContaining({
+      id: preBatchRule.lastOperationId,
+      record: preBatchRule,
+      batchId: undefined,
+      batchBeforeRecord: undefined,
+    })]);
+    const missingRemote = new InMemoryRemote([
+      { entity: 'accounts', record: remoteAccount },
+      { entity: 'categories', record: category },
+    ]);
+    const created = await syncFinanceState(acceptedWithoutRemoteRule, 'user-a', missingRemote, () => NOW);
+    expect(created.state.outbox).toEqual([]);
+    expect((await missingRemote.pull('user-a')).find((entry) => (
+      entry.entity === 'recurringRules' && entry.record.id === preBatchRule.id
+    ))?.record).toEqual(preBatchRule);
+
+    const archivedRemoteAccount = {
+      ...remoteAccount, version: 5, lastOperationId: 'remote-account-archive', isActive: false,
+    };
+    const acceptedArchivedParent = acceptRemoteConflictRecord(
+      localState,
+      { entity: 'accounts', record: archivedRemoteAccount },
+      [{ entity: 'accounts', record: archivedRemoteAccount }],
+    );
+    const safelyPaused = acceptedArchivedParent.data.recurringRules[0];
+    expect(safelyPaused).toEqual(expect.objectContaining({
+      ...preBatchRule,
+      isActive: false,
+      version: preBatchRule.version + 1,
+      updatedAt: expect.any(String),
+      lastOperationId: expect.stringContaining('accept-cloud-parent:'),
+    }));
+    expect(safelyPaused.lastOperationId).not.toBe(preBatchRule.lastOperationId);
+    expect(acceptedArchivedParent.outbox[0]).toEqual(expect.objectContaining({
+      id: safelyPaused.lastOperationId,
+      record: safelyPaused,
+      batchId: undefined,
+    }));
+  });
+
   it('retains the complete batch manifest when a conflict appears after the first member applies', async () => {
     const goal: SavingsGoal = {
       id: 'goal-race', ownerId: 'user-a', version: 1,
