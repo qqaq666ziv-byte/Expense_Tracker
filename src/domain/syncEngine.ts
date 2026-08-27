@@ -378,59 +378,77 @@ export function acceptRemoteConflictRecord(
   ));
   for (const operation of acceptedOperations) {
     const operationKey = syncRecordKey(operation.entity, operation.recordId);
-    if (acceptedRemoteKeys.has(operationKey)) continue;
+    const acceptedRelatedRecord = acceptedRemoteKeys.has(operationKey)
+      ? remoteByKey.get(operationKey)?.record
+      : undefined;
     const preservedBefore = preservedBeforeByKey.get(operationKey);
-    let record = preservedBefore ?? operation.record;
+    let record = preservedBefore ?? acceptedRelatedRecord ?? operation.record;
+    let requiresStandaloneOperation = !acceptedRelatedRecord;
     if (operation.entity === 'recurringRules') {
       const rule = record as FinanceData['recurringRules'][number];
       if (remoteRecord.entity === 'accounts' && rule.accountId === remoteRecord.record.id) {
         const account = remoteRecord.record as FinanceData['accounts'][number];
-        const mustPause = Boolean((!account.isActive || account.deletedAt) && rule.isActive);
-        const mustRefreshMirror = !preservedBefore && rule.accountName !== account.name;
+        const mustPause = Boolean(
+          !rule.deletedAt && (!account.isActive || account.deletedAt) && rule.isActive,
+        );
+        const mustRefreshMirror = Boolean(
+          !rule.deletedAt && !preservedBefore && rule.accountName !== account.name,
+        );
         if (mustPause || mustRefreshMirror) {
           record = {
             ...rule,
             ...(mustRefreshMirror ? { accountName: account.name } : {}),
             ...(mustPause ? { isActive: false } : {}),
-            version: rule.version + 1,
+            version: Math.max(rule.version, operation.record.version) + 1,
             updatedAt: new Date().toISOString(),
             lastOperationId: activeOperationId(`accept-cloud-parent:${crypto.randomUUID()}`),
           };
+          requiresStandaloneOperation = true;
         }
       }
       if (remoteRecord.entity === 'categories' && rule.categoryId === remoteRecord.record.id) {
         const category = remoteRecord.record as FinanceData['categories'][number];
-        const mustPause = Boolean((!category.isActive || category.deletedAt) && rule.isActive);
-        const mustRefreshMirror = !preservedBefore && rule.categoryName !== category.name;
+        const mustPause = Boolean(
+          !rule.deletedAt && (!category.isActive || category.deletedAt) && rule.isActive,
+        );
+        const mustRefreshMirror = Boolean(
+          !rule.deletedAt && !preservedBefore && rule.categoryName !== category.name,
+        );
         if (mustPause || mustRefreshMirror) {
           record = {
             ...rule,
             ...(mustRefreshMirror ? { categoryName: category.name } : {}),
             ...(mustPause ? { isActive: false } : {}),
-            version: rule.version + 1,
+            version: Math.max(rule.version, operation.record.version) + 1,
             updatedAt: new Date().toISOString(),
             lastOperationId: activeOperationId(`accept-cloud-parent:${crypto.randomUUID()}`),
           };
+          requiresStandaloneOperation = true;
         }
       }
     }
+    if (!requiresStandaloneOperation) continue;
     data = replaceRecord(data, { entity: operation.entity, record } as RemoteRecord);
-    outbox = outbox.map((candidate) => (
+    const pending = outbox.find((candidate) => (
       candidate.entity === operation.entity && candidate.recordId === operation.recordId
-        ? {
-            ...candidate,
-            id: record.lastOperationId,
-            record,
-            attempts: preservedBefore ? 0 : candidate.attempts,
-            queuedAt: preservedBefore ? record.updatedAt : candidate.queuedAt,
-            batchId: undefined,
-            batchBeforeRecord: undefined,
-            lastError: preservedBefore
-              ? '已採用批次的雲端版本；批次前已排隊的獨立修改仍保留等待同步。'
-              : candidate.lastError,
-          }
-        : candidate
-    ));
+    )) ?? operation;
+    outbox = [
+      ...outbox.filter((candidate) => (
+        candidate.entity !== operation.entity || candidate.recordId !== operation.recordId
+      )),
+      {
+        ...pending,
+        id: record.lastOperationId,
+        record,
+        attempts: preservedBefore || acceptedRelatedRecord ? 0 : pending.attempts,
+        queuedAt: preservedBefore || acceptedRelatedRecord ? record.updatedAt : pending.queuedAt,
+        batchId: undefined,
+        batchBeforeRecord: undefined,
+        lastError: preservedBefore
+          ? '已採用批次的雲端版本；批次前已排隊的獨立修改仍保留等待同步。'
+          : pending.lastError,
+      },
+    ];
   }
   validateFinanceData(data, 'accepted remote conflict record');
   assertLifecycleTransition(state.data, data);

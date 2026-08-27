@@ -1444,7 +1444,7 @@ describe('offline sync engine', () => {
     expect(safelyPaused).toEqual(expect.objectContaining({
       ...preBatchRule,
       isActive: false,
-      version: preBatchRule.version + 1,
+      version: batchedRule.version + 1,
       updatedAt: expect.any(String),
       lastOperationId: expect.stringContaining('accept-cloud-parent:'),
     }));
@@ -1454,6 +1454,55 @@ describe('offline sync engine', () => {
       record: safelyPaused,
       batchId: undefined,
     }));
+
+    const newerRemoteRule = {
+      ...remoteRule,
+      version: 4,
+      lastOperationId: 'newer-cloud-rule',
+    };
+    const acceptedArchivedParentAndNewerRule = acceptRemoteConflictRecord(
+      localState,
+      { entity: 'accounts', record: archivedRemoteAccount },
+      [
+        { entity: 'accounts', record: archivedRemoteAccount },
+        { entity: 'recurringRules', record: newerRemoteRule },
+      ],
+    );
+    const cloudRuleSafelyPaused = acceptedArchivedParentAndNewerRule.data.recurringRules[0];
+    expect(cloudRuleSafelyPaused).toEqual(expect.objectContaining({
+      ...newerRemoteRule,
+      isActive: false,
+      version: newerRemoteRule.version + 1,
+      updatedAt: expect.any(String),
+      lastOperationId: expect.stringContaining('accept-cloud-parent:'),
+    }));
+    expect(acceptedArchivedParentAndNewerRule.outbox).toEqual([
+      expect.objectContaining({
+        id: cloudRuleSafelyPaused.lastOperationId,
+        record: cloudRuleSafelyPaused,
+        batchId: undefined,
+      }),
+    ]);
+
+    const remoteRuleTombstone = {
+      ...newerRemoteRule,
+      version: 6,
+      lastOperationId: 'tombstone:remote-rule-delete',
+      accountName: '刪除當時的帳戶名稱',
+      isActive: false,
+      deletedAt: '2026-08-27T09:00:00.000Z',
+    };
+    const acceptedArchivedParentAndRuleTombstone = acceptRemoteConflictRecord(
+      localState,
+      { entity: 'accounts', record: archivedRemoteAccount },
+      [
+        { entity: 'accounts', record: archivedRemoteAccount },
+        { entity: 'recurringRules', record: remoteRuleTombstone },
+      ],
+    );
+    expect(acceptedArchivedParentAndRuleTombstone.data.recurringRules)
+      .toEqual([remoteRuleTombstone]);
+    expect(acceptedArchivedParentAndRuleTombstone.outbox).toEqual([]);
   });
 
   it('retains the complete batch manifest when a conflict appears after the first member applies', async () => {

@@ -6,6 +6,7 @@ import {
   buildEditedBudget,
   buildEditedSavingsGoal,
   PlanningView,
+  selectableBudgetCategories,
 } from './PlanningView';
 
 describe('PlanningView goal lifecycle', () => {
@@ -269,6 +270,20 @@ describe('PlanningView archived allocations', () => {
 });
 
 describe('PlanningView budget lifecycle', () => {
+  it('excludes batch-locked categories from new budget choices', () => {
+    const state = createInitialState('guest');
+    const expenseCategories = state.data.categories.filter((item) => item.kind === 'expense');
+    const locked = expenseCategories[0];
+
+    const selectable = selectableBudgetCategories(
+      state.data,
+      new Set([`categories:${locked.id}`]),
+    );
+
+    expect(selectable.some((category) => category.id === locked.id)).toBe(false);
+    expect(selectable.length).toBe(expenseCategories.length - 1);
+  });
+
   it('shows explicit edit actions and keeps archived budgets available for restore', () => {
     const state = createInitialState('guest');
     const category = state.data.categories.find((item) => item.kind === 'expense')!;

@@ -97,6 +97,18 @@ export interface BudgetEditDraft {
   categoryName?: string;
 }
 
+export function selectableBudgetCategories(
+  data: FinanceData,
+  mutationLockedRecordKeys: ReadonlySet<string>,
+) {
+  return sortByDisplayOrder(data.categories.filter((item) => (
+    item.kind === "expense"
+    && item.isActive
+    && !item.deletedAt
+    && !mutationLockedRecordKeys.has(syncRecordKey("categories", item.id))
+  )));
+}
+
 export function buildEditedBudget(
   opened: Budget,
   current: Budget | undefined,
@@ -654,11 +666,7 @@ export function BudgetPanel({
   const [editingBudgetSnapshot, setEditingBudgetSnapshot] = useState<Budget | null>(null);
   const editingBudgetId = editingBudgetSnapshot?.id ?? "";
   const [message, setMessage] = useState("");
-  const categories = sortByDisplayOrder(
-    data.categories.filter(
-      (item) => item.kind === "expense" && item.isActive && !item.deletedAt,
-    ),
-  );
+  const categories = selectableBudgetCategories(data, unresolvedSyncRecordKeys);
   const visibleBudgets = data.budgets.filter((item) => !item.deletedAt);
   const archivedBudgets = visibleBudgets.filter((item) => !item.isActive);
   const editingBudget = editingBudgetSnapshot
@@ -673,6 +681,10 @@ export function BudgetPanel({
   const resolvedCategoryId = categoryOptions.some((item) => item.id === categoryId)
     ? categoryId
     : (categoryOptions[0]?.id ?? "");
+  const selectedCategoryLocked = scope === "category" && Boolean(
+    resolvedCategoryId
+    && unresolvedSyncRecordKeys.has(syncRecordKey("categories", resolvedCategoryId)),
+  );
   const usages = useMemo(
     () => calculateBudgetUsage(data, reference),
     [data, reference],
@@ -709,6 +721,9 @@ export function BudgetPanel({
     event.preventDefault();
     const limit = parseRequiredNumberInput(amount);
     const category = categoryOptions.find((item) => item.id === resolvedCategoryId);
+    if (selectedCategoryLocked) return setMessage(
+      "此分類仍有待同步的生命週期操作；資料未變更，請完成同步後再設定預算",
+    );
     if (limit === null || limit <= 0 || (scope === "category" && !category))
       return setMessage(
         "請輸入大於 0、最多兩位小數且可安全精確處理的預算並選擇分類",
@@ -849,8 +864,18 @@ export function BudgetPanel({
                 onChange={(event) => setCategoryId(event.target.value)}
               >
                 {categoryOptions.map((category) => (
-                  <option key={category.id} value={category.id}>
-                    {category.name}{!category.isActive || category.deletedAt ? "（已封存）" : ""}
+                  <option
+                    key={category.id}
+                    value={category.id}
+                    disabled={unresolvedSyncRecordKeys.has(
+                      syncRecordKey("categories", category.id),
+                    )}
+                  >
+                    {category.name}{!category.isActive || category.deletedAt
+                      ? "（已封存）"
+                      : unresolvedSyncRecordKeys.has(syncRecordKey("categories", category.id))
+                        ? "（同步處理中）"
+                        : ""}
                   </option>
                 ))}
               </select>
@@ -867,7 +892,14 @@ export function BudgetPanel({
             />
           </label>
           <div className="flex gap-2 sm:col-span-2">
-            <button className="primary-button flex-1" type="submit">
+            <button
+              className="primary-button flex-1"
+              type="submit"
+              disabled={scope === "category" && (!resolvedCategoryId || selectedCategoryLocked)}
+              title={selectedCategoryLocked
+                ? "此分類仍在同步處理中，請完成同步後再設定預算。"
+                : undefined}
+            >
               {editingBudgetId ? <Pencil className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
               {editingBudgetId ? "儲存修改" : "建立預算"}
             </button>
