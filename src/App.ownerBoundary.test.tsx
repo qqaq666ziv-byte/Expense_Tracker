@@ -120,4 +120,37 @@ describe('App owner boundary', () => {
     expect(screen.getByRole('heading', { name: '設定與說明' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '繼續上次進度' })).not.toBeInTheDocument();
   });
+
+  it('does not treat ambiguous legacy tutorial progress as guest-owned after sign-out', async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      TUTORIAL_STORAGE_KEY,
+      JSON.stringify({
+        ...startTutorial('first-record'),
+        status: 'paused',
+        step: 'open-edit',
+        recordId: 'owner-a-legacy-tutorial-record',
+      }),
+    );
+    financeAppMock.current = financeAppFor('owner-a');
+    const view = render(
+      <ThemeProvider>
+        <App />
+      </ThemeProvider>,
+    );
+
+    await user.click(screen.getByRole('button', { name: /帳戶與同步/ }));
+    await user.click(screen.getByRole('button', { name: /設定與說明/ }));
+    expect(screen.queryByRole('button', { name: '繼續上次進度' })).not.toBeInTheDocument();
+
+    financeAppMock.current = { ...financeAppFor('guest'), user: null };
+    view.rerender(
+      <ThemeProvider>
+        <App />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByRole('heading', { name: '設定與說明' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '繼續上次進度' })).not.toBeInTheDocument();
+  });
 });

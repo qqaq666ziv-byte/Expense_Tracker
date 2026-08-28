@@ -77,9 +77,7 @@ const SettingsView = lazy(() =>
 type Tab = "record" | "insights" | "assets" | "planning";
 
 function tutorialStorageKey(ownerId: string): string {
-  return ownerId === "guest"
-    ? TUTORIAL_STORAGE_KEY
-    : `${TUTORIAL_STORAGE_KEY}:user:${ownerId}`;
+  return `${TUTORIAL_STORAGE_KEY}:${ownerId === "guest" ? "guest" : `user:${ownerId}`}`;
 }
 
 function initialTutorialProgress(ownerId: string): TutorialProgress | null {
