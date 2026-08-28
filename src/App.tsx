@@ -362,13 +362,17 @@ function OwnerScopedApp({
       current ? transitionTutorial(current, event) : current,
     );
 
-  const cleanupTutorialRecords = (): boolean =>
-    data.transactions
-      .filter((record) => !record.deletedAt && isTutorialTransaction(record))
-      .every((record) => app.softDelete("transactions", record));
+  const cleanupTutorialRecords = async (): Promise<boolean> => {
+    for (const record of data.transactions.filter(
+      (candidate) => !candidate.deletedAt && isTutorialTransaction(candidate),
+    )) {
+      if (!await app.softDelete("transactions", record)) return false;
+    }
+    return true;
+  };
 
-  const startTutorialChapter = (chapter: TutorialChapter) => {
-    if (!cleanupTutorialRecords()) {
+  const startTutorialChapter = async (chapter: TutorialChapter) => {
+    if (!await cleanupTutorialRecords()) {
       setAuthMessage("教學紀錄尚未安全清除，請稍後再重新開始教學。");
       return;
     }
@@ -378,8 +382,8 @@ function OwnerScopedApp({
   };
 
   const pauseTutorial = () => handleTutorialEvent({ type: "pause" });
-  const skipTutorial = () => {
-    if (!cleanupTutorialRecords()) {
+  const skipTutorial = async () => {
+    if (!await cleanupTutorialRecords()) {
       setAuthMessage("教學紀錄尚未安全清除，因此沒有結束教學。");
       return;
     }
@@ -997,7 +1001,7 @@ function OwnerScopedApp({
                 <button
                   type="button"
                   className="secondary-button"
-                  onClick={() => startTutorialChapter("full")}
+                  onClick={() => { void startTutorialChapter("full"); }}
                 >
                   從頭跑完整教學
                 </button>
@@ -1016,7 +1020,7 @@ function OwnerScopedApp({
                   <button
                     type="button"
                     key={chapter}
-                    onClick={() => startTutorialChapter(chapter)}
+                    onClick={() => { void startTutorialChapter(chapter); }}
                   >
                     {label}
                   </button>

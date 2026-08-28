@@ -33,22 +33,31 @@ import {
   applyAccountArchiveMutation,
   applyGoalAllocationReleaseMutation,
   applyCategoryLifecycleMutation,
-  advanceFinanceStateRef,
-  canAutoSaveFinanceState,
+  assertFreshLocalRecordMutation,
+  assertLatestMutationDependencies,
+  assertMutationBaseUnchanged,
+  assertMutationSetUnchanged,
+  assertRestoreBaseUnchanged,
   changedRecordMeta,
+  createInitialState,
   guestSnapshotFingerprint,
   hasUserContent,
   loadFinanceStateWithRecovery,
-  persistGuestImportState,
+  type LoadedFinanceState,
   planGuestImport,
   type LocalStateRecovery,
   putRecord,
   putCategoryWithDependents,
   putAccountWithDependents,
   remapOwner,
-  saveFinanceState,
   tombstoneRecordMeta,
 } from './state';
+import {
+  durabilityRecovery,
+  getBrowserFinancePersistence,
+  type DurableCommitResult,
+  type FinancePersistence,
+} from './localDurability';
 import { assertCategoryUpsert, type CategoryAction } from '../domain/lifecycle';
 import {
   assertTransferCollectionMutationAllowed,
@@ -79,13 +88,13 @@ export interface FinanceAppController {
   importGuestData(): void;
   importLegacyCandidate(): void;
   keepCloudData(): void;
-  setData(data: FinanceData): void;
-  put<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
-  categoryLifecycle(record: Category, action: CategoryAction): boolean;
-  archiveAccount(record: AssetAccount): boolean;
-  releaseGoalAllocations(goal: SavingsGoal): boolean;
-  softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
-  confirmTransferAccounts(record: Transfer): boolean;
+  setData(data: FinanceData): Promise<void>;
+  put<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): Promise<boolean>;
+  categoryLifecycle(record: Category, action: CategoryAction): Promise<boolean>;
+  archiveAccount(record: AssetAccount): Promise<boolean>;
+  releaseGoalAllocations(goal: SavingsGoal): Promise<boolean>;
+  softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): Promise<boolean>;
+  confirmTransferAccounts(record: Transfer): Promise<boolean>;
   acceptRemoteConflict(entity: FinanceEntityName, recordId: string): Promise<boolean>;
   syncNow(): Promise<void>;
   signIn(): Promise<void>;
@@ -97,6 +106,21 @@ export type LegacyBootstrapDecision = 'import-candidate' | 'keep-cloud';
 export interface OwnerActionContext {
   ownerId: string;
   generation: number;
+}
+
+/** Ignore every outcome from a persistence request whose owner has switched. */
+export async function commitOwnerAttemptUnlessSwitched(
+  financePersistence: FinancePersistence,
+  expected: OwnerActionContext,
+  attemptId: string,
+  update: (current: PersistedFinanceState) => PersistedFinanceState,
+  currentContext: () => OwnerActionContext,
+): Promise<DurableCommitResult | undefined> {
+  const result = await financePersistence.commit(expected.ownerId, attemptId, update);
+  const current = currentContext();
+  return current.ownerId === expected.ownerId && current.generation === expected.generation
+    ? result
+    : undefined;
 }
 
 /** Clear every recovery-only UI signal after the replacement snapshot is durably persisted. */
@@ -397,7 +421,9 @@ function localDateString(date = new Date()): string {
   return `${year}-${month}-${day}`;
 }
 
-export function useFinanceApp(): FinanceAppController {
+export function useFinanceApp(
+  financePersistence: FinancePersistence = getBrowserFinancePersistence(),
+): FinanceAppController {
   const [initialLoad] = useState(() => loadFinanceStateWithRecovery('guest'));
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(supabaseConfigured);
@@ -411,11 +437,16 @@ export function useFinanceApp(): FinanceAppController {
   const [legacyBootstrapNotice, setLegacyBootstrapNotice] = useState<string>();
   const [safetyNotice, setSafetyNotice] = useState<string>();
   const [calendarDay, setCalendarDay] = useState(() => localDateString());
+  const [durabilityLoading, setDurabilityLoading] = useState(true);
+  const [guestLedger, setGuestLedger] = useState<LoadedFinanceState>(initialLoad);
   const stateRef = useRef(state);
   const activeOwnerRef = useRef(state.ownerId);
   const storageRecoveryRef = useRef<LocalStateRecovery | undefined>(initialLoad.recovery);
   const ownerGenerationRef = useRef(0);
   const syncTokenRef = useRef<{ generation: number; ownerId: string; id: symbol } | null>(null);
+  const durableOwnerRef = useRef<string>();
+  const durabilityBlockedRef = useRef<string>();
+  const financialWritePendingRef = useRef(false);
   const renderedOwnerId = state.ownerId;
   const renderedOwnerGeneration = ownerGenerationRef.current;
 
@@ -428,28 +459,129 @@ export function useFinanceApp(): FinanceAppController {
     );
   }, [renderedOwnerGeneration, renderedOwnerId]);
 
-  const commitState = useCallback((update: (current: PersistedFinanceState) => PersistedFinanceState) => {
-    const next = advanceFinanceStateRef(stateRef, update);
-    setState(next);
-  }, []);
+  const loadDurableOwner = useCallback(async (ownerId: string, generation: number) => {
+    try {
+      const loaded = await financePersistence.load(ownerId);
+      if (activeOwnerRef.current !== ownerId || ownerGenerationRef.current !== generation) return;
+      durableOwnerRef.current = loaded.recovery ? undefined : ownerId;
+      durabilityBlockedRef.current = loaded.recovery?.message;
+      storageRecoveryRef.current = loaded.recovery;
+      stateRef.current = loaded.state;
+      setState(loaded.state);
+      if (ownerId === 'guest') setGuestLedger(loaded);
+      setStorageRecovery(loaded.recovery);
+      setStorageError(loaded.recovery?.message);
+    } catch (error) {
+      if (activeOwnerRef.current !== ownerId || ownerGenerationRef.current !== generation) return;
+      const recovery = durabilityRecovery(ownerId, error);
+      durableOwnerRef.current = undefined;
+      durabilityBlockedRef.current = recovery.message;
+      storageRecoveryRef.current = recovery;
+      setStorageRecovery(recovery);
+      setStorageError(recovery.message);
+      setSafetyNotice('本機 durable storage 無法使用；為避免遺失帳務，本次工作階段已停止財務寫入。');
+    } finally {
+      if (activeOwnerRef.current === ownerId && ownerGenerationRef.current === generation) {
+        setDurabilityLoading(false);
+      }
+    }
+  }, [financePersistence]);
+
+  const commitState = useCallback(async (
+    attemptId: string,
+    update: (current: PersistedFinanceState) => PersistedFinanceState,
+  ): Promise<PersistedFinanceState | undefined> => {
+    const ownerId = activeOwnerRef.current;
+    const generation = ownerGenerationRef.current;
+    if (durableOwnerRef.current !== ownerId || durabilityBlockedRef.current) {
+      const message = durabilityBlockedRef.current
+        ?? '本機 durable storage 尚未完成載入；本次財務寫入未執行。';
+      setStorageError(message);
+      setSafetyNotice(message);
+      return undefined;
+    }
+    const result = await commitOwnerAttemptUnlessSwitched(
+      financePersistence,
+      { ownerId, generation },
+      attemptId,
+      update,
+      () => ({
+        ownerId: activeOwnerRef.current,
+        generation: ownerGenerationRef.current,
+      }),
+    );
+    if (!result) return undefined;
+    if (result.ok === false) {
+      if (result.lockWrites) {
+        durabilityBlockedRef.current = result.message;
+        setStorageError(result.message);
+      }
+      setSafetyNotice(`資料未儲存：${result.message}`);
+      return undefined;
+    }
+    stateRef.current = result.state;
+    setState(result.state);
+    setStorageError(undefined);
+    return result.state;
+  }, [financePersistence]);
+
+  const commitFinancialState = useCallback(async (
+    attemptId: string,
+    update: (current: PersistedFinanceState) => PersistedFinanceState,
+  ): Promise<boolean> => {
+    if (financialWritePendingRef.current) {
+      setSafetyNotice('上一筆財務資料仍在等待本機 durable storage；本次重複操作未執行。');
+      return false;
+    }
+    financialWritePendingRef.current = true;
+    try {
+      return (await commitState(attemptId, update)) !== undefined;
+    } finally {
+      financialWritePendingRef.current = false;
+    }
+  }, [commitState]);
 
   const activateOwner = useCallback((nextOwnerId: string) => {
     if (activeOwnerRef.current === nextOwnerId && stateRef.current.ownerId === nextOwnerId) return;
     ownerGenerationRef.current += 1;
     activeOwnerRef.current = nextOwnerId;
-    const loaded = loadFinanceStateWithRecovery(nextOwnerId);
-    storageRecoveryRef.current = loaded.recovery;
-    stateRef.current = loaded.state;
-    setState(loaded.state);
-    setStorageRecovery(loaded.recovery);
-    setStorageError(loaded.recovery?.message);
+    const generation = ownerGenerationRef.current;
+    const provisional = createInitialState(nextOwnerId);
+    syncTokenRef.current = null;
+    durableOwnerRef.current = undefined;
+    durabilityBlockedRef.current = undefined;
+    storageRecoveryRef.current = undefined;
+    stateRef.current = provisional;
+    setState(provisional);
+    setStorageRecovery(undefined);
+    setStorageError(undefined);
+    setDurabilityLoading(true);
     setSyncReport(null);
     setSyncBusy(false);
     setGuestPromptDismissed(false);
     setGuestImportNotice(undefined);
     setLegacyBootstrapNotice(undefined);
     setSafetyNotice(undefined);
-  }, []);
+    void loadDurableOwner(nextOwnerId, generation);
+  }, [loadDurableOwner]);
+
+  useEffect(() => {
+    void loadDurableOwner(activeOwnerRef.current, ownerGenerationRef.current);
+  }, [loadDurableOwner]);
+
+  useEffect(() => {
+    if (state.ownerId === 'guest') {
+      setGuestLedger({ state, ...(storageRecovery ? { recovery: storageRecovery } : {}) });
+      return;
+    }
+    let active = true;
+    void financePersistence.load('guest').then((loaded) => {
+      if (active) setGuestLedger(loaded);
+    }).catch((error) => {
+      if (active) setStorageError(`無法讀取訪客 durable ledger：${error instanceof Error ? error.message : String(error)}`);
+    });
+    return () => { active = false; };
+  }, [financePersistence, state, storageRecovery]);
 
   useEffect(() => {
     const refreshDay = () => setCalendarDay(localDateString());
@@ -487,22 +619,6 @@ export function useFinanceApp(): FinanceAppController {
     };
   }, [activateOwner]);
 
-  useEffect(() => {
-    if (!canAutoSaveFinanceState(state, activeOwnerRef.current, storageRecovery)) {
-      if (state.ownerId !== activeOwnerRef.current) return;
-      if (storageRecovery) {
-        setStorageError(`${storageRecovery.message}。原始內容仍保留，修復前已停止自動覆寫。`);
-      }
-      return;
-    }
-    try {
-      saveFinanceState(state);
-      setStorageError(undefined);
-    } catch (error) {
-      setStorageError(error instanceof Error ? error.message : String(error));
-    }
-  }, [state, storageRecovery]);
-
   const syncNow = useCallback(async () => {
     if (!supabase) return;
     const started = stateRef.current;
@@ -527,7 +643,7 @@ export function useFinanceApp(): FinanceAppController {
       );
       if (!result) return;
       if (ownerGenerationRef.current !== generation || activeOwnerRef.current !== ownerId) return;
-      commitState((current) => {
+      const committed = await commitState(`sync:${crypto.randomUUID()}`, (current) => {
         const merged = applySyncCompletion(started, current, result.state, ownerId);
         // A durable legacy decision made while this sync was in flight wins
         // over bootstrap metadata captured by the older response.
@@ -540,6 +656,7 @@ export function useFinanceApp(): FinanceAppController {
         }
         return merged;
       });
+      if (!committed) return;
       setSyncReport(result.report);
     } finally {
       if (syncTokenRef.current === token) {
@@ -550,14 +667,14 @@ export function useFinanceApp(): FinanceAppController {
   }, [commitState]);
 
   useEffect(() => {
-    if (state.ownerId === 'guest' || authLoading) return;
+    if (state.ownerId === 'guest' || authLoading || durabilityLoading) return;
     void syncNow();
     const onOnline = () => { void syncNow(); };
     window.addEventListener('online', onOnline);
     return () => window.removeEventListener('online', onOnline);
     // A first pull is required after every owner switch. Retries thereafter use the online/manual triggers.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.ownerId, authLoading]);
+  }, [state.ownerId, authLoading, durabilityLoading]);
 
   const outboxKey = state.outbox.map((operation) => operation.id).join('|');
   useEffect(() => {
@@ -568,10 +685,10 @@ export function useFinanceApp(): FinanceAppController {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.ownerId, outboxKey]);
 
-  const put = useCallback(<E extends FinanceEntityName>(
+  const put = useCallback(async <E extends FinanceEntityName>(
     entity: E,
     record: FinanceData[E][number],
-  ) => {
+  ): Promise<boolean> => {
     try {
       assertRenderedOwnerContext();
     } catch (error) {
@@ -600,23 +717,30 @@ export function useFinanceApp(): FinanceAppController {
       if (entity === 'categories') {
         assertCategoryUpsert(stateRef.current.data, record as Category);
       }
-      commitState((current) => applyFinanceMutationUnlessRecovering(
-        current,
-        storageRecoveryRef.current,
-        (recoverable) => entity === 'categories'
-          ? putCategoryWithDependents(recoverable, record as Category)
+      return await commitFinancialState(record.lastOperationId, (current) => {
+        assertTransferMutationAllowed(entity, TRANSFER_MUTATIONS_ENABLED);
+        assertSyncRecordMutationsAllowed(
+          current,
+          syncMutationTargets(current, entity, record),
+        );
+        assertFreshLocalRecordMutation(current, entity, record);
+        assertLatestMutationDependencies(current, entity, record);
+        if (entity === 'categories') {
+          assertCategoryUpsert(current.data, record as Category);
+        }
+        return entity === 'categories'
+          ? putCategoryWithDependents(current, record as Category)
           : entity === 'accounts'
-            ? putAccountWithDependents(recoverable, record as AssetAccount)
-            : putRecord(recoverable, entity, record),
-      ));
-      return true;
+            ? putAccountWithDependents(current, record as AssetAccount)
+            : putRecord(current, entity, record);
+      });
     } catch (error) {
       setSafetyNotice(`資料未儲存：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-  }, [assertRenderedOwnerContext, commitState]);
+  }, [assertRenderedOwnerContext, commitFinancialState]);
 
-  const confirmTransferAccounts = useCallback((record: Transfer): boolean => {
+  const confirmTransferAccounts = useCallback(async (record: Transfer): Promise<boolean> => {
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
@@ -627,16 +751,20 @@ export function useFinanceApp(): FinanceAppController {
       if (storageRecoveryRef.current) {
         throw new Error('本機快照仍在復原保護中；無法重新確認轉帳帳戶。');
       }
-      commitState((current) => confirmTransferDependencyConflict(current, record));
+      const committed = await commitFinancialState(
+        record.lastOperationId,
+        (current) => confirmTransferDependencyConflict(current, record),
+      );
+      if (!committed) return false;
       setSafetyNotice(undefined);
       return true;
     } catch (error) {
       setSafetyNotice(`轉帳帳戶未重新確認：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-  }, [assertRenderedOwnerContext, commitState]);
+  }, [assertRenderedOwnerContext, commitFinancialState]);
 
-  const categoryLifecycle = useCallback((record: Category, action: CategoryAction) => {
+  const categoryLifecycle = useCallback(async (record: Category, action: CategoryAction) => {
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
@@ -657,16 +785,48 @@ export function useFinanceApp(): FinanceAppController {
             .map((rule) => ({ entity: 'recurringRules' as const, recordId: rule.id }))
           : []),
       ];
+      const expectedRules = action === 'archive'
+        ? stateRef.current.data.recurringRules.filter(
+          (rule) => !rule.deletedAt && rule.isActive && rule.categoryId === record.id,
+        ).map((rule) => structuredClone(rule))
+        : [];
       assertSyncRecordMutationsAllowed(stateRef.current, targets);
-      commitState((current) => applyCategoryLifecycleMutation(current, record.id, action));
-      return true;
+      return await commitFinancialState(
+        `category-lifecycle:${action}:${crypto.randomUUID()}`,
+        (current) => {
+          assertMutationBaseUnchanged(
+            record,
+            current.data.categories.find((candidate) => candidate.id === record.id),
+            '分類',
+          );
+          const latestTargets = [
+            { entity: 'categories' as const, recordId: record.id },
+            ...(action === 'archive'
+              ? current.data.recurringRules
+                .filter((rule) => !rule.deletedAt && rule.isActive && rule.categoryId === record.id)
+                .map((rule) => ({ entity: 'recurringRules' as const, recordId: rule.id }))
+              : []),
+          ];
+          if (action === 'archive') {
+            assertMutationSetUnchanged(
+              expectedRules,
+              current.data.recurringRules.filter(
+                (rule) => !rule.deletedAt && rule.isActive && rule.categoryId === record.id,
+              ),
+              '分類所屬週期規則',
+            );
+          }
+          assertSyncRecordMutationsAllowed(current, latestTargets);
+          return applyCategoryLifecycleMutation(current, record.id, action);
+        },
+      );
     } catch (error) {
       setSafetyNotice(error instanceof Error ? error.message : String(error));
       return false;
     }
-  }, [assertRenderedOwnerContext, commitState]);
+  }, [assertRenderedOwnerContext, commitFinancialState]);
 
-  const archiveAccount = useCallback((record: AssetAccount) => {
+  const archiveAccount = useCallback(async (record: AssetAccount) => {
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
@@ -683,19 +843,42 @@ export function useFinanceApp(): FinanceAppController {
           .filter((rule) => !rule.deletedAt && rule.isActive && rule.accountId === record.id)
           .map((rule) => ({ entity: 'recurringRules' as const, recordId: rule.id })),
       ];
+      const expectedRules = current.data.recurringRules.filter(
+        (rule) => !rule.deletedAt && rule.isActive && rule.accountId === record.id,
+      ).map((rule) => structuredClone(rule));
       assertSyncRecordMutationsAllowed(current, targets);
-      commitState((latest) => {
-        assertSyncRecordMutationsAllowed(latest, targets);
-        return applyAccountArchiveMutation(latest, record.id);
-      });
-      return true;
+      return await commitFinancialState(
+        `archive-account:${crypto.randomUUID()}`,
+        (latest) => {
+          assertMutationBaseUnchanged(
+            record,
+            latest.data.accounts.find((candidate) => candidate.id === record.id),
+            '帳戶',
+          );
+          assertMutationSetUnchanged(
+            expectedRules,
+            latest.data.recurringRules.filter(
+              (rule) => !rule.deletedAt && rule.isActive && rule.accountId === record.id,
+            ),
+            '帳戶所屬週期規則',
+          );
+          const latestTargets = [
+            { entity: 'accounts' as const, recordId: record.id },
+            ...latest.data.recurringRules
+              .filter((rule) => !rule.deletedAt && rule.isActive && rule.accountId === record.id)
+              .map((rule) => ({ entity: 'recurringRules' as const, recordId: rule.id })),
+          ];
+          assertSyncRecordMutationsAllowed(latest, latestTargets);
+          return applyAccountArchiveMutation(latest, record.id);
+        },
+      );
     } catch (error) {
       setSafetyNotice(`帳戶未封存：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-  }, [assertRenderedOwnerContext, commitState]);
+  }, [assertRenderedOwnerContext, commitFinancialState]);
 
-  const releaseGoalAllocationRecords = useCallback((goal: SavingsGoal) => {
+  const releaseGoalAllocationRecords = useCallback(async (goal: SavingsGoal) => {
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
@@ -712,22 +895,45 @@ export function useFinanceApp(): FinanceAppController {
           .filter((allocation) => !allocation.deletedAt && allocation.goalId === goal.id)
           .map((allocation) => ({ entity: 'allocations' as const, recordId: allocation.id })),
       ];
+      const expectedAllocations = current.data.allocations.filter(
+        (allocation) => !allocation.deletedAt && allocation.goalId === goal.id,
+      ).map((allocation) => structuredClone(allocation));
       assertSyncRecordMutationsAllowed(current, targets);
-      commitState((latest) => {
-        assertSyncRecordMutationsAllowed(latest, targets);
-        return applyGoalAllocationReleaseMutation(latest, goal.id);
-      });
-      return true;
+      return await commitFinancialState(
+        `release-goal:${crypto.randomUUID()}`,
+        (latest) => {
+          assertMutationBaseUnchanged(
+            goal,
+            latest.data.goals.find((candidate) => candidate.id === goal.id),
+            '儲蓄目標',
+          );
+          assertMutationSetUnchanged(
+            expectedAllocations,
+            latest.data.allocations.filter(
+              (allocation) => !allocation.deletedAt && allocation.goalId === goal.id,
+            ),
+            '目標配置',
+          );
+          const latestTargets = [
+            { entity: 'goals' as const, recordId: goal.id },
+            ...latest.data.allocations
+              .filter((allocation) => !allocation.deletedAt && allocation.goalId === goal.id)
+              .map((allocation) => ({ entity: 'allocations' as const, recordId: allocation.id })),
+          ];
+          assertSyncRecordMutationsAllowed(latest, latestTargets);
+          return applyGoalAllocationReleaseMutation(latest, goal.id);
+        },
+      );
     } catch (error) {
       setSafetyNotice(`目標配置未釋放：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-  }, [assertRenderedOwnerContext, commitState]);
+  }, [assertRenderedOwnerContext, commitFinancialState]);
 
-  const softDelete = useCallback(<E extends FinanceEntityName>(
+  const softDelete = useCallback(async <E extends FinanceEntityName>(
     entity: E,
     record: FinanceData[E][number],
-  ) => {
+  ): Promise<boolean> => {
     try {
       assertRenderedOwnerContext();
     } catch (error) {
@@ -753,35 +959,37 @@ export function useFinanceApp(): FinanceAppController {
         stateRef.current,
         syncMutationTargets(stateRef.current, entity, record),
       );
-      commitState((current) => applyFinanceMutationUnlessRecovering(
-        current,
-        storageRecoveryRef.current,
-        (recoverable) => {
-          const currentRecord = (recoverable.data[entity] as FinanceData[E][number][])
+      const attemptId = `soft-delete:${crypto.randomUUID()}`;
+      return await commitFinancialState(attemptId, (current) => {
+        assertSyncRecordMutationsAllowed(
+          current,
+          syncMutationTargets(current, entity, record),
+        );
+        const currentRecord = (current.data[entity] as FinanceData[E][number][])
             .find((candidate) => candidate.id === record.id);
-          if (!currentRecord || currentRecord.deletedAt) {
-            throw new Error('找不到可刪除的最新資料，本次刪除未執行。');
-          }
-          assertSyncRecordMutationsAllowed(
-            recoverable,
-            syncMutationTargets(recoverable, entity, currentRecord),
-          );
-          const deleted = {
-            ...currentRecord,
-            ...tombstoneRecordMeta(currentRecord as SyncRecord),
-            ...('isActive' in currentRecord ? { isActive: false } : {}),
-          } as FinanceData[E][number];
-          return putRecord(recoverable, entity, deleted);
-        },
-      ));
-      return true;
+        if (!currentRecord || currentRecord.deletedAt) {
+          throw new Error('找不到可刪除的最新資料，本次刪除未執行。');
+        }
+        assertMutationBaseUnchanged(record, currentRecord, '待刪除資料');
+        assertSyncRecordMutationsAllowed(
+          current,
+          syncMutationTargets(current, entity, currentRecord),
+        );
+        const deleted = {
+          ...currentRecord,
+          ...tombstoneRecordMeta(currentRecord as SyncRecord, new Date(), () => attemptId),
+          ...('isActive' in currentRecord ? { isActive: false } : {}),
+        } as FinanceData[E][number];
+        return putRecord(current, entity, deleted);
+      });
     } catch (error) {
       setSafetyNotice(`資料未刪除：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-  }, [assertRenderedOwnerContext, commitState]);
+  }, [assertRenderedOwnerContext, commitFinancialState]);
 
-  const setData = useCallback((data: FinanceData) => {
+  const setData = useCallback(async (data: FinanceData): Promise<void> => {
+    const restorePreviewBase = structuredClone(stateRef.current);
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
@@ -801,19 +1009,56 @@ export function useFinanceApp(): FinanceAppController {
     if (stateRef.current.initialBootstrap) {
       setSafetyNotice('正在先讀取雲端帳本；完成前本次一般備份還原未執行。');
     }
-    const restored = restoreFinanceStateUnlessLegacyBootstrap(
-      stateRef.current,
-      data,
-      saveFinanceState,
-      () => clearSuccessfulRecoveryUiState(
+    const attemptId = `restore:${crypto.randomUUID()}`;
+    const recovery = storageRecoveryRef.current;
+    if (recovery) {
+      const recoveryOwnerId = activeOwnerRef.current;
+      const recoveryGeneration = ownerGenerationRef.current;
+      const restored = restoreFinanceStateUnlessLegacyBootstrap(
+        stateRef.current,
+        data,
+        () => undefined,
+        () => undefined,
+        true,
+      );
+      const result = await financePersistence.recover(
+        recoveryOwnerId,
+        attemptId,
+        recovery.raw,
+        restored,
+      );
+      if (activeOwnerRef.current !== recoveryOwnerId
+        || ownerGenerationRef.current !== recoveryGeneration) {
+        throw new Error('帳戶已切換；復原結果未套用到目前畫面。');
+      }
+      if (result.ok === false) {
+        if (result.lockWrites) durabilityBlockedRef.current = result.message;
+        setStorageError(result.message);
+        throw new Error(result.message);
+      }
+      durableOwnerRef.current = result.state.ownerId;
+      durabilityBlockedRef.current = undefined;
+      stateRef.current = result.state;
+      setState(result.state);
+      setStorageError(undefined);
+      clearSuccessfulRecoveryUiState(
         storageRecoveryRef,
         setStorageRecovery,
         setSafetyNotice,
-      ),
-      storageRecoveryRef.current !== undefined,
-    );
-    commitState(() => restored);
-  }, [assertRenderedOwnerContext, commitState]);
+      );
+      return;
+    }
+    const applied = await commitFinancialState(attemptId, (current) => {
+      assertRestoreBaseUnchanged(restorePreviewBase, current);
+      return restoreFinanceStateUnlessLegacyBootstrap(
+        current,
+        data,
+        () => undefined,
+        () => undefined,
+      );
+    });
+    if (!applied) throw new Error('備份還原未能寫入本機 durable storage。');
+  }, [assertRenderedOwnerContext, commitFinancialState, financePersistence]);
 
   const acceptRemoteConflict = useCallback(async (
     entity: FinanceEntityName,
@@ -870,11 +1115,12 @@ export function useFinanceApp(): FinanceAppController {
       if (ownerGenerationRef.current !== generation || activeOwnerRef.current !== startedOwnerId) {
         throw new Error('帳戶已切換，衝突未解除。');
       }
-      commitState((current) => acceptRemoteConflictRecord(
+      const committed = await commitState(`accept-remote:${crypto.randomUUID()}`, (current) => acceptRemoteConflictRecord(
         current,
         remoteRecord,
         pull.records,
       ));
+      if (!committed) return false;
       setSafetyNotice(undefined);
       setSyncReport(null);
       return true;
@@ -891,22 +1137,23 @@ export function useFinanceApp(): FinanceAppController {
 
   useEffect(() => {
     if (storageRecovery
+      || durabilityLoading
       || syncBusy
       || syncTokenRef.current !== null
       || state.legacyBootstrap?.status === 'pending'
       || state.initialBootstrap) return;
-    commitState((current) => {
+    void commitState(`recurrence:${state.ownerId}:${calendarDay}:${recurrenceCursorKey}`, (current) => {
       if (syncTokenRef.current !== null) return current;
       return materializeRecurringTransactionsUnlessSyncing(
         current,
         calendarDay,
-        storageRecoveryRef.current,
+        storageRecovery,
         () => syncTokenRef.current !== null,
       );
     });
-  }, [state.ownerId, state.legacyBootstrap?.status, state.initialBootstrap?.status, recurrenceCursorKey, calendarDay, commitState, storageRecovery, syncBusy]);
+  }, [state.ownerId, state.legacyBootstrap?.status, state.initialBootstrap?.status, recurrenceCursorKey, calendarDay, commitState, durabilityLoading, storageRecovery, syncBusy]);
 
-  const guestLoad = useMemo(() => loadFinanceStateWithRecovery('guest'), [state.ownerId, state.data.transactions.length]);
+  const guestLoad = guestLedger;
   const guestFingerprint = guestSnapshotFingerprint(guestLoad.state.data);
   const guestDecisionKey = state.ownerId === 'guest'
     ? undefined
@@ -934,7 +1181,7 @@ export function useFinanceApp(): FinanceAppController {
     }
   }, []);
 
-  const importGuestData = useCallback(() => {
+  const importGuestData = useCallback(async () => {
     try {
       assertRenderedOwnerContext();
     } catch (error) {
@@ -959,12 +1206,25 @@ export function useFinanceApp(): FinanceAppController {
       setGuestImportNotice('目前帳號的本機快照仍在復原保護中；為避免覆寫可救援原始資料，請先完成備份還原或明確重設，再匯入訪客資料。');
       return;
     }
-    const loadedGuest = loadFinanceStateWithRecovery('guest');
+    const importOwnerId = activeOwnerRef.current;
+    const importGeneration = ownerGenerationRef.current;
+    let loadedGuest: LoadedFinanceState;
+    try {
+      loadedGuest = await financePersistence.load('guest');
+    } catch (error) {
+      setStorageError(`訪客 durable ledger 無法讀取：${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (activeOwnerRef.current !== importOwnerId
+      || ownerGenerationRef.current !== importGeneration) {
+      setGuestImportNotice('帳戶已切換；本次訪客匯入未執行。');
+      return;
+    }
     if (loadedGuest.recovery) {
       setStorageError('訪客資料快照無法驗證，因此未匯入；原始內容仍保持不變。');
       return;
     }
-    const imported = remapOwner(loadedGuest.state.data, stateRef.current.ownerId);
+    const imported = remapOwner(loadedGuest.state.data, importOwnerId);
     if (!TRANSFER_MUTATIONS_ENABLED && imported.transfers.length > 0) {
       setGuestImportNotice('緊急 transfer read-only 模式下不會匯入新轉帳；訪客快照仍保持不變。');
       return;
@@ -975,30 +1235,35 @@ export function useFinanceApp(): FinanceAppController {
       return;
     }
     if (!guestDecisionKey) return;
-    let persistence;
-    try {
-      persistence = persistGuestImportState(
-        plan.state,
-        guestDecisionKey,
-        guestFingerprint,
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setStorageError(`訪客資料匯入無法安全寫入：${message}`);
+    let committedPlan = plan;
+    const applied = await commitFinancialState(
+      `guest-import:${guestFingerprint}`,
+      (latest) => {
+        const latestPlan = planGuestImport(latest, imported);
+        if (latestPlan.conflicts.length > 0) {
+          throw new Error(`訪客匯入與其他分頁的 ${latestPlan.conflicts.length} 筆資料衝突`);
+        }
+        committedPlan = latestPlan;
+        return latestPlan.state;
+      },
+    );
+    if (activeOwnerRef.current !== importOwnerId
+      || ownerGenerationRef.current !== importGeneration) return;
+    if (!applied) {
       setGuestImportNotice('訪客匯入已中止：帳號快照未能持久化，因此目前資料未變更，且此訪客快照未標記為已處理。');
       return;
     }
-    commitState(() => plan.state);
-    if (persistence.decisionRemembered) {
+    try {
+      localStorage.setItem(guestDecisionKey, guestFingerprint);
       setGuestPromptDismissed(true);
-      setGuestImportNotice(`訪客資料匯入完成：新增 ${plan.addedCount} 筆，略過 ${plan.skippedCount} 筆內容相同的既有資料。`);
-    } else {
-      setStorageError(`訪客資料已匯入，但無法記住匯入決策：${persistence.decisionError}`);
-      setGuestImportNotice(`訪客資料已安全匯入：新增 ${plan.addedCount} 筆，略過 ${plan.skippedCount} 筆；但瀏覽器未能記住此決策，下次可能再次提示。`);
+      setGuestImportNotice(`訪客資料匯入完成：新增 ${committedPlan.addedCount} 筆，略過 ${committedPlan.skippedCount} 筆內容相同的既有資料。`);
+    } catch (error) {
+      setStorageError(`訪客資料已匯入，但無法記住匯入決策：${error instanceof Error ? error.message : String(error)}`);
+      setGuestImportNotice(`訪客資料已安全匯入：新增 ${committedPlan.addedCount} 筆，略過 ${committedPlan.skippedCount} 筆；但瀏覽器未能記住此決策，下次可能再次提示。`);
     }
-  }, [assertRenderedOwnerContext, commitState, guestDecisionKey, guestFingerprint, storageRecovery]);
+  }, [assertRenderedOwnerContext, commitFinancialState, financePersistence, guestDecisionKey, guestFingerprint, storageRecovery]);
 
-  const decideLegacyBootstrap = useCallback((decision: LegacyBootstrapDecision) => {
+  const decideLegacyBootstrap = useCallback(async (decision: LegacyBootstrapDecision) => {
     setLegacyBootstrapNotice(undefined);
     try {
       assertRenderedOwnerContext();
@@ -1011,16 +1276,19 @@ export function useFinanceApp(): FinanceAppController {
       return;
     }
     try {
-      const next = resolveLegacyBootstrapState(
-        stateRef.current,
-        decision,
-        saveFinanceState,
-        () => {
-          storageRecoveryRef.current = undefined;
-          setStorageRecovery(undefined);
-        },
+      const applied = await commitFinancialState(
+        `legacy-bootstrap:${decision}:${crypto.randomUUID()}`,
+        (current) => resolveLegacyBootstrapState(
+          current,
+          decision,
+          () => undefined,
+          () => undefined,
+        ),
       );
-      commitState(() => next);
+      if (!applied) {
+        setLegacyBootstrapNotice('本次決定未生效；候選資料與現有帳本都保持不變。');
+        return;
+      }
       setStorageError(undefined);
       setLegacyBootstrapNotice(decision === 'import-candidate'
         ? '舊版候選資料已明確匯入，並已建立可重試的待同步作業。'
@@ -1030,14 +1298,14 @@ export function useFinanceApp(): FinanceAppController {
       setStorageError(`無法安全完成舊版資料決定：${message}`);
       setLegacyBootstrapNotice('本次決定未生效；候選資料與現有帳本都保持不變。');
     }
-  }, [assertRenderedOwnerContext, commitState]);
+  }, [assertRenderedOwnerContext, commitFinancialState]);
 
   const importLegacyCandidate = useCallback(() => {
-    decideLegacyBootstrap('import-candidate');
+    void decideLegacyBootstrap('import-candidate');
   }, [decideLegacyBootstrap]);
 
   const keepCloudData = useCallback(() => {
-    decideLegacyBootstrap('keep-cloud');
+    void decideLegacyBootstrap('keep-cloud');
   }, [decideLegacyBootstrap]);
 
   const dismissGuestImport = useCallback(() => {
@@ -1098,7 +1366,7 @@ export function useFinanceApp(): FinanceAppController {
   return {
     state: exposedState,
     user,
-    authLoading,
+    authLoading: authLoading || durabilityLoading,
     cloudEnabled: supabaseConfigured,
     syncBusy,
     syncReport,

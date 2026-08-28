@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { RecurringRule, Transaction, Transfer } from '../domain/model';
+import type { DurableCommitResult, FinancePersistence } from './localDurability';
 import {
   createInitialState,
   loadFinanceStateWithRecovery,
@@ -13,12 +14,45 @@ import {
   assertSyncRecordMutationsAllowed,
   assertCurrentOwnerContext,
   clearSuccessfulRecoveryUiState,
+  commitOwnerAttemptUnlessSwitched,
   materializeRecurringTransactionsUnlessRecovering,
   materializeRecurringTransactionsUnlessSyncing,
   resolveLegacyBootstrapState,
   restoreFinanceStateUnlessLegacyBootstrap,
   syncMutationTargets,
 } from './useFinanceApp';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe('owner-scoped durable completion', () => {
+  it.each(['success', 'failure'] as const)(
+    'ignores a delayed %s after the owner generation switches',
+    async (outcome) => {
+      const pending = deferred<DurableCommitResult>();
+      const persistence = {
+        commit: vi.fn(() => pending.promise),
+      } as unknown as FinancePersistence;
+      let current = { ownerId: 'user-a', generation: 1 };
+      const completion = commitOwnerAttemptUnlessSwitched(
+        persistence,
+        current,
+        'delayed-attempt',
+        (state) => state,
+        () => current,
+      );
+      current = { ownerId: 'user-b', generation: 2 };
+      pending.resolve(outcome === 'success'
+        ? { ok: true, state: createInitialState('user-a'), revision: 1, replayed: false }
+        : { ok: false, code: 'DURABILITY_FAILED', message: 'quota', lockWrites: true });
+
+      await expect(completion).resolves.toBeUndefined();
+    },
+  );
+});
 
 describe('unresolved sync conflict mutation lock', () => {
   it('blocks a new local winner for a record with a durable same-clock payload conflict', () => {
