@@ -336,6 +336,37 @@ describe('HomeView smart quick entry interactions', () => {
     expect(put).not.toHaveBeenCalled();
   });
 
+  it('rejects a same-clock transaction whose current payload changed after the editor opened', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    data.transactions = [data.transactions[0]];
+    const put = vi.fn(() => true);
+    const view = render(
+      <HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '編輯 餐飲' }));
+    const note = screen.getByRole('textbox', { name: '備註' });
+    await user.clear(note);
+    await user.type(note, '只想修改備註');
+    view.rerender(
+      <HomeView
+        data={{
+          ...data,
+          transactions: [{ ...data.transactions[0], amount: 65 }],
+        }}
+        ownerId="guest"
+        put={put}
+        deleteTransaction={() => true}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('這筆交易已在背景更新');
+    expect(note).toHaveValue('只想修改備註');
+    expect(put).not.toHaveBeenCalled();
+  });
+
   it('rejects a transaction edit when background sync removes the current record', async () => {
     const user = userEvent.setup();
     const data = dataWithQuickHistory();

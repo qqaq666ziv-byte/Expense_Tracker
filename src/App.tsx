@@ -76,10 +76,16 @@ const SettingsView = lazy(() =>
 
 type Tab = "record" | "insights" | "assets" | "planning";
 
-function initialTutorialProgress(): TutorialProgress | null {
+function tutorialStorageKey(ownerId: string): string {
+  return ownerId === "guest"
+    ? TUTORIAL_STORAGE_KEY
+    : `${TUTORIAL_STORAGE_KEY}:user:${ownerId}`;
+}
+
+function initialTutorialProgress(ownerId: string): TutorialProgress | null {
   try {
     const saved = parseTutorialProgress(
-      localStorage.getItem(TUTORIAL_STORAGE_KEY),
+      localStorage.getItem(tutorialStorageKey(ownerId)),
     );
     if (saved) return saved;
     // People who completed the previous tour should not be interrupted again;
@@ -254,25 +260,11 @@ export function FinanceOwnerBoundary({
 
 export default function App() {
   const app = useFinanceApp();
-  return (
-    <FinanceOwnerBoundary ownerId={app.state.ownerId}>
-      <OwnerScopedApp app={app} />
-    </FinanceOwnerBoundary>
-  );
-}
-
-function OwnerScopedApp({ app }: { app: ReturnType<typeof useFinanceApp> }) {
-  const data = app.state.data;
   const { theme, toggleTheme } = useTheme();
   const [tab, setTab] = useState<Tab>("record");
   const [online, setOnline] = useState(navigator.onLine);
-  const [authMessage, setAuthMessage] = useState("");
   const [showSystem, setShowSystem] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [tutorial, setTutorial] = useState<TutorialProgress | null>(
-    initialTutorialProgress,
-  );
-  const tutorialResumeChecked = useRef(false);
 
   useEffect(() => {
     const update = () => setOnline(navigator.onLine);
@@ -284,14 +276,65 @@ function OwnerScopedApp({ app }: { app: ReturnType<typeof useFinanceApp> }) {
     };
   }, []);
 
+  return (
+    <FinanceOwnerBoundary ownerId={app.state.ownerId}>
+      <OwnerScopedApp
+        app={app}
+        theme={theme}
+        toggleTheme={toggleTheme}
+        tab={tab}
+        setTab={setTab}
+        online={online}
+        showSystem={showSystem}
+        setShowSystem={setShowSystem}
+        showSettings={showSettings}
+        setShowSettings={setShowSettings}
+      />
+    </FinanceOwnerBoundary>
+  );
+}
+
+function OwnerScopedApp({
+  app,
+  theme,
+  toggleTheme,
+  tab,
+  setTab,
+  online,
+  showSystem,
+  setShowSystem,
+  showSettings,
+  setShowSettings,
+}: {
+  app: ReturnType<typeof useFinanceApp>;
+  theme: ReturnType<typeof useTheme>["theme"];
+  toggleTheme: ReturnType<typeof useTheme>["toggleTheme"];
+  tab: Tab;
+  setTab(tab: Tab): void;
+  online: boolean;
+  showSystem: boolean;
+  setShowSystem(show: boolean): void;
+  showSettings: boolean;
+  setShowSettings(show: boolean): void;
+}) {
+  const data = app.state.data;
+  const [authMessage, setAuthMessage] = useState("");
+  const [tutorial, setTutorial] = useState<TutorialProgress | null>(
+    () => initialTutorialProgress(app.state.ownerId),
+  );
+  const tutorialResumeChecked = useRef(false);
+
   useEffect(() => {
     if (!tutorial) return;
     try {
-      localStorage.setItem(TUTORIAL_STORAGE_KEY, JSON.stringify(tutorial));
+      localStorage.setItem(
+        tutorialStorageKey(app.state.ownerId),
+        JSON.stringify(tutorial),
+      );
     } catch {
       /* UI preference only */
     }
-  }, [tutorial]);
+  }, [app.state.ownerId, tutorial]);
 
   const activeTutorial = tutorial?.status === "active" ? tutorial : null;
 
