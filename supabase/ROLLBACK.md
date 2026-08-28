@@ -36,16 +36,42 @@ For `finance_account_transfers`, preserve migration order: apply `20260824023801
 
 The repository release document and the domains currently attached to the active Vercel project have a known topology discrepancy. It remains a separate release follow-up; do not change domains or aliases as part of the transfer database release.
 
-## Safest application rollback
+## Code-only frontend rollback
 
-The preferred rollback is code-only:
+Use one operational rule: **if any Production transfer row may exist, the
+code-only rollback must be transfer-aware.** Unless an authoritative,
+current aggregate check proves `public.transfers` is empty, treat transfer rows
+as potentially present and deploy the emergency artifact built with:
 
-1. Stop or roll back the v3 frontend deployment to the previous known-good production deployment `dpl_6ejsiuY1gFcGne5F7U44kuUeFdWj`, built from main SHA `5fcebebe4b924b94929a4e0c638437796ef2ef9c` and previously serving `https://pure-finance-pi.vercel.app/`.
-2. Leave the v3 tables/columns, owner-scoped legacy primary keys, tightened RLS policies, and legacy columns in place.
-3. Do not delete v3 records. The legacy columns on `transactions`, `goals`, `subscriptions`, and `budgets` were intentionally retained for this path.
-4. Diagnose and repair forward in a new reviewed migration.
+```powershell
+npm.cmd run build:transfer-read-only
+```
 
-Leaving the backward-compatible schema in place preserves legacy financial records and lets the old client continue to use its owner-qualified CRUD paths. Headerless legacy reads intentionally hide tombstones, archived goals/budgets, and paused subscriptions; v3 requests retain owner-scoped full-graph visibility through the non-secret capability header. Allocation totals and representable monthly recurring rules remain projected into the retained legacy columns/tables so a code-only frontend rollback does not reinterpret them as missing. Do not restore the global `id` uniqueness constraint or broaden historical RLS policies merely to roll back the frontend.
+For a hosted emergency build, set the deployment build command to
+`npm.cmd run build:transfer-read-only` (or set
+`VITE_TRANSFER_MUTATIONS_ENABLED=false` at build time). This artifact retains
+schema-v4 local data, pulls and validates transfer rows and tombstones, and
+includes transfer effects in account balances and total assets while blocking
+transfer create/edit/delete. It does not require reversing additive database
+migrations. Verify the served artifact against an existing transfer before
+routing users to it, then diagnose and repair forward in a reviewed release.
+
+### Historical pre-transfer frontend rollback (conditionally safe only)
+
+The former v3 frontend/deployment rollback is historical. It may be considered
+only when authoritative current evidence proves that `public.transfers` has no
+Production rows and every schema-v4 local raw recovery payload is preserved.
+Under that narrow condition, the historical reference was deployment
+`dpl_6ejsiuY1gFcGne5F7U44kuUeFdWj`, built from main SHA
+`5fcebebe4b924b94929a4e0c638437796ef2ef9c` and previously serving
+`https://pure-finance-pi.vercel.app/`.
+
+Never use that frontend when a Production transfer row may exist: it does not
+pull `public.transfers` and omits transfer effects from balances and total
+assets. Leave v3 tables/columns, owner-scoped legacy primary keys, tightened
+RLS policies, and retained legacy columns in place; do not delete v3 records,
+restore global `id` uniqueness, or broaden historical RLS policies merely to
+roll back a frontend.
 
 ## Database rollback
 
@@ -80,21 +106,16 @@ For a later explicitly authorized release:
 5. Verify that `public.transfers` has exactly three authenticated owner policies, no authenticated `DELETE` grant, both owner-scoped account foreign keys, conflict/resource/account guards, deterministic endpoint row locking, and no orphan rows.
 6. Deploy the compatible frontend only after the schema and function checks succeed; verify guest and an authorized isolated authenticated ledger without touching genuine user financial rows.
 
-Rollback has two materially different phases:
+For code-only rollback, follow the rule in [Code-only frontend rollback](#code-only-frontend-rollback):
+when a Production transfer row may exist, use the transfer-aware emergency
+artifact. A schema-v3 frontend is historical and conditionally safe only after
+an authoritative current aggregate check proves `public.transfers` is empty and
+all schema-v4 local raw recovery payloads are preserved. Commit
+`d2510646961ff51f725b2e9a3c91bf9fb740516b` predates schema v4, does not pull
+`public.transfers`, and is not an operationally safe rollback target when
+transfer rows may exist, even if a clean device appears to load normally.
 
-1. **Before any Production transfer row exists:** a schema-v3 frontend may be
-   considered only after an authoritative aggregate check proves
-   `public.transfers` is empty. Preserve every schema-v4 local raw payload first;
-   an upgraded device can still enter recovery protection.
-2. **After the first Production transfer row exists:** never deploy a frontend
-   that does not read and calculate transfers. Commit
-   `d2510646961ff51f725b2e9a3c91bf9fb740516b` predates schema v4, does not pull
-   `public.transfers`, and omits transfer effects from balances and total assets.
-   It is not an operationally safe rollback even if a clean device appears to
-   load normally.
-
-The concrete transfer-aware code-only emergency path is the tested build mode
-checked into this transfer-capable release:
+The tested transfer-aware code-only emergency path is:
 
 ```powershell
 npm.cmd ci

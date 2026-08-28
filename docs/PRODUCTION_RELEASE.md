@@ -193,22 +193,15 @@ operation; never copy a service-role credential into Vercel or browser code.
 
 Frontend rollback and database rollback are separate operations.
 
-A frontend regression may be mitigated by restoring a previously verified
-Vercel deployment while leaving additive database schema changes intact, but
-the safe target changes permanently after first-class transfer data exists:
+Use one operational rule for a code-only frontend rollback: **if any
+Production `public.transfers` row may exist, deploy a transfer-aware frontend.**
+Unless an authoritative, current aggregate check proves the table is empty,
+treat transfer rows as potentially present. Do not restore a frontend that
+cannot pull, validate, display, and calculate transfers; a clean device can
+appear healthy while its account balances and total assets omit cloud transfers.
 
-- Before the first Production `public.transfers` row exists, a schema-v3
-  frontend may be considered only after confirming the table is empty and
-  preserving every schema-v4 local raw recovery payload. An upgraded browser
-  can still enter recovery protection.
-- After the first Production transfer row exists, never deploy a frontend that
-  does not pull, validate, display, and calculate transfer rows. In particular,
-  pre-transfer commit `d2510646961ff51f725b2e9a3c91bf9fb740516b` is not an
-  operationally safe rollback target: a clean device can appear healthy while
-  omitting cloud transfers from account balances and total assets.
-
-The repository contains a tested transfer-aware emergency frontend mode. From
-the reviewed transfer-capable release commit, run:
+The primary emergency path is the repository's tested transfer-aware build
+mode. From the reviewed transfer-capable release commit, run:
 
 ```powershell
 npm.cmd ci
@@ -225,6 +218,12 @@ and writes continue normally. For a hosted emergency build, configure the
 deployment build command as `npm.cmd run build:transfer-read-only`, or set
 `VITE_TRANSFER_MUTATIONS_ENABLED=false` for the build. Verify the served bundle
 and canonical deployment before routing users to it.
+
+A schema-v3/pre-transfer frontend is historical and conditionally safe only
+when authoritative current evidence proves `public.transfers` is empty and all
+schema-v4 local raw recovery payloads have been preserved. In particular,
+pre-transfer commit `d2510646961ff51f725b2e9a3c91bf9fb740516b` is never an
+operationally safe rollback target while a transfer row may exist.
 
 Do not clear browser storage or drop/hide the transfer table or tombstones to
 make an older client start. Preserve a raw recovery export and every cloud
