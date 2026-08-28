@@ -90,14 +90,15 @@ declare
   historical_transfer public.transfers%rowtype;
   source_account public.accounts%rowtype;
   destination_account public.accounts%rowtype;
-  endpoints_unchanged boolean := false;
+  source_unchanged boolean := false;
+  destination_unchanged boolean := false;
   has_existing boolean := false;
 begin
   if tg_op = 'UPDATE' then
     has_existing := true;
     historical_transfer := old;
-    endpoints_unchanged := new.source_account_id = old.source_account_id
-      and new.destination_account_id = old.destination_account_id;
+    source_unchanged := new.source_account_id = old.source_account_id;
+    destination_unchanged := new.destination_account_id = old.destination_account_id;
   else
     select * into existing_transfer
     from public.transfers
@@ -105,8 +106,8 @@ begin
     if found then
       has_existing := true;
       historical_transfer := existing_transfer;
-      endpoints_unchanged := new.source_account_id = existing_transfer.source_account_id
-        and new.destination_account_id = existing_transfer.destination_account_id;
+      source_unchanged := new.source_account_id = existing_transfer.source_account_id;
+      destination_unchanged := new.destination_account_id = existing_transfer.destination_account_id;
     end if;
   end if;
 
@@ -124,43 +125,59 @@ begin
     return new;
   end if;
 
-  if endpoints_unchanged then
-    if new.source_account_name is distinct from historical_transfer.source_account_name
-      or new.destination_account_name is distinct from historical_transfer.destination_account_name
-    then
+  if has_existing and source_unchanged
+    and new.source_account_name is distinct from historical_transfer.source_account_name
+  then
+    raise exception 'historical transfer source snapshot is immutable'
+      using errcode = '23514', constraint = 'finance_v3_transfer_snapshot_immutable';
+  end if;
+  if has_existing and destination_unchanged
+    and new.destination_account_name is distinct from historical_transfer.destination_account_name
+  then
+    raise exception 'historical transfer destination snapshot is immutable'
+      using errcode = '23514', constraint = 'finance_v3_transfer_snapshot_immutable';
+  end if;
+
+  if new.deleted_at is not null then
+    if has_existing and (not source_unchanged or not destination_unchanged) then
       raise exception 'historical transfer account snapshots are immutable'
         using errcode = '23514', constraint = 'finance_v3_transfer_snapshot_immutable';
     end if;
     return new;
   end if;
 
-  if new.deleted_at is not null then
-    return new;
+  if not source_unchanged then
+    select * into source_account
+    from public.accounts
+    where user_id = new.user_id and id = new.source_account_id;
+    if source_account.id is null
+      or source_account.deleted_at is not null
+      or not source_account.is_active
+    then
+      raise exception 'transfer source account must be active'
+        using errcode = '23514', constraint = 'finance_v3_transfer_active_source';
+    end if;
+    if new.source_account_name is distinct from source_account.name then
+      raise exception 'transfer source snapshot name does not match its account'
+        using errcode = '23514', constraint = 'finance_v3_transfer_account_snapshot';
+    end if;
   end if;
 
-  select * into source_account
-  from public.accounts
-  where user_id = new.user_id and id = new.source_account_id;
-  select * into destination_account
-  from public.accounts
-  where user_id = new.user_id and id = new.destination_account_id;
-
-  if source_account.id is null or source_account.deleted_at is not null or not source_account.is_active then
-    raise exception 'transfer source account must be active'
-      using errcode = '23514', constraint = 'finance_v3_transfer_active_source';
-  end if;
-  if destination_account.id is null
-    or destination_account.deleted_at is not null
-    or not destination_account.is_active
-  then
-    raise exception 'transfer destination account must be active'
-      using errcode = '23514', constraint = 'finance_v3_transfer_active_destination';
-  end if;
-  if new.source_account_name is distinct from source_account.name
-    or new.destination_account_name is distinct from destination_account.name
-  then
-    raise exception 'transfer account snapshot name does not match its account'
-      using errcode = '23514', constraint = 'finance_v3_transfer_account_snapshot';
+  if not destination_unchanged then
+    select * into destination_account
+    from public.accounts
+    where user_id = new.user_id and id = new.destination_account_id;
+    if destination_account.id is null
+      or destination_account.deleted_at is not null
+      or not destination_account.is_active
+    then
+      raise exception 'transfer destination account must be active'
+        using errcode = '23514', constraint = 'finance_v3_transfer_active_destination';
+    end if;
+    if new.destination_account_name is distinct from destination_account.name then
+      raise exception 'transfer destination snapshot name does not match its account'
+        using errcode = '23514', constraint = 'finance_v3_transfer_account_snapshot';
+    end if;
   end if;
 
   return new;

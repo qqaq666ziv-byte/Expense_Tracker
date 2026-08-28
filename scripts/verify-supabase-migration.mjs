@@ -2510,6 +2510,28 @@ async function verifyAtomicTransfers() {
       },
       'A stale retarget retry must preserve the newer transfer before account availability checks',
     );
+    const partialHistoricalRetarget = await one(db, `
+      update public.transfers
+      set source_account_id = 'included-a', source_account_name = '計入 A',
+        version = 3, last_operation_id = 'transfer-4-retarget-source-op'
+      where user_id = $1 and id = 'excluded-to-excluded'
+      returning source_account_id, destination_account_id, destination_account_name, version
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        source: partialHistoricalRetarget.source_account_id,
+        destination: partialHistoricalRetarget.destination_account_id,
+        destinationName: partialHistoricalRetarget.destination_account_name,
+        version: numeric(partialHistoricalRetarget.version),
+      },
+      {
+        source: 'included-a',
+        destination: 'excluded-b',
+        destinationName: '排除 B',
+        version: 3,
+      },
+      'Changing one endpoint must retain the other historical snapshot even after that account is archived',
+    );
     await assert.rejects(
       db.query(`
         insert into public.transfers (
