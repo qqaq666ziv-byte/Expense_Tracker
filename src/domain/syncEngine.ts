@@ -1406,13 +1406,11 @@ export async function syncFinanceState(
           // Direct transfer conflicts retain the normal accept-cloud path.
           if (transferComparison < 0 || divergentSameClock) continue;
         }
-        const changedEndpoints = [
+        const selectedEndpoints = [
           [transfer.sourceAccountId, remoteTransfer?.sourceAccountId],
           [transfer.destinationAccountId, remoteTransfer?.destinationAccountId],
-        ].flatMap(([accountId, historicalAccountId]) => {
-            // Unchanged endpoints intentionally retain their historical
-            // snapshots, including accounts archived after the transfer.
-            if (historicalAccountId === accountId) return [];
+        ].filter(([accountId, historicalAccountId]) => historicalAccountId !== accountId);
+        const mismatchedEndpoints = selectedEndpoints.flatMap(([accountId]) => {
             const accountKey = recordKey('accounts', accountId);
             const localAccount = state.data.accounts.find((account) => account.id === accountId);
             const remoteAccount = preflightByKey.get(accountKey);
@@ -1437,8 +1435,13 @@ export async function syncFinanceState(
             );
             return parentWillEstablishExactLocalState ? [] : [accountId];
           });
-        if (changedEndpoints.length === 0) continue;
-        const dependencyIds = [...new Set(changedEndpoints)].map(encodeURIComponent).join(',');
+        if (mismatchedEndpoints.length === 0) continue;
+        // Once any selected dependency changes, remember every endpoint newly
+        // selected by this mutation. A sibling endpoint may change remotely
+        // while the user is deciding, and first creates must refresh both.
+        const dependencyIds = [...new Set(selectedEndpoints.map(([accountId]) => accountId))]
+          .map(encodeURIComponent)
+          .join(',');
         const reason = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: accounts=${dependencyIds}; `
           + '請重新開啟轉帳並明確確認來源與目的帳戶。';
         preflightBlockedKeys.add(transferKey);

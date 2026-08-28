@@ -245,6 +245,14 @@ describe('offline sync engine', () => {
     expect(blocked.state.outbox[0].lastError).toMatch(/^transfer selected account changed before cloud write/);
     expect(blocked.state.unresolvedSyncRecordKeys).toContain('transfers:pending-transfer');
 
+    const remoteCash = {
+      ...cash,
+      name: '日常零用金',
+      version: 2,
+      updatedAt: '2026-08-28T02:00:30.000Z',
+      lastOperationId: 'cash-remote-rename',
+    };
+    await remote.apply('user-a', operation(remoteCash));
     const reloaded = JSON.parse(JSON.stringify(blocked.state)) as PersistedFinanceState;
     const retried = await syncFinanceState(reloaded, 'user-a', remote);
     expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers')).toEqual([]);
@@ -254,6 +262,7 @@ describe('offline sync engine', () => {
     const refreshed = {
       ...pendingTransfer,
       sourceAccountName: remoteBank.name,
+      destinationAccountName: remoteCash.name,
       version: 2,
       updatedAt: '2026-08-28T02:01:00.000Z',
       lastOperationId: 'transfer-reconfirmed',
