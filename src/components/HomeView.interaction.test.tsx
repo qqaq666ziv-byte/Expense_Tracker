@@ -63,6 +63,28 @@ function dataWithQuickHistory(): FinanceData {
   return data;
 }
 
+function dataWithQuickHistoryForOwner(ownerId: string): FinanceData {
+  const data = createInitialState(ownerId).data;
+  const category = data.categories.find((item) => item.kind === 'expense')!;
+  const account = data.accounts[0];
+  data.transactions = [1, 2].map((index) => ({
+    id: `${ownerId}-meal-${index}`,
+    ownerId,
+    version: 1,
+    updatedAt: `2026-08-2${6 + index}T12:00:00.000Z`,
+    lastOperationId: `${ownerId}-meal-${index}-create`,
+    amount: 60,
+    type: 'expense',
+    categoryId: category.id,
+    categoryName: category.name,
+    accountId: account.id,
+    accountName: account.name,
+    occurredAt: `2026-08-2${6 + index}T12:00:00.000`,
+    note: '滷肉飯',
+  }));
+  return data;
+}
+
 beforeEach(() => {
   localStorage.clear();
   Object.defineProperty(window, 'scrollTo', { configurable: true, value: vi.fn() });
@@ -277,6 +299,77 @@ describe('HomeView transfer interactions', () => {
 });
 
 describe('HomeView smart quick entry interactions', () => {
+  it('discards every owner-derived entry state before another owner can observe or save it', async () => {
+    const user = userEvent.setup();
+    const ownerAData = dataWithQuickHistoryForOwner('owner-a');
+    const ownerACategory = ownerAData.categories.find((item) => item.kind === 'expense')!;
+    const ownerAAccount = ownerAData.accounts[0];
+    const ownerBData = createInitialState('owner-b').data;
+    const ownerBCategory = ownerBData.categories.find((item) => item.kind === 'expense')!;
+    const ownerBAccount = ownerBData.accounts[0];
+    const put = vi.fn(() => true);
+    const view = render(
+      <HomeView data={ownerAData} ownerId="owner-a" put={put} deleteTransaction={() => true} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '新增快捷備註' }));
+    await user.type(screen.getByRole('textbox', { name: '新的快捷備註' }), 'A 的私人早餐');
+    await user.click(screen.getByRole('button', { name: '加入快捷備註' }));
+    await user.type(screen.getByRole('textbox', { name: '搜尋帳本' }), '滷肉');
+    await user.click(screen.getByRole('button', { name: '再記一次 滷肉飯 NT$60' }));
+
+    expect(screen.getByRole('textbox', { name: '金額' })).toHaveValue('60');
+    expect(screen.getByRole('textbox', { name: '備註' })).toHaveValue('滷肉飯');
+    expect(screen.getByRole('button', { name: ownerACategory.name })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: ownerAAccount.name })).toHaveAttribute('aria-pressed', 'true');
+
+    view.rerender(
+      <HomeView data={ownerBData} ownerId="owner-b" put={put} deleteTransaction={() => true} />,
+    );
+
+    expect(screen.getByRole('textbox', { name: '金額' })).toHaveValue('');
+    expect(screen.getByRole('textbox', { name: '備註' })).toHaveValue('');
+    expect(screen.getByRole('textbox', { name: '搜尋帳本' })).toHaveValue('');
+    expect(screen.getByRole('heading', { name: '極速記帳' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '使用我的快捷 A 的私人早餐' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: ownerBCategory.name })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: ownerBAccount.name })).toHaveAttribute('aria-pressed', 'false');
+
+    await user.type(screen.getByRole('textbox', { name: '金額' }), '25');
+    await user.click(screen.getByRole('button', { name: ownerBCategory.name }));
+    await user.click(screen.getByRole('button', { name: ownerBAccount.name }));
+    await user.click(screen.getByText('補充時間或備註'));
+    await user.type(screen.getByRole('textbox', { name: '備註' }), 'B 手動輸入');
+    await user.click(screen.getByRole('button', { name: '記下這筆支出' }));
+
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(put).toHaveBeenCalledWith('transactions', expect.objectContaining({
+      ownerId: 'owner-b',
+      amount: 25,
+      note: 'B 手動輸入',
+      categoryId: ownerBCategory.id,
+      accountId: ownerBAccount.id,
+    }));
+    expect(put).not.toHaveBeenCalledWith('transactions', expect.objectContaining({
+      amount: 60,
+      note: '滷肉飯',
+    }));
+
+    view.rerender(
+      <HomeView data={ownerAData} ownerId="owner-a" put={put} deleteTransaction={() => true} />,
+    );
+    await user.click(screen.getAllByRole('button', { name: `編輯 ${ownerACategory.name}` })[0]);
+    expect(screen.getByRole('button', { name: '儲存修改' })).toBeInTheDocument();
+
+    view.rerender(
+      <HomeView data={ownerBData} ownerId="owner-b" put={put} deleteTransaction={() => true} />,
+    );
+    expect(screen.queryByRole('button', { name: '儲存修改' })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '極速記帳' })).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '金額' })).toHaveValue('');
+    expect(screen.getByRole('textbox', { name: '備註' })).toHaveValue('');
+  });
+
   it('fills only the editable note when a common note chip is tapped', async () => {
     const user = userEvent.setup();
     const data = dataWithQuickHistory();

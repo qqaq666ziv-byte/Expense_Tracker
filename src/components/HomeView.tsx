@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { createElement, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   CalendarClock,
   Check,
@@ -61,7 +61,11 @@ interface HomeViewProps {
 
 const ledgerPageSize = 30;
 
-export function HomeView({
+export function HomeView(props: HomeViewProps) {
+  return createElement(OwnerScopedHomeView, { ...props, key: props.ownerId });
+}
+
+function OwnerScopedHomeView({
   data,
   ownerId,
   put,
