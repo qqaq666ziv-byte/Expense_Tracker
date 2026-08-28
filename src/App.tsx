@@ -1,4 +1,12 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   BarChart3,
   BookOpenCheck,
@@ -234,8 +242,26 @@ function downloadJson(name: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
+export function FinanceOwnerBoundary({
+  ownerId,
+  children,
+}: {
+  ownerId: string;
+  children: ReactNode;
+}) {
+  return <Fragment key={ownerId}>{children}</Fragment>;
+}
+
 export default function App() {
   const app = useFinanceApp();
+  return (
+    <FinanceOwnerBoundary ownerId={app.state.ownerId}>
+      <OwnerScopedApp app={app} />
+    </FinanceOwnerBoundary>
+  );
+}
+
+function OwnerScopedApp({ app }: { app: ReturnType<typeof useFinanceApp> }) {
   const data = app.state.data;
   const { theme, toggleTheme } = useTheme();
   const [tab, setTab] = useState<Tab>("record");
