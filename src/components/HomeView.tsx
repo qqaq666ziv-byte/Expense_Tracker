@@ -4,11 +4,13 @@ import {
   Check,
   ChevronDown,
   Pencil,
+  Plus,
   Search,
   ArrowLeftRight,
   Trash2,
+  X,
 } from "lucide-react";
-import type { AssetAccount, FinanceData, Transaction, Transfer } from "../domain/model";
+import type { AssetAccount, Category, FinanceData, Transaction, Transfer } from "../domain/model";
 import { buildLedgerHistory, calculateInsights } from "../domain/financeEngine";
 import { sortByDisplayOrder } from "../domain/displayOrder";
 import { changedRecordMeta, newRecordMeta } from "../app/state";
@@ -31,6 +33,14 @@ import { MoneyInput } from "./MoneyInput";
 import { syncRecordKey } from "../domain/syncEngine";
 import { buildTransferRecord } from "../domain/transfer";
 import { isEditorSnapshotStale } from "../domain/staleEditor";
+import {
+  deriveCommonNoteSuggestions,
+  deriveQuickReentryCandidates,
+} from "../domain/quickEntrySuggestions";
+import {
+  changePinnedNoteShortcuts,
+  loadPinnedNoteShortcuts,
+} from "../app/noteShortcutPreferences";
 
 interface HomeViewProps {
   data: FinanceData;
@@ -84,8 +94,22 @@ export function HomeView({
     source?: AssetAccount;
     destination?: AssetAccount;
   }>({});
+  const [quickReentryParents, setQuickReentryParents] = useState<{
+    category?: Category;
+    account?: AssetAccount;
+  } | null>(null);
   const [historyLimit, setHistoryLimit] = useState(ledgerPageSize);
   const [query, setQuery] = useState("");
+  const [pinnedNotePreference, setPinnedNotePreference] = useState<{
+    ownerId: string;
+    shortcuts: string[];
+  }>({ ownerId, shortcuts: [] });
+  const pinnedNoteShortcuts = pinnedNotePreference.ownerId === ownerId
+    ? pinnedNotePreference.shortcuts
+    : [];
+  const [addingNoteShortcut, setAddingNoteShortcut] = useState(false);
+  const [noteShortcutDraft, setNoteShortcutDraft] = useState("");
+  const [noteShortcutError, setNoteShortcutError] = useState("");
 
   const accounts = sortByDisplayOrder(
     data.accounts.filter(
@@ -136,6 +160,26 @@ export function HomeView({
     && item.isActive
     && !unresolvedSyncRecordKeys.has(syncRecordKey("accounts", item.id))
   ));
+  const commonNoteSuggestions = useMemo(() => deriveCommonNoteSuggestions(data, {
+    mode,
+    ownerId,
+    categoryId: mode === "transfer" ? undefined : resolvedCategoryId || undefined,
+    accountId: mode === "transfer" ? undefined : resolvedAccountId || undefined,
+    query: note,
+    excludeNormalizedNotes: pinnedNoteShortcuts,
+  }), [data, mode, note, ownerId, pinnedNoteShortcuts, resolvedAccountId, resolvedCategoryId]);
+  const quickReentryCandidates = useMemo(() => (
+    mode === "transfer" || editing || editingTransfer || tutorial
+      ? []
+      : deriveQuickReentryCandidates(data, {
+          mode,
+          ownerId,
+          categoryId: resolvedCategoryId || undefined,
+          accountId: resolvedAccountId || undefined,
+          lockedRecordKeys: unresolvedSyncRecordKeys,
+        })
+  ), [data, editing, editingTransfer, mode, ownerId, resolvedAccountId,
+    resolvedCategoryId, tutorial, unresolvedSyncRecordKeys]);
 
   useEffect(() => {
     try {
@@ -153,6 +197,36 @@ export function HomeView({
       /* Recent picks are a convenience, never financial state. */
     }
   }, [ownerId, type]);
+
+  useEffect(() => {
+    setPinnedNotePreference({
+      ownerId,
+      shortcuts: loadPinnedNoteShortcuts(localStorage, ownerId),
+    });
+    setAddingNoteShortcut(false);
+    setNoteShortcutDraft("");
+    setNoteShortcutError("");
+  }, [ownerId]);
+
+  const changeNoteShortcut = (change: { type: "add" | "remove"; note: string }) => {
+    const result = changePinnedNoteShortcuts(localStorage, ownerId, change);
+    setPinnedNotePreference({ ownerId, shortcuts: result.shortcuts });
+    if (result.persisted) {
+      setNoteShortcutError("");
+      if (change.type === "add") {
+        setAddingNoteShortcut(false);
+        setNoteShortcutDraft("");
+      }
+      return;
+    }
+    setNoteShortcutError({
+      empty: "請輸入快捷備註。",
+      duplicate: "這個快捷備註已經存在。",
+      "count-limit": "我的快捷已達數量上限，請先移除不需要的項目。",
+      "size-limit": "快捷備註太長，請縮短後再加入。",
+      storage: "瀏覽器無法儲存快捷備註；帳本資料未受影響。",
+    }[result.error ?? "storage"]);
+  };
 
   const today = useMemo(
     () =>
@@ -211,6 +285,7 @@ export function HomeView({
     setOccurredAt(toLocalInput());
     setEditing(null);
     setEditingTransfer(null);
+    setQuickReentryParents(null);
     setOpenedTransferAccounts({
       source: data.accounts.find((account) => account.id === sourceAccountId),
       destination: data.accounts.find((account) => account.id === destinationAccountId),
@@ -223,6 +298,7 @@ export function HomeView({
     setMode(next);
     setType(next);
     setEditingTransfer(null);
+    setQuickReentryParents(null);
     setOpenedTransferAccounts({});
     setSourceAccountId("");
     setDestinationAccountId("");
@@ -235,6 +311,7 @@ export function HomeView({
   const switchToTransfer = () => {
     setMode("transfer");
     setEditing(null);
+    setQuickReentryParents(null);
     setCategoryId("");
     setError("");
     setSuccess("");
@@ -339,6 +416,32 @@ export function HomeView({
       setError("這筆交易有未解同步衝突；請先選擇雲端版本，本次修改未執行。");
       return;
     }
+    if (quickReentryParents) {
+      const staleCategory = quickReentryParents.category && isEditorSnapshotStale(
+        quickReentryParents.category,
+        data.categories.find((item) => item.id === quickReentryParents.category!.id),
+        {
+          requireActive: true,
+          hasUnresolvedConflict: unresolvedSyncRecordKeys.has(
+            syncRecordKey("categories", quickReentryParents.category.id),
+          ),
+        },
+      );
+      const staleAccount = quickReentryParents.account && isEditorSnapshotStale(
+        quickReentryParents.account,
+        data.accounts.find((item) => item.id === quickReentryParents.account!.id),
+        {
+          requireActive: true,
+          hasUnresolvedConflict: unresolvedSyncRecordKeys.has(
+            syncRecordKey("accounts", quickReentryParents.account.id),
+          ),
+        },
+      );
+      if (staleCategory || staleAccount) {
+        setError("快捷重填的分類或帳戶已在背景更新、封存、刪除或發生同步衝突；請重新選擇。");
+        return;
+      }
+    }
     if (selectedCategoryUnavailable || selectedAccountUnavailable) {
       setError("原先選取的帳戶或分類目前不可用；本次交易未儲存，請明確選擇其他可用項目。");
       return;
@@ -420,6 +523,7 @@ export function HomeView({
     setEditing(transaction);
     setEditingTransfer(null);
     setOpenedTransferAccounts({});
+    setQuickReentryParents(null);
     setSourceAccountId("");
     setDestinationAccountId("");
     setType(transaction.type);
@@ -438,6 +542,7 @@ export function HomeView({
     setMode("transfer");
     setEditing(null);
     setEditingTransfer(transfer);
+    setQuickReentryParents(null);
     setAmount(String(transfer.amount));
     setSourceAccountId(transfer.sourceAccountId);
     setDestinationAccountId(transfer.destinationAccountId);
@@ -506,6 +611,41 @@ export function HomeView({
             </button>
           </div>
 
+          {quickReentryCandidates.length > 0 && (
+            <section className="quick-reentry" aria-labelledby="quick-reentry-title">
+              <div className="quick-reentry-heading">
+                <span id="quick-reentry-title">再記一次</span>
+                <small>帶入後仍可修改，確認儲存才會新增</small>
+              </div>
+              <div className="quick-reentry-list">
+                {quickReentryCandidates.map((candidate) => (
+                  <button
+                    key={`${candidate.note}:${candidate.amount}:${candidate.categoryId}:${candidate.accountId}`}
+                    type="button"
+                    className="quick-reentry-card"
+                    aria-label={`再記一次 ${candidate.note} ${displayMoney(candidate.amount)}`}
+                    onClick={() => {
+                      const category = data.categories.find((item) => item.id === candidate.categoryId);
+                      const account = data.accounts.find((item) => item.id === candidate.accountId);
+                      if (!category || !account) return;
+                      setAmount(String(candidate.amount));
+                      setNote(candidate.note);
+                      setCategoryId(candidate.categoryId);
+                      setAccountId(candidate.accountId);
+                      setQuickReentryParents({ category, account });
+                      setError("");
+                      setSuccess("");
+                      requestAnimationFrame(() => amountRef.current?.focus());
+                    }}
+                  >
+                    <strong>{candidate.note} · {displayMoney(candidate.amount)}</strong>
+                    <small>{candidate.categoryName} · {candidate.accountName}</small>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+
           <label className={`amount-stage ${mode}`} data-tutorial="amount">
             <span>{mode === "transfer" ? "轉帳金額" : type === "expense" ? "支出金額" : "收入金額"}</span>
             <MoneyInput
@@ -551,6 +691,9 @@ export function HomeView({
                     : undefined}
                   onClick={() => {
                     setCategoryId(category.id);
+                    setQuickReentryParents((current) => current?.account
+                      ? { account: current.account }
+                      : null);
                     onTutorialEvent?.({ type: "category-selected" });
                   }}
                 >
@@ -583,6 +726,9 @@ export function HomeView({
                     : undefined}
                   onClick={() => {
                     setAccountId(account.id);
+                    setQuickReentryParents((current) => current?.category
+                      ? { category: current.category }
+                      : null);
                     onTutorialEvent?.({ type: "account-selected" });
                   }}
                 >
@@ -679,7 +825,12 @@ export function HomeView({
             </p>
           )}
 
-          <details className="optional-details" open={Boolean(editing || editingTransfer)}>
+          <details
+            className="optional-details"
+            open={Boolean(editing || editingTransfer || addingNoteShortcut
+              || note.length > 0 || pinnedNoteShortcuts.length > 0
+              || commonNoteSuggestions.length > 0)}
+          >
             <summary>
               <ChevronDown className="h-4 w-4" />
               補充時間或備註
@@ -707,6 +858,103 @@ export function HomeView({
                 />
               </label>
             </div>
+            <div className="note-suggestion-group pinned-note-shortcuts" aria-label="我的快捷備註">
+              <div className="note-suggestion-heading">
+                <span>我的快捷</span>
+                <small>只保存在這台裝置</small>
+              </div>
+              <div className="chip-row">
+                {pinnedNoteShortcuts.map((shortcut) => (
+                  <span className="pinned-note-item" key={shortcut}>
+                    <button
+                      type="button"
+                      className="note-suggestion-chip pinned"
+                      aria-label={`使用我的快捷 ${shortcut}`}
+                      onClick={() => setNote(shortcut)}
+                    >
+                      {shortcut}
+                    </button>
+                    <button
+                      type="button"
+                      className="remove-note-shortcut"
+                      aria-label={`移除快捷備註 ${shortcut}`}
+                      onClick={() => changeNoteShortcut({ type: "remove", note: shortcut })}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </span>
+                ))}
+                <button
+                  type="button"
+                  className="note-suggestion-chip add"
+                  aria-label="新增快捷備註"
+                  onClick={() => {
+                    setAddingNoteShortcut(true);
+                    setNoteShortcutError("");
+                  }}
+                >
+                  <Plus className="h-4 w-4" />
+                </button>
+              </div>
+              {addingNoteShortcut && (
+                <div className="add-note-shortcut-row">
+                  <input
+                    className="field"
+                    aria-label="新的快捷備註"
+                    placeholder="例如：滷肉飯"
+                    value={noteShortcutDraft}
+                    onChange={(event) => {
+                      setNoteShortcutDraft(event.target.value);
+                      setNoteShortcutError("");
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.nativeEvent.isComposing) return;
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        changeNoteShortcut({ type: "add", note: noteShortcutDraft });
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => changeNoteShortcut({ type: "add", note: noteShortcutDraft })}
+                  >
+                    加入快捷備註
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      setAddingNoteShortcut(false);
+                      setNoteShortcutDraft("");
+                      setNoteShortcutError("");
+                    }}
+                  >
+                    取消新增
+                  </button>
+                </div>
+              )}
+              {noteShortcutError && <small role="status">{noteShortcutError}</small>}
+            </div>
+            {commonNoteSuggestions.length > 0 && (
+              <div className="note-suggestion-group" aria-label="常用備註">
+                <span>常用：</span>
+                <div className="chip-row">
+                  {commonNoteSuggestions.map((suggestion) => (
+                    <button
+                      key={suggestion}
+                      type="button"
+                      className="note-suggestion-chip"
+                      aria-label={`使用常用備註 ${suggestion}`}
+                      onClick={() => setNote(suggestion)}
+                    >
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </details>
 
           {error && (
