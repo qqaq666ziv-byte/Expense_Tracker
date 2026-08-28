@@ -245,6 +245,12 @@ describe('offline sync engine', () => {
     expect(blocked.state.outbox[0].lastError).toMatch(/^transfer account changed before first cloud write/);
     expect(blocked.state.unresolvedSyncRecordKeys).toContain('transfers:pending-transfer');
 
+    const reloaded = JSON.parse(JSON.stringify(blocked.state)) as PersistedFinanceState;
+    const retried = await syncFinanceState(reloaded, 'user-a', remote);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers')).toEqual([]);
+    expect(retried.state.outbox[0].lastError).toMatch(/^transfer account changed before first cloud write/);
+    expect(retried.state.unresolvedSyncRecordKeys).toContain('transfers:pending-transfer');
+
     const refreshed = {
       ...pendingTransfer,
       sourceAccountName: remoteBank.name,
@@ -252,7 +258,7 @@ describe('offline sync engine', () => {
       updatedAt: '2026-08-28T02:01:00.000Z',
       lastOperationId: 'transfer-reconfirmed',
     };
-    const confirmed = confirmTransferDependencyConflict(blocked.state, refreshed);
+    const confirmed = confirmTransferDependencyConflict(retried.state, refreshed);
     expect(confirmed.unresolvedSyncRecordKeys).toBeUndefined();
     expect(confirmed.outbox).toEqual([expect.objectContaining({
       id: 'transfer-reconfirmed',

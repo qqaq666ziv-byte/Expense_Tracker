@@ -1578,7 +1578,9 @@ export async function syncFinanceState(
       unresolvedKeys.has(key)
       || (queuedOperation.batchId !== undefined && unresolvedBatchIds.has(queuedOperation.batchId))
     ) {
-      const message = `unresolved sync conflict for ${operation.entity}/${operation.recordId}; pending write was not sent`;
+      const message = hasTransferDependencyConflict(queuedOperation)
+        ? queuedOperation.lastError!
+        : `unresolved sync conflict for ${operation.entity}/${operation.recordId}; pending write was not sent`;
       remaining.push({ ...operation, lastError: message });
       failures.push({
         stage: 'conflict',
