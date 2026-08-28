@@ -289,6 +289,11 @@ export function HomeView({
         const currentAccount = data.accounts.find((account) => account.id === openedAccount.id);
         if (isEditorSnapshotStale(openedAccount, currentAccount, {
           requireActive: openedAccount.isActive,
+          allowDeleted: resolvingTransferDependency && Boolean(
+            editingTransfer
+            && (openedAccount.id === editingTransfer.sourceAccountId
+              || openedAccount.id === editingTransfer.destinationAccountId),
+          ),
           hasUnresolvedConflict: unresolvedSyncRecordKeys.has(
             syncRecordKey("accounts", openedAccount.id),
           ),
@@ -312,7 +317,7 @@ export function HomeView({
           destinationAccountId: resolvedDestinationAccountId,
           occurredAt,
           note: note.trim() || undefined,
-        }, metadata, resolvingTransferDependency ? undefined : editingTransfer ?? undefined);
+        }, metadata, editingTransfer ?? undefined);
         completeAppliedMutation(
           resolvingTransferDependency
             ? Boolean(confirmTransferAccounts?.(record))

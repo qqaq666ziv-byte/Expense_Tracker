@@ -185,6 +185,13 @@ Frontend rollback and database rollback are separate operations.
 A frontend regression may be mitigated by restoring a previously verified
 Vercel deployment while leaving additive database schema changes intact.
 
+If the rollback crosses from the schema-v4 local-state client to schema v3,
+the older client may enter recovery protection even though it preserves the
+raw local payload and the cloud still retains every row. Do not clear browser
+storage or drop the transfer table/tombstones to make the old client start.
+Preserve a raw recovery export and prefer a reviewed forward repair when it is
+safer than making the older client reinterpret the newer ledger.
+
 Do not reverse production database migrations merely because the frontend
 requires rollback unless database rollback is independently justified and safe.
 

@@ -146,6 +146,7 @@ class InMemoryRemote implements RemoteAdapter {
   private readonly acceptedOperationIds = new Set<string>();
   readonly failBeforeApplyOnce = new Set<string>();
   readonly failAfterApplyOnce = new Set<string>();
+  readonly applyCalls: string[] = [];
   failAfterCompareAndSwapOnce = false;
 
   constructor(records: RemoteRecord[] = []) {
@@ -162,6 +163,7 @@ class InMemoryRemote implements RemoteAdapter {
     if (pending.record.ownerId !== ownerId) {
       throw new Error('owner mismatch');
     }
+    this.applyCalls.push(`${pending.entity}:${pending.recordId}`);
 
     if (this.failBeforeApplyOnce.delete(pending.id)) {
       throw new Error('offline before apply');
@@ -217,6 +219,120 @@ class InMemoryRemote implements RemoteAdapter {
 }
 
 describe('offline sync engine', () => {
+  it('creates a transfer before a later local account rename without retroactive reconfirmation', async () => {
+    const bankV1 = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const bankV2 = {
+      ...bankV1,
+      name: '主要銀行',
+      version: 2,
+      updatedAt: '2026-08-28T04:01:00.000Z',
+      lastOperationId: 'bank-local-rename',
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const created = transfer('chronology-rename', 'user-a', 1, 'transfer-before-rename');
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bankV1 },
+      { entity: 'accounts', record: cash },
+    ]);
+    const withTransfer = enqueueSyncRecord({
+      ...state('user-a', [bankV1, cash], []),
+      data: { ...emptyData(), accounts: [bankV1, cash] },
+    }, 'transfers', created);
+    const initial = enqueueSyncRecord(
+      withTransfer,
+      'accounts',
+      bankV2,
+      bankV2.updatedAt,
+      'rename-after-transfer',
+    );
+
+    const result = await syncFinanceState(initial, 'user-a', remote);
+
+    expect(result.state.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(result.state.outbox).toEqual([]);
+    expect(remote.applyCalls).toEqual(['transfers:chronology-rename', 'accounts:bank']);
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: created });
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'accounts' && item.record.id === 'bank'))
+      .toEqual({ entity: 'accounts', record: bankV2 });
+  });
+
+  it('creates a transfer before a later local account archive while the cloud endpoint is still active', async () => {
+    const bankV1 = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const archivedBank = {
+      ...bankV1,
+      isActive: false,
+      version: 2,
+      updatedAt: '2026-08-28T04:02:00.000Z',
+      lastOperationId: 'bank-local-archive',
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const created = transfer('chronology-archive', 'user-a', 1, 'transfer-before-archive');
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bankV1 },
+      { entity: 'accounts', record: cash },
+    ]);
+    const withTransfer = enqueueSyncRecord({
+      ...state('user-a', [bankV1, cash], []),
+      data: { ...emptyData(), accounts: [bankV1, cash] },
+    }, 'transfers', created);
+    const initial = enqueueSyncRecord(
+      withTransfer,
+      'accounts',
+      archivedBank,
+      archivedBank.updatedAt,
+      'archive-after-transfer',
+    );
+
+    const result = await syncFinanceState(initial, 'user-a', remote);
+
+    expect(result.state.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(result.state.outbox).toEqual([]);
+    expect(remote.applyCalls).toEqual(['transfers:chronology-archive', 'accounts:bank']);
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: created });
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'accounts' && item.record.id === 'bank'))
+      .toEqual({ entity: 'accounts', record: archivedBank });
+  });
+
+  it('applies a local account mutation queued before a transfer before creating that transfer', async () => {
+    const bankV1 = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const bankV2 = {
+      ...bankV1,
+      name: '主要銀行',
+      version: 2,
+      updatedAt: '2026-08-28T04:03:00.000Z',
+      lastOperationId: 'bank-rename-before-transfer',
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const created = {
+      ...transfer('chronology-parent-first', 'user-a', 1, 'transfer-after-rename'),
+      sourceAccountName: bankV2.name,
+    };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bankV1 },
+      { entity: 'accounts', record: cash },
+    ]);
+    const withRenamedAccount = enqueueSyncRecord(
+      {
+        ...state('user-a', [bankV1, cash], []),
+        data: { ...emptyData(), accounts: [bankV1, cash] },
+      },
+      'accounts',
+      bankV2,
+      bankV2.updatedAt,
+      'rename-before-transfer',
+    );
+    const initial = enqueueSyncRecord(withRenamedAccount, 'transfers', created);
+
+    const result = await syncFinanceState(initial, 'user-a', remote);
+
+    expect(result.state.outbox).toEqual([]);
+    expect(remote.applyCalls).toEqual(['accounts:bank', 'transfers:chronology-parent-first']);
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: created });
+  });
+
   it('holds a first transfer write when an endpoint changed remotely until the user explicitly reconfirms it', async () => {
     const localBank = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
     const remoteBank = {
@@ -362,6 +478,72 @@ describe('offline sync engine', () => {
     expect(converged.state.outbox).toEqual([]);
     expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
       .toEqual({ entity: 'transfers', record: confirmed.data.transfers[0] });
+  });
+
+  it('reconfirms a changed destination while preserving an archived historical source', async () => {
+    const archivedBank = {
+      ...account('bank', 'user-a', 2, 'bank-archived'),
+      name: '主要銀行',
+      isActive: false,
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const localBroker = { ...account('broker', 'user-a', 1, 'broker-create'), name: '券商舊名' };
+    const remoteBroker = {
+      ...localBroker,
+      name: '投資帳戶',
+      version: 2,
+      updatedAt: '2026-08-28T03:00:00.000Z',
+      lastOperationId: 'broker-remote-rename',
+    };
+    const cloudTransfer = {
+      ...transfer('archived-source-retarget', 'user-a', 1, 'transfer-cloud-create'),
+      sourceAccountName: '銀行原名',
+    };
+    const localRetarget = {
+      ...cloudTransfer,
+      destinationAccountId: localBroker.id,
+      destinationAccountName: localBroker.name,
+      version: 2,
+      updatedAt: '2026-08-28T02:59:00.000Z',
+      lastOperationId: 'transfer-local-retarget',
+    };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: archivedBank },
+      { entity: 'accounts', record: cash },
+      { entity: 'accounts', record: remoteBroker },
+      { entity: 'transfers', record: cloudTransfer },
+    ]);
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [archivedBank, cash, localBroker], []),
+      data: {
+        ...emptyData(),
+        accounts: [archivedBank, cash, localBroker],
+        transfers: [localRetarget],
+      },
+      outbox: [transferOperation(localRetarget)],
+    };
+
+    const blocked = await syncFinanceState(initial, 'user-a', remote);
+    expect(blocked.state.outbox[0].lastError)
+      .toMatch(/^transfer selected account changed before cloud write/);
+
+    const confirmed = confirmTransferDependencyConflict(blocked.state, {
+      ...localRetarget,
+      sourceAccountName: cloudTransfer.sourceAccountName,
+      destinationAccountName: remoteBroker.name,
+      version: 3,
+      updatedAt: '2026-08-28T03:01:00.000Z',
+      lastOperationId: 'transfer-retarget-reconfirmed',
+    });
+    expect(confirmed.data.transfers[0]).toEqual(expect.objectContaining({
+      sourceAccountId: archivedBank.id,
+      sourceAccountName: cloudTransfer.sourceAccountName,
+      destinationAccountId: remoteBroker.id,
+      destinationAccountName: remoteBroker.name,
+    }));
+
+    const converged = await syncFinanceState(confirmed, 'user-a', remote);
+    expect(converged.state.outbox).toEqual([]);
   });
 
   it('retries one atomic transfer row and converges create, edit, and tombstone without duplicates', async () => {

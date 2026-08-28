@@ -33,6 +33,15 @@ describe('stale editor snapshot guard', () => {
     expect(isEditorSnapshotStale(opened, { ...opened, isActive: false })).toBe(false);
   });
 
+  it('allows an exact soft-deleted snapshot only when the caller opts into historical semantics', () => {
+    const deleted = { ...opened, isActive: false, deletedAt: '2026-08-27T01:00:00.000Z' };
+    expect(isEditorSnapshotStale(deleted, deleted)).toBe(true);
+    expect(isEditorSnapshotStale(deleted, deleted, { allowDeleted: true })).toBe(false);
+    expect(isEditorSnapshotStale(deleted, { ...deleted, version: 3 }, {
+      allowDeleted: true,
+    })).toBe(true);
+  });
+
   it('fails closed when the same record key has an unresolved payload conflict', () => {
     expect(isEditorSnapshotStale(opened, { ...opened }, {
       hasUnresolvedConflict: true,

@@ -183,4 +183,46 @@ describe('HomeView transfer interactions', () => {
     }));
     expect(screen.getByText(/已重新確認轉帳/)).toBeInTheDocument();
   });
+
+  it('keeps a soft-deleted unchanged endpoint when reconfirming a transfer dependency', async () => {
+    const user = userEvent.setup();
+    const data = dataWithTwoAccounts();
+    const existing = {
+      ...transferFor(data),
+      sourceAccountName: '建立轉帳時的銀行名稱',
+    };
+    data.accounts[0] = {
+      ...data.accounts[0],
+      name: '封存後的銀行名稱',
+      isActive: false,
+      deletedAt: '2026-08-28T02:30:00.000Z',
+      version: data.accounts[0].version + 1,
+      lastOperationId: 'account-archived',
+    };
+    data.transfers = [existing];
+    const confirmTransferAccounts = vi.fn(() => true);
+    render(
+      <HomeView
+        data={data}
+        ownerId="guest"
+        put={() => true}
+        deleteTransaction={() => true}
+        unresolvedSyncRecordKeys={new Set(['transfers:transfer-ui'])}
+        transferDependencyConflictIds={new Set(['transfer-ui'])}
+        confirmTransferAccounts={confirmTransferAccounts}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '重新選擇並確認' }));
+    expect(screen.getByRole('button', { name: '儲存轉帳修改' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: '儲存轉帳修改' }));
+
+    expect(confirmTransferAccounts).toHaveBeenCalledWith(expect.objectContaining({
+      id: existing.id,
+      sourceAccountId: existing.sourceAccountId,
+      sourceAccountName: existing.sourceAccountName,
+      destinationAccountId: existing.destinationAccountId,
+    }));
+    expect(screen.getByText(/已重新確認轉帳/)).toBeInTheDocument();
+  });
 });

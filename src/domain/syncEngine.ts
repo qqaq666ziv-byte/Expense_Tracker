@@ -282,18 +282,27 @@ export function confirmTransferDependencyConflict(
   const destination = state.data.accounts.find(
     (account) => account.id === replacement.destinationAccountId,
   );
-  if (!source || !destination || source.ownerId !== state.ownerId || destination.ownerId !== state.ownerId
-    || source.deletedAt || destination.deletedAt || !source.isActive || !destination.isActive) {
+  if (!source || !destination
+    || source.ownerId !== state.ownerId || destination.ownerId !== state.ownerId) {
     throw new Error('請重新選擇兩個目前可用的帳戶。');
   }
   if (source.id === destination.id) throw new Error('來源帳戶與目的帳戶必須不同。');
   const dependencyAccountIds = transferDependencyAccountIds(pending);
+  const sourceRemainsHistorical = source.id === current.sourceAccountId
+    && !dependencyAccountIds.has(source.id);
+  const destinationRemainsHistorical = destination.id === current.destinationAccountId
+    && !dependencyAccountIds.has(destination.id);
+  if ((!sourceRemainsHistorical && (source.deletedAt || !source.isActive))
+    || (!destinationRemainsHistorical && (destination.deletedAt || !destination.isActive))) {
+    throw new Error('請重新選擇兩個目前可用的帳戶。');
+  }
   const refreshSourceSnapshot = source.id !== current.sourceAccountId
     || dependencyAccountIds.has(source.id);
   const refreshDestinationSnapshot = destination.id !== current.destinationAccountId
     || dependencyAccountIds.has(destination.id);
-  if ((refreshSourceSnapshot && replacement.sourceAccountName !== source.name)
-    || (refreshDestinationSnapshot && replacement.destinationAccountName !== destination.name)) {
+  if ((source.id !== current.sourceAccountId && replacement.sourceAccountName !== source.name)
+    || (destination.id !== current.destinationAccountId
+      && replacement.destinationAccountName !== destination.name)) {
     throw new Error('新選或已變更帳戶的名稱快照不是目前明確確認的版本。');
   }
   const confirmedReplacement = {
@@ -1407,10 +1416,18 @@ export async function syncFinanceState(
           if (transferComparison < 0 || divergentSameClock) continue;
         }
         const selectedEndpoints = [
-          [transfer.sourceAccountId, remoteTransfer?.sourceAccountId],
-          [transfer.destinationAccountId, remoteTransfer?.destinationAccountId],
+          [
+            transfer.sourceAccountId,
+            remoteTransfer?.sourceAccountId,
+            transfer.sourceAccountName,
+          ],
+          [
+            transfer.destinationAccountId,
+            remoteTransfer?.destinationAccountId,
+            transfer.destinationAccountName,
+          ],
         ].filter(([accountId, historicalAccountId]) => historicalAccountId !== accountId);
-        const mismatchedEndpoints = selectedEndpoints.flatMap(([accountId]) => {
+        const mismatchedEndpoints = selectedEndpoints.flatMap(([accountId, , accountName]) => {
             const accountKey = recordKey('accounts', accountId);
             const localAccount = state.data.accounts.find((account) => account.id === accountId);
             const remoteAccount = preflightByKey.get(accountKey);
@@ -1424,6 +1441,10 @@ export async function syncFinanceState(
             const parentOperation = parentOperationIndex >= 0
               ? state.outbox[parentOperationIndex]
               : undefined;
+            const historicalAccount = parentOperation?.entity === 'accounts'
+              && parentOperation.batchBeforeRecord
+              ? parentOperation.batchBeforeRecord as FinanceData['accounts'][number]
+              : undefined;
             const parentWillEstablishExactLocalState = Boolean(
               localAccount
               && parentOperation
@@ -1433,7 +1454,27 @@ export async function syncFinanceState(
               && differingSyncRecordFields('accounts', parentOperation.record, localAccount).length === 0
               && (!remoteAccount || compareSyncRecords(parentOperation.record, remoteAccount.record) > 0),
             );
-            return parentWillEstablishExactLocalState ? [] : [accountId];
+            const laterParentPreservesHistoricalEndpoint = Boolean(
+              parentOperation
+              && parentOperationIndex > transferIndex
+              && historicalAccount
+              && remoteAccount?.entity === 'accounts'
+              && historicalAccount.id === accountId
+              && historicalAccount.ownerId === authenticatedOwnerId
+              && historicalAccount.isActive
+              && !historicalAccount.deletedAt
+              && historicalAccount.name === accountName
+              && !unresolvedKeys.has(accountKey)
+              && !preflightBlockedKeys.has(accountKey)
+              && differingSyncRecordFields(
+                'accounts',
+                historicalAccount,
+                remoteAccount.record,
+              ).length === 0,
+            );
+            return parentWillEstablishExactLocalState || laterParentPreservesHistoricalEndpoint
+              ? []
+              : [accountId];
           });
         if (mismatchedEndpoints.length === 0) continue;
         // Once any selected dependency changes, remember every endpoint newly

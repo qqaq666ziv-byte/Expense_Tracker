@@ -5,6 +5,7 @@ type EditableSyncRecord = SyncRecord & { isActive?: boolean };
 export interface EditorSnapshotOptions {
   requireActive?: boolean;
   hasUnresolvedConflict?: boolean;
+  allowDeleted?: boolean;
 }
 
 /**
@@ -18,7 +19,9 @@ export function isEditorSnapshotStale<T extends EditableSyncRecord>(
   options: EditorSnapshotOptions = {},
 ): boolean {
   if (options.hasUnresolvedConflict) return true;
-  if (!current || current.id !== opened.id || current.deletedAt) return true;
+  if (!current || current.id !== opened.id || (current.deletedAt && !options.allowDeleted)) {
+    return true;
+  }
   if (options.requireActive && current.isActive !== true) return true;
   return current.version !== opened.version
     || current.lastOperationId !== opened.lastOperationId;
