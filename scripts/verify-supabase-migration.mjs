@@ -2407,6 +2407,203 @@ async function verifyAtomicTransfers() {
         ($1, 'excluded-b', '排除 B', 'vector', 'wallet', 0, false, true, 4, 1, now(), 'account-d-op')
     `, [OWNER_A]);
 
+    const historicalAccountRows = [{
+      user_id: OWNER_A,
+      id: 'historical-archived-source',
+      name: '目前銀行名',
+      icon_type: 'vector',
+      icon_value: 'wallet',
+      opening_balance: 500,
+      include_in_total_assets: false,
+      is_active: false,
+      sort_order: 10,
+      legacy_key: null,
+      requires_review: false,
+      version: 2,
+      updated_at: '2026-08-28T01:00:00.000Z',
+      last_operation_id: 'historical-source-archive-op',
+      deleted_at: null,
+    }, {
+      user_id: OWNER_A,
+      id: 'historical-active-destination',
+      name: '現金',
+      icon_type: 'vector',
+      icon_value: 'wallet',
+      opening_balance: 0,
+      include_in_total_assets: false,
+      is_active: true,
+      sort_order: 11,
+      legacy_key: null,
+      requires_review: false,
+      version: 1,
+      updated_at: '2026-08-28T01:00:00.000Z',
+      last_operation_id: 'historical-destination-op',
+      deleted_at: null,
+    }];
+    const historicalTransferRows = [{
+      user_id: OWNER_A,
+      id: 'historical-imported-transfer',
+      amount: 250,
+      source_account_id: 'historical-archived-source',
+      source_account_name: '舊銀行名',
+      destination_account_id: 'historical-active-destination',
+      destination_account_name: '現金',
+      occurred_at: '2026-08-20 08:00',
+      note: null,
+      version: 1,
+      updated_at: '2026-08-28T01:00:00.000Z',
+      last_operation_id: 'historical-transfer-op',
+      deleted_at: null,
+    }];
+    const importHistorical = () => db.query(`
+      select entity, id, version, last_operation_id
+      from public.finance_import_historical_transfer_batch(
+        $1, $2::jsonb, $3::jsonb, $4::jsonb
+      )
+      order by entity, id
+    `, [
+      'historical-import:migration-verifier',
+      JSON.stringify(historicalAccountRows),
+      JSON.stringify(historicalAccountRows),
+      JSON.stringify(historicalTransferRows),
+    ]);
+    const firstHistoricalImport = await importHistorical();
+    assert.equal(firstHistoricalImport.rows.length, 3,
+      'Historical import RPC must confirm both endpoint accounts and one transfer');
+    const importedHistoricalAccount = await one(db, `
+      select is_active, deleted_at from public.accounts
+      where user_id = $1 and id = 'historical-archived-source'
+    `, [OWNER_A]);
+    assert.equal(importedHistoricalAccount.is_active, false,
+      'Historical import must retain the endpoint archived state');
+    assert.equal(importedHistoricalAccount.deleted_at, null,
+      'Historical import must not invent a tombstone');
+    const importedHistoricalTransfer = await one(db, `
+      select source_account_id, source_account_name from public.transfers
+      where user_id = $1 and id = 'historical-imported-transfer'
+    `, [OWNER_A]);
+    assert.equal(importedHistoricalTransfer.source_account_id, 'historical-archived-source');
+    assert.equal(importedHistoricalTransfer.source_account_name, '舊銀行名',
+      'Historical import must preserve the original endpoint name snapshot');
+    const repeatedHistoricalImport = await importHistorical();
+    assert.equal(repeatedHistoricalImport.rows.length, 3,
+      'An exact historical import retry must be idempotently confirmed');
+    const historicalTransferCount = await one(db, `
+      select count(*)::integer as count from public.transfers
+      where user_id = $1 and id = 'historical-imported-transfer'
+    `, [OWNER_A]);
+    assert.equal(numeric(historicalTransferCount.count), 1,
+      'Historical import retry must not duplicate the atomic transfer row');
+
+    const softDeletedAt = '2026-08-27T01:00:00.000Z';
+    const softDeletedAccounts = historicalAccountRows.map((row, index) => ({
+      ...row,
+      id: index === 0 ? 'historical-deleted-source' : 'historical-deleted-destination',
+      name: index === 0 ? '已刪除帳戶' : '保留帳戶',
+      opening_balance: 0,
+      is_active: index !== 0,
+      version: index === 0 ? 3 : 1,
+      last_operation_id: index === 0 ? 'historical-source-delete-op' : 'historical-destination-2-op',
+      deleted_at: index === 0 ? softDeletedAt : null,
+    }));
+    const softDeletedTransfers = [{
+      ...historicalTransferRows[0],
+      id: 'historical-soft-deleted-transfer',
+      source_account_id: 'historical-deleted-source',
+      source_account_name: '刪除前舊名',
+      destination_account_id: 'historical-deleted-destination',
+      destination_account_name: '保留帳戶',
+      last_operation_id: 'historical-soft-deleted-transfer-op',
+    }];
+    await db.query(`
+      select * from public.finance_import_historical_transfer_batch(
+        $1, $2::jsonb, $3::jsonb, $4::jsonb
+      )
+    `, [
+      'historical-import:soft-deleted',
+      JSON.stringify(softDeletedAccounts),
+      JSON.stringify(softDeletedAccounts),
+      JSON.stringify(softDeletedTransfers),
+    ]);
+    const retainedSoftDelete = await one(db, `
+      select is_active, deleted_at from public.accounts
+      where user_id = $1 and id = 'historical-deleted-source'
+    `, [OWNER_A]);
+    assert.equal(retainedSoftDelete.is_active, false);
+    assert.equal(retainedSoftDelete.deleted_at.toISOString(), softDeletedAt,
+      'Historical import must retain a safely supported endpoint tombstone');
+    const softDeletedTransferCount = await one(db, `
+      select count(*)::integer as count from public.transfers
+      where user_id = $1 and id = 'historical-soft-deleted-transfer' and deleted_at is null
+    `, [OWNER_A]);
+    assert.equal(numeric(softDeletedTransferCount.count), 1,
+      'An active historical transfer may retain a soft-deleted endpoint through the explicit RPC');
+
+    const partialFailureAccounts = historicalAccountRows.map((row, index) => ({
+      ...row,
+      id: index === 0 ? 'rolled-back-source' : 'rolled-back-destination',
+      name: index === 0 ? '回滾來源' : '回滾目的',
+      opening_balance: 0,
+      is_active: true,
+      last_operation_id: `rolled-back-account-${index}-op`,
+    }));
+    const invalidTransfer = [{
+      ...historicalTransferRows[0],
+      id: 'rolled-back-invalid-transfer',
+      source_account_id: 'rolled-back-source',
+      source_account_name: '回滾來源',
+      destination_account_id: 'rolled-back-source',
+      destination_account_name: '回滾來源',
+      last_operation_id: 'rolled-back-invalid-transfer-op',
+    }];
+    await assert.rejects(
+      db.query(`
+        select * from public.finance_import_historical_transfer_batch(
+          $1, $2::jsonb, $3::jsonb, $4::jsonb
+        )
+      `, [
+        'historical-import:must-roll-back',
+        JSON.stringify(partialFailureAccounts),
+        JSON.stringify(partialFailureAccounts),
+        JSON.stringify(invalidTransfer),
+      ]),
+      /distinct_accounts|check constraint/i,
+      'A transfer-stage failure must roll back earlier account writes in the same RPC',
+    );
+    const rolledBackAccountCount = await one(db, `
+      select count(*)::integer as count from public.accounts
+      where user_id = $1 and id like 'rolled-back-%'
+    `, [OWNER_A]);
+    assert.equal(numeric(rolledBackAccountCount.count), 0,
+      'A failed historical import must not leave misleading staged account rows');
+
+    const foreignManifest = historicalAccountRows.map((row) => ({ ...row, user_id: OWNER_B }));
+    await assert.rejects(
+      db.query(`
+        select * from public.finance_import_historical_transfer_batch(
+          $1, $2::jsonb, $3::jsonb, $4::jsonb
+        )
+      `, [
+        'historical-import:foreign-owner',
+        JSON.stringify(foreignManifest),
+        JSON.stringify(foreignManifest),
+        JSON.stringify(historicalTransferRows.map((row) => ({ ...row, user_id: OWNER_B }))),
+      ]),
+      /owner mismatch|row-level security|42501/i,
+      'Historical import must reject a manifest owned by another user',
+    );
+    const rpcPrivileges = await one(db, `
+      select
+        has_function_privilege('anon',
+          'public.finance_import_historical_transfer_batch(text,jsonb,jsonb,jsonb)', 'EXECUTE') as anon_executes,
+        has_function_privilege('authenticated',
+          'public.finance_import_historical_transfer_batch(text,jsonb,jsonb,jsonb)', 'EXECUTE') as authenticated_executes
+    `);
+    assert.equal(rpcPrivileges.anon_executes, false,
+      'Signed-out ordinary clients must not activate the historical import RPC');
+    assert.equal(rpcPrivileges.authenticated_executes, true,
+      'Authenticated owners may use the explicit import/restore RPC');
+
     await db.query(`
       insert into public.transfers (
         user_id, id, amount, source_account_id, source_account_name,
@@ -2420,7 +2617,11 @@ async function verifyAtomicTransfers() {
     `, [OWNER_A]);
 
     const transferCount = await one(db, `
-      select count(*)::integer as count from public.transfers where user_id = $1
+      select count(*)::integer as count from public.transfers
+      where user_id = $1 and id in (
+        'included-to-included', 'included-to-excluded',
+        'excluded-to-included', 'excluded-to-excluded'
+      )
     `, [OWNER_A]);
     assert.equal(numeric(transferCount.count), 4, 'Each transfer must persist as one atomic row');
 
@@ -2543,6 +2744,18 @@ async function verifyAtomicTransfers() {
       `, [OWNER_A]),
       /destination account must be active|transfer_active_destination/i,
       'New transfers must not target an archived account',
+    );
+    await assert.rejects(
+      db.query(`
+        update public.transfers
+        set destination_account_id = 'excluded-b',
+          destination_account_name = '排除 B',
+          version = 2,
+          last_operation_id = 'retarget-to-archived-op'
+        where user_id = $1 and id = 'included-to-included'
+      `, [OWNER_A]),
+      /destination account must be active|transfer_active_destination/i,
+      'Ordinary retargeting must not select an archived account',
     );
     await assert.rejects(
       db.query(`

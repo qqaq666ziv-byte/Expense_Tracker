@@ -686,6 +686,7 @@ export default function App() {
                 }
                 unresolvedSyncRecordKeys={app.mutationLockedRecordKeys}
                 transferDependencyConflictIds={app.transferDependencyConflictIds}
+                transferMutationsEnabled={app.transferMutationsEnabled}
                 confirmTransferAccounts={app.confirmTransferAccounts}
                 acceptRemoteConflict={(recordId) => {
                   void app.acceptRemoteConflict("transactions", recordId);

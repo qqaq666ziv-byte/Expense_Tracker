@@ -247,6 +247,10 @@ export function loadFinanceStateWithRecovery(
           && operation.batchBeforeRecord !== null
           && (operation.batchBeforeRecord.ownerId !== ownerId
             || operation.batchBeforeRecord.id !== operation.recordId))
+        || (operation.historicalImportBatchId !== undefined
+          && (typeof operation.historicalImportBatchId !== 'string'
+            || !operation.historicalImportBatchId.startsWith('historical-import:')
+            || !['accounts', 'transfers'].includes(operation.entity)))
         || !entityNames.includes(operation.entity)) {
         throw new Error('invalid or foreign operation in outbox');
       }
@@ -309,6 +313,10 @@ export function loadFinanceStateWithRecovery(
             && operation.batchBeforeRecord !== null
             && (operation.batchBeforeRecord.ownerId !== ownerId
               || operation.batchBeforeRecord.id !== operation.recordId))
+          || (operation.historicalImportBatchId !== undefined
+            && (typeof operation.historicalImportBatchId !== 'string'
+              || !operation.historicalImportBatchId.startsWith('historical-import:')
+              || !['accounts', 'transfers'].includes(operation.entity)))
           || !entityNames.includes(operation.entity)
           || pendingKeys.has(key)) {
           throw new Error('invalid or duplicate operation in authenticated initial bootstrap');
@@ -567,6 +575,7 @@ export function putRecord<E extends FinanceEntityName>(
   entity: E,
   record: FinanceData[E][number],
   batchId?: string,
+  historicalImportBatchId?: string,
 ): PersistedFinanceState {
   if (record.ownerId !== state.ownerId) throw new Error('拒絕寫入其他使用者的資料');
   assertFinanceRecordWithinWriteLimits(entity, record);
@@ -578,6 +587,7 @@ export function putRecord<E extends FinanceEntityName>(
     record,
     record.updatedAt,
     batchId,
+    historicalImportBatchId,
   );
 
   const index = records.findIndex((candidate) => candidate.id === record.id);
@@ -661,11 +671,21 @@ export function planGuestImport(
 
   let next = state;
   let addedCount = 0;
+  const currentTransferIds = new Set(state.data.transfers.map((record) => record.id));
+  const historicalImportBatchId = imported.transfers.some((record) => !currentTransferIds.has(record.id))
+    ? `historical-import:${crypto.randomUUID()}`
+    : undefined;
   for (const entity of entityNames) {
     const existingIds = new Set((state.data[entity] as SyncRecord[]).map((record) => record.id));
     for (const record of imported[entity] as FinanceData[typeof entity][number][]) {
       if (existingIds.has(record.id)) continue;
-      next = putRecord(next, entity, record);
+      next = putRecord(
+        next,
+        entity,
+        record,
+        undefined,
+        entity === 'accounts' || entity === 'transfers' ? historicalImportBatchId : undefined,
+      );
       addedCount += 1;
     }
   }
@@ -692,6 +712,10 @@ export function applyRestoredData(
   }
 
   const timestamp = now.toISOString();
+  const historicalImportBatchId = restoredData.transfers.some((record) => {
+    const existing = state.data.transfers.find((candidate) => candidate.id === record.id);
+    return !existing || JSON.stringify(existing) !== JSON.stringify(record);
+  }) ? `historical-import:${crypto.randomUUID()}` : undefined;
   let next: PersistedFinanceState = {
     ...state,
     data: { ...state.data, settings: structuredClone(restoredData.settings) },
@@ -705,7 +729,8 @@ export function applyRestoredData(
           ...existing,
           ...tombstoneRecordMeta(existing, now, operationId),
           ...('isActive' in existing ? { isActive: false } : {}),
-        } as FinanceData[typeof entity][number]);
+        } as FinanceData[typeof entity][number], undefined,
+        entity === 'accounts' || entity === 'transfers' ? historicalImportBatchId : undefined);
       }
     }
     for (const record of incoming as FinanceData[typeof entity][number][]) {
@@ -719,7 +744,8 @@ export function applyRestoredData(
         lastOperationId: record.deletedAt
           ? `tombstone:${operationId()}`
           : activeOperationId(operationId()),
-      } as FinanceData[typeof entity][number]);
+      } as FinanceData[typeof entity][number], undefined,
+      entity === 'accounts' || entity === 'transfers' ? historicalImportBatchId : undefined);
     }
   }
   return next;

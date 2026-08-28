@@ -46,6 +46,7 @@ interface HomeViewProps {
   acceptRemoteTransferConflict?(recordId: string): void;
   transferDependencyConflictIds?: ReadonlySet<string>;
   confirmTransferAccounts?(record: Transfer): boolean;
+  transferMutationsEnabled?: boolean;
 }
 
 const ledgerPageSize = 30;
@@ -63,6 +64,7 @@ export function HomeView({
   acceptRemoteTransferConflict,
   transferDependencyConflictIds = new Set(),
   confirmTransferAccounts,
+  transferMutationsEnabled = true,
 }: HomeViewProps) {
   const amountRef = useRef<HTMLInputElement>(null);
   const [type, setType] = useState<"expense" | "income">("expense");
@@ -492,8 +494,12 @@ export function HomeView({
               type="button"
               className={mode === "transfer" ? "active transfer" : ""}
               aria-pressed={mode === "transfer"}
-              disabled={Boolean(tutorial)}
-              title={tutorial ? "互動教學期間先完成支出流程" : undefined}
+              disabled={Boolean(tutorial) || !transferMutationsEnabled}
+              title={tutorial
+                ? "互動教學期間先完成支出流程"
+                : !transferMutationsEnabled
+                  ? "緊急唯讀模式：仍會顯示與計算轉帳，但已停用轉帳寫入。"
+                  : undefined}
               onClick={switchToTransfer}
             >
               記轉帳
@@ -871,6 +877,7 @@ export function HomeView({
                           <button
                             type="button"
                             className="secondary-button"
+                            disabled={!transferMutationsEnabled}
                             onClick={() => beginEditTransfer(transfer)}
                           >
                             重新選擇並確認
@@ -900,8 +907,10 @@ export function HomeView({
                       <button
                         type="button"
                         aria-label={`編輯轉帳 ${transferLabel}`}
-                        disabled={mutationBlocked}
-                        title={mutationBlocked ? "此轉帳或其帳戶有未解同步衝突，請先完成處理。" : undefined}
+                        disabled={mutationBlocked || !transferMutationsEnabled}
+                        title={!transferMutationsEnabled
+                          ? "緊急唯讀模式已停用轉帳編輯。"
+                          : mutationBlocked ? "此轉帳或其帳戶有未解同步衝突，請先完成處理。" : undefined}
                         onClick={() => beginEditTransfer(transfer)}
                       >
                         <Pencil className="h-4 w-4" />
@@ -909,8 +918,10 @@ export function HomeView({
                       <button
                         type="button"
                         aria-label={`刪除轉帳 ${transferLabel}`}
-                        disabled={mutationBlocked}
-                        title={mutationBlocked ? "此轉帳或其帳戶有未解同步衝突，請先完成處理。" : undefined}
+                        disabled={mutationBlocked || !transferMutationsEnabled}
+                        title={!transferMutationsEnabled
+                          ? "緊急唯讀模式已停用轉帳刪除。"
+                          : mutationBlocked ? "此轉帳或其帳戶有未解同步衝突，請先完成處理。" : undefined}
                         onClick={() => {
                           if (window.confirm("刪除這筆轉帳？兩個帳戶的餘額都會一併回復。")) {
                             deleteTransfer(transfer);

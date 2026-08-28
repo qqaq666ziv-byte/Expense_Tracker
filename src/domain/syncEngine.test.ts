@@ -12,6 +12,8 @@ import type {
   Transfer,
 } from './model';
 import type { RemoteAdapter, RemoteRecord } from './syncEngine';
+import { createFinanceBackup, restoreFinanceBackup } from './backup';
+import { applyRestoredData, planGuestImport, remapOwner } from '../app/state';
 import {
   acceptRemoteConflictRecord,
   confirmTransferDependencyConflict,
@@ -147,9 +149,14 @@ class InMemoryRemote implements RemoteAdapter {
   readonly failBeforeApplyOnce = new Set<string>();
   readonly failAfterApplyOnce = new Set<string>();
   readonly applyCalls: string[] = [];
+  readonly historicalImportCalls: string[] = [];
   failAfterCompareAndSwapOnce = false;
+  failAfterHistoricalImportOnce = false;
 
-  constructor(records: RemoteRecord[] = []) {
+  constructor(
+    records: RemoteRecord[] = [],
+    private readonly strictTransferAccounts = false,
+  ) {
     for (const record of records) {
       this.records.set(this.key(record), record);
     }
@@ -164,6 +171,19 @@ class InMemoryRemote implements RemoteAdapter {
       throw new Error('owner mismatch');
     }
     this.applyCalls.push(`${pending.entity}:${pending.recordId}`);
+
+    if (this.strictTransferAccounts && pending.entity === 'transfers' && !pending.record.deletedAt) {
+      const candidate = pending.record as Transfer;
+      const existing = this.records.get(`transfers:${candidate.id}`);
+      if (!existing) {
+        for (const accountId of [candidate.sourceAccountId, candidate.destinationAccountId]) {
+          const endpoint = this.records.get(`accounts:${accountId}`)?.record as AssetAccount | undefined;
+          if (!endpoint || !endpoint.isActive || endpoint.deletedAt) {
+            throw new Error('transfer endpoint must be active');
+          }
+        }
+      }
+    }
 
     if (this.failBeforeApplyOnce.delete(pending.id)) {
       throw new Error('offline before apply');
@@ -187,6 +207,52 @@ class InMemoryRemote implements RemoteAdapter {
 
     if (this.failAfterApplyOnce.delete(pending.id)) {
       throw new Error('connection dropped after apply');
+    }
+  }
+
+  async applyHistoricalImportBatch(
+    ownerId: string,
+    batch: {
+      id: string;
+      operations: readonly PendingOperation[];
+      endpointAccounts: readonly AssetAccount[];
+    },
+  ): Promise<void> {
+    if (batch.operations.some((operation) => operation.record.ownerId !== ownerId)
+      || batch.endpointAccounts.some((accountRecord) => accountRecord.ownerId !== ownerId)) {
+      throw new Error('owner mismatch');
+    }
+    const snapshot = new Map(this.records);
+    try {
+      for (const operation of batch.operations.filter((candidate) => candidate.entity === 'accounts')) {
+        this.records.set(`accounts:${operation.recordId}`, {
+          entity: 'accounts',
+          record: structuredClone(operation.record),
+        } as RemoteRecord);
+      }
+      for (const operation of batch.operations.filter((candidate) => candidate.entity === 'transfers')) {
+        const candidate = operation.record as Transfer;
+        if (candidate.sourceAccountId === candidate.destinationAccountId) {
+          throw new Error('transfer endpoints must differ');
+        }
+        if (!batch.endpointAccounts.some((endpoint) => endpoint.id === candidate.sourceAccountId)
+          || !batch.endpointAccounts.some((endpoint) => endpoint.id === candidate.destinationAccountId)) {
+          throw new Error('historical import endpoint manifest is incomplete');
+        }
+        this.records.set(`transfers:${operation.recordId}`, {
+          entity: 'transfers',
+          record: structuredClone(operation.record),
+        } as RemoteRecord);
+      }
+      this.historicalImportCalls.push(batch.id);
+    } catch (error) {
+      this.records.clear();
+      for (const [key, value] of snapshot) this.records.set(key, value);
+      throw error;
+    }
+    if (this.failAfterHistoricalImportOnce) {
+      this.failAfterHistoricalImportOnce = false;
+      throw new Error('connection dropped after historical import commit');
     }
   }
 
@@ -219,6 +285,173 @@ class InMemoryRemote implements RemoteAdapter {
 }
 
 describe('offline sync engine', () => {
+  function historicalImportData(
+    ownerId: string,
+    endpointState: 'archived' | 'deleted' = 'archived',
+  ): FinanceData {
+    const source = {
+      ...account('history-source', ownerId, 2, 'history-source-final'),
+      name: '目前銀行名',
+      isActive: false,
+      ...(endpointState === 'deleted' ? { deletedAt: '2026-08-27T01:00:00.000Z' } : {}),
+    };
+    const destination = {
+      ...account('history-destination', ownerId, 1, 'history-destination-final'),
+      name: '現金',
+    };
+    return {
+      ...emptyData(),
+      accounts: [source, destination],
+      transfers: [{
+        ...transfer('history-transfer', ownerId, 1, 'history-transfer-create'),
+        sourceAccountId: source.id,
+        sourceAccountName: '舊銀行名',
+        destinationAccountId: destination.id,
+        destinationAccountName: destination.name,
+      }],
+    };
+  }
+
+  it('converges an explicit guest import with a soft-deleted historical endpoint and retries idempotently', async () => {
+    const mapped = remapOwner(historicalImportData('guest', 'deleted'), 'user-a');
+    const base: PersistedFinanceState = {
+      schemaVersion: 4,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+    };
+    const imported = planGuestImport(base, mapped).state;
+    const remote = new InMemoryRemote([], true);
+
+    const first = await syncFinanceState(imported, 'user-a', remote);
+    const repeated = await syncFinanceState(first.state, 'user-a', remote);
+    const cloud = await remote.pull('user-a');
+    const cloudSource = cloud.find((entry) => (
+      entry.entity === 'accounts' && entry.record.id === mapped.accounts[0].id
+    ));
+    const cloudTransfer = cloud.find((entry) => entry.entity === 'transfers');
+
+    expect(first.state.outbox).toEqual([]);
+    expect(repeated.state.outbox).toEqual([]);
+    expect(cloudSource).toEqual({ entity: 'accounts', record: mapped.accounts[0] });
+    expect(cloudTransfer).toEqual({ entity: 'transfers', record: mapped.transfers[0] });
+    expect((cloudTransfer?.record as Transfer).sourceAccountName).toBe('舊銀行名');
+    expect(cloud.filter((entry) => entry.entity === 'transfers')).toHaveLength(1);
+  });
+
+  it.each(['merge', 'replace'] as const)(
+    'converges an authenticated %s restore with an archived historical endpoint',
+    async (mode) => {
+      const base: PersistedFinanceState = {
+        schemaVersion: 4,
+        ownerId: 'user-a',
+        data: emptyData(),
+        outbox: [],
+      };
+      const backup = createFinanceBackup(historicalImportData('user-a'));
+      const restoredData = restoreFinanceBackup(base.data, backup, {
+        mode,
+        ownerId: 'user-a',
+        confirmReplace: mode === 'replace',
+      });
+      const restored = applyRestoredData(
+        base,
+        restoredData,
+        new Date('2026-08-28T05:00:00.000Z'),
+        (() => {
+          let sequence = 0;
+          return () => `restore-${mode}-${sequence += 1}`;
+        })(),
+      );
+      const remote = new InMemoryRemote([], true);
+
+      const first = await syncFinanceState(restored, 'user-a', remote);
+      const repeated = await syncFinanceState(first.state, 'user-a', remote);
+      const cloud = await remote.pull('user-a');
+      const cloudSource = cloud.find((entry) => (
+        entry.entity === 'accounts' && entry.record.id === 'history-source'
+      ));
+      const cloudTransfer = cloud.find((entry) => entry.entity === 'transfers');
+
+      expect(first.state.outbox).toEqual([]);
+      expect(repeated.state.outbox).toEqual([]);
+      expect(cloudSource?.record).toMatchObject({ isActive: false });
+      expect(cloudSource?.record).not.toHaveProperty('deletedAt');
+      expect(cloudTransfer?.record).toMatchObject({
+        sourceAccountId: 'history-source',
+        sourceAccountName: '舊銀行名',
+      });
+      expect(cloud.filter((entry) => entry.entity === 'transfers')).toHaveLength(1);
+    },
+  );
+
+  it('retries the whole historical import manifest after the commit response is lost', async () => {
+    const data = historicalImportData('user-a');
+    const base: PersistedFinanceState = {
+      schemaVersion: 4,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+    };
+    const restored = applyRestoredData(
+      base,
+      data,
+      new Date('2026-08-28T05:30:00.000Z'),
+      () => 'lost-response-operation',
+    );
+    const remote = new InMemoryRemote([], true);
+    remote.failAfterHistoricalImportOnce = true;
+
+    const uncertain = await syncFinanceState(restored, 'user-a', remote);
+    expect(uncertain.state.outbox).toHaveLength(3);
+    expect(uncertain.state.outbox.every((operation) => operation.attempts === 1)).toBe(true);
+    expect((await remote.pull('user-a')).filter((entry) => entry.entity === 'transfers')).toHaveLength(1);
+
+    const recovered = await syncFinanceState(uncertain.state, 'user-a', remote);
+    expect(recovered.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).filter((entry) => entry.entity === 'transfers')).toHaveLength(1);
+  });
+
+  it('atomically imports a historical transfer while retaining its archived endpoint', async () => {
+    const archivedBank = {
+      ...account('bank', 'user-a', 1, 'bank-import'),
+      name: '主要銀行',
+      isActive: false,
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-import'), name: '現金' };
+    const historical = {
+      ...transfer('historical-import', 'user-a', 1, 'transfer-import'),
+      sourceAccountName: '舊銀行名',
+    };
+    const batchId = 'historical-import:guest-1';
+    const withBatch = (pending: PendingOperation) => ({
+      ...pending,
+      historicalImportBatchId: batchId,
+    }) as PendingOperation & { historicalImportBatchId: string };
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [archivedBank, cash], []),
+      data: { ...emptyData(), accounts: [archivedBank, cash], transfers: [historical] },
+      outbox: [
+        withBatch(operation(archivedBank)),
+        withBatch(operation(cash)),
+        withBatch(transferOperation(historical)),
+      ],
+    };
+    const remote = new InMemoryRemote([], true);
+
+    const first = await syncFinanceState(initial, 'user-a', remote);
+    const second = await syncFinanceState(first.state, 'user-a', remote);
+    const cloud = await remote.pull('user-a');
+
+    expect(first.state.outbox).toEqual([]);
+    expect(second.state.outbox).toEqual([]);
+    expect(remote.historicalImportCalls).toEqual([batchId]);
+    expect(cloud.find((entry) => entry.entity === 'accounts' && entry.record.id === 'bank'))
+      .toEqual({ entity: 'accounts', record: archivedBank });
+    expect(cloud.find((entry) => entry.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: historical });
+  });
+
   it('creates a transfer before a later local account rename without retroactive reconfirmation', async () => {
     const bankV1 = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
     const bankV2 = {

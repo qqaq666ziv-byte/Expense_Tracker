@@ -79,7 +79,53 @@ For a later explicitly authorized release:
 4. Verify that `public.transfers` has exactly three authenticated owner policies, no authenticated `DELETE` grant, both owner-scoped account foreign keys, conflict/resource/account guards, and no orphan rows.
 5. Deploy the compatible frontend only after the schema check succeeds; verify guest and an authorized isolated authenticated ledger without touching genuine user financial rows.
 
-The preferred rollback is code-only: restore the previous frontend while leaving `public.transfers` and its rows intact. Older clients synchronize known entity tables individually and therefore do not delete unknown transfer rows. However, rolling the frontend from the schema-v4 local-state client back to a schema-v3 client is not guaranteed to be immediately usable: the older validator preserves the raw local payload and all cloud rows but may deliberately enter recovery protection because it cannot interpret the newer local schema. Keep the raw recovery export, do not clear browser storage, and prefer a forward client repair when that is safer than asking the older client to reinterpret the ledger. Do not drop the table, its tombstones, policies, or triggers. If a database-level reversal is unavoidable, restore the fresh pre-release backup/PITR point; any selective removal requires separate authorization plus proof that no transfer rows would be lost. A forward repair migration is preferred for client-schema, constraint, policy, trigger, or capacity-calculation defects.
+Rollback has two materially different phases:
+
+1. **Before any Production transfer row exists:** a schema-v3 frontend may be
+   considered only after an authoritative aggregate check proves
+   `public.transfers` is empty. Preserve every schema-v4 local raw payload first;
+   an upgraded device can still enter recovery protection.
+2. **After the first Production transfer row exists:** never deploy a frontend
+   that does not read and calculate transfers. Commit
+   `d2510646961ff51f725b2e9a3c91bf9fb740516b` predates schema v4, does not pull
+   `public.transfers`, and omits transfer effects from balances and total assets.
+   It is not an operationally safe rollback even if a clean device appears to
+   load normally.
+
+The concrete transfer-aware code-only emergency path is the tested build mode
+checked into this transfer-capable release:
+
+```powershell
+npm.cmd ci
+npm.cmd run lint
+npm.cmd test
+npm.cmd run verify:migration
+npm.cmd run build:transfer-read-only
+npm.cmd audit --audit-level=high
+```
+
+Deploy that reviewed source with build command
+`npm.cmd run build:transfer-read-only` (or build-time
+`VITE_TRANSFER_MUTATIONS_ENABLED=false`). The resulting frontend still:
+
+- accepts and preserves local schema v4;
+- pulls and validates `public.transfers` rows and tombstones;
+- preserves endpoint IDs and historical endpoint-name snapshots;
+- includes transfers in each account balance and total assets without
+  converting them into income or expense;
+- blocks transfer create/edit/delete locally and rejects normal, conditional,
+  and historical-import transfer writes remotely, leaving any pending transfer
+  operations durable for a later repaired build.
+
+Smoke the emergency artifact by loading an existing transfer (including one
+whose unchanged endpoint is archived), confirming both account balances and
+total assets, and confirming create/edit/delete controls are disabled. Do not
+drop or hide `public.transfers`, its tombstones, policies, or triggers. Do not
+clear browser storage. Preserve raw recovery exports and all cloud transfer
+rows. Prefer a reviewed forward repair when it can safely restore the normal
+write path. If database-level reversal is unavoidable, restore the fresh
+pre-release backup/PITR point; any selective removal requires separate
+authorization plus proof that no transfer rows would be lost.
 
 ## Post-rollback verification
 

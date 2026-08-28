@@ -193,6 +193,12 @@ export interface RemotePullResult {
 
 export type RemotePullResponse = readonly RemoteRecord[] | RemotePullResult;
 
+export interface HistoricalImportBatch {
+  id: string;
+  operations: readonly PendingOperation[];
+  endpointAccounts: readonly FinanceData['accounts'][number][];
+}
+
 /**
  * External persistence seam. `apply` must durably and idempotently apply by
  * `(ownerId, operation.id)` and must not overwrite a record with a higher conflict clock.
@@ -200,6 +206,14 @@ export type RemotePullResponse = readonly RemoteRecord[] | RemotePullResult;
 export interface RemoteAdapter {
   pull(ownerId: string): Promise<RemotePullResponse>;
   apply(ownerId: string, operation: PendingOperation): Promise<void>;
+  /**
+   * Atomically applies account final states and first-class historical
+   * transfers created only by an explicit import/restore workflow.
+   */
+  applyHistoricalImportBatch?(
+    ownerId: string,
+    batch: HistoricalImportBatch,
+  ): Promise<void>;
   /** Atomically replace `expected` only while its conflict clock is unchanged. */
   compareAndSwap?(
     ownerId: string,
@@ -1266,6 +1280,7 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
   record: FinanceData[E][number],
   queuedAt: string = record.updatedAt,
   batchId?: string,
+  historicalImportBatchId?: string,
 ): PersistedFinanceState {
   if (state.ownerId === 'guest') {
     throw new Error('guest state is local-only and cannot enqueue remote sync operations');
@@ -1289,7 +1304,9 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
   const existingOperation = state.outbox.find((operation) => (
     operation.entity === entity && operation.recordId === syncRecord.id
   ));
-  const effectiveBatchId = existingOperation?.batchId ?? batchId;
+  const effectiveBatchId = historicalImportBatchId
+    ? undefined
+    : existingOperation?.batchId ?? batchId;
   const nextOperation: PendingOperation = {
     id: syncRecord.lastOperationId,
     entity,
@@ -1301,7 +1318,8 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
       batchId: effectiveBatchId,
       batchBeforeRecord: existingOperation?.batchBeforeRecord
         ?? (existingRecord ? structuredClone(existingRecord) : null),
-    } : {}),
+      } : {}),
+    ...(historicalImportBatchId ? { historicalImportBatchId } : {}),
   };
 
   return {
@@ -1402,6 +1420,7 @@ export async function syncFinanceState(
         .map((entry) => [recordKey(entry.entity, entry.record.id), entry]));
       for (const [transferIndex, operation] of state.outbox.entries()) {
         if (operation.entity !== 'transfers' || operation.record.deletedAt) continue;
+        if (operation.historicalImportBatchId) continue;
         const transferKey = recordKey('transfers', operation.recordId);
         const transfer = operation.record as FinanceData['transfers'][number];
         const remoteTransferEntry = preflightByKey.get(transferKey);
@@ -1673,9 +1692,84 @@ export async function syncFinanceState(
     }
   }
 
+  const completedHistoricalImportKeys = new Set<string>();
+  const visitedHistoricalImportBatchIds = new Set<string>();
   for (const queuedOperation of state.outbox) {
     const key = recordKey(queuedOperation.entity, queuedOperation.recordId);
     const operation = preflightApplyOverrides.get(key) ?? queuedOperation;
+    if (queuedOperation.historicalImportBatchId) {
+      const batchId = queuedOperation.historicalImportBatchId;
+      if (visitedHistoricalImportBatchIds.has(batchId)) continue;
+      visitedHistoricalImportBatchIds.add(batchId);
+      const batchOperations = state.outbox.filter((candidate) => (
+        candidate.historicalImportBatchId === batchId
+      ));
+      const transferOperations = batchOperations.filter((candidate) => candidate.entity === 'transfers');
+      const endpointIds = new Set(transferOperations.flatMap((candidate) => {
+        const candidateTransfer = candidate.record as FinanceData['transfers'][number];
+        return [candidateTransfer.sourceAccountId, candidateTransfer.destinationAccountId];
+      }));
+      const endpointAccounts = state.data.accounts.filter((account) => endpointIds.has(account.id));
+      const blockedEndpointKey = [...endpointIds]
+        .map((accountId) => recordKey('accounts', accountId))
+        .find((accountKey) => unresolvedKeys.has(accountKey) || preflightBlockedReasons.has(accountKey));
+      const blockedOperation = batchOperations.find((candidate) => {
+        const candidateKey = recordKey(candidate.entity, candidate.recordId);
+        return unresolvedKeys.has(candidateKey)
+          || (preflightBlockedKeys.has(candidateKey)
+            && (!candidate.record.deletedAt || preflightBlockedReasons.has(candidateKey)));
+      });
+      const failureReason = endpointAccounts.length !== endpointIds.size
+        ? '歷史轉帳匯入批次缺少完整的端點帳戶快照。'
+        : blockedEndpointKey
+          ? `歷史轉帳匯入端點 ${blockedEndpointKey} 尚未完成衝突確認。`
+          : blockedOperation
+            ? '歷史轉帳匯入批次包含未解衝突；本次未上傳任何批次成員。'
+            : !remote.applyHistoricalImportBatch
+              ? '遠端不支援原子歷史轉帳匯入；本次未上傳任何批次成員。'
+              : undefined;
+      if (failureReason) {
+        for (const candidate of batchOperations) {
+          remaining.push({ ...candidate, lastError: failureReason });
+          failures.push({
+            stage: unresolvedKeys.has(recordKey(candidate.entity, candidate.recordId)) ? 'conflict' : 'apply',
+            message: failureReason,
+            operationId: candidate.id,
+            entity: candidate.entity,
+            recordId: candidate.recordId,
+          });
+        }
+        continue;
+      }
+      try {
+        await remote.applyHistoricalImportBatch(authenticatedOwnerId, {
+          id: batchId,
+          operations: batchOperations,
+          endpointAccounts,
+        });
+        for (const candidate of batchOperations) {
+          completedHistoricalImportKeys.add(recordKey(candidate.entity, candidate.recordId));
+        }
+        applied += batchOperations.length;
+      } catch (error) {
+        const message = errorMessage(error);
+        for (const candidate of batchOperations) {
+          remaining.push({
+            ...candidate,
+            attempts: candidate.attempts + 1,
+            lastError: message,
+          });
+          failures.push({
+            stage: 'apply',
+            message,
+            operationId: candidate.id,
+            entity: candidate.entity,
+            recordId: candidate.recordId,
+          });
+        }
+      }
+      continue;
+    }
     if (
       unresolvedKeys.has(key)
       || (queuedOperation.batchId !== undefined && unresolvedBatchIds.has(queuedOperation.batchId))
@@ -1976,7 +2070,10 @@ export async function syncFinanceState(
       finalRemaining.map((operation) => [recordKey(operation.entity, operation.recordId), operation]),
     );
     for (const operation of state.outbox) {
-      if (!operation.batchId || retainedByKey.has(recordKey(operation.entity, operation.recordId))) continue;
+      const completedAtomicWrite = operation.batchId
+        || (operation.historicalImportBatchId
+          && completedHistoricalImportKeys.has(recordKey(operation.entity, operation.recordId)));
+      if (!completedAtomicWrite || retainedByKey.has(recordKey(operation.entity, operation.recordId))) continue;
       retainedByKey.set(recordKey(operation.entity, operation.recordId), {
         ...operation,
         lastError: '批次寫入後尚未完成雲端確認；本筆將安全重試。',

@@ -53,6 +53,30 @@ afterEach(() => {
 });
 
 describe('HomeView transfer interactions', () => {
+  it('keeps historical transfers visible while disabling create, edit, and delete in emergency mode', () => {
+    const data = dataWithTwoAccounts();
+    const historical = transferFor(data);
+    data.accounts[0] = { ...data.accounts[0], isActive: false };
+    data.transfers = [historical];
+
+    render(
+      <HomeView
+        data={data}
+        ownerId="guest"
+        put={() => true}
+        deleteTransaction={() => true}
+        deleteTransfer={() => true}
+        transferMutationsEnabled={false}
+      />,
+    );
+
+    expect(screen.getByTestId('transfer-row')).toHaveTextContent('測試轉帳');
+    expect(screen.getByTestId('transfer-row')).toHaveTextContent('現金 轉至 很長的主要日常轉帳銀行帳戶');
+    expect(screen.getByRole('button', { name: '記轉帳' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /編輯轉帳/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /刪除轉帳/ })).toBeDisabled();
+  });
+
   it('requires two accounts, hides categories, and never silently chooses endpoints', async () => {
     const user = userEvent.setup();
     const data = createInitialState('guest').data;

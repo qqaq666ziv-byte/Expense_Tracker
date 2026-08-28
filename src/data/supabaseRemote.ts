@@ -14,6 +14,7 @@ import type {
   Transfer,
 } from '../domain/model';
 import type {
+  HistoricalImportBatch,
   RemoteAdapter,
   RemotePullIssue,
   RemotePullResult,
@@ -824,6 +825,79 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
         throw new Error(
           `Supabase persisted payload differs for ${operation.entity}/${operation.recordId} at columns: ${differingColumns.join(', ')}`,
         );
+      }
+    },
+
+    async applyHistoricalImportBatch(ownerId, batch: HistoricalImportBatch) {
+      await assertAuthenticatedOwner(client, ownerId);
+      if (!batch.id.startsWith('historical-import:') || batch.operations.length === 0) {
+        throw new Error('Historical import batch requires an explicit non-empty import id');
+      }
+      const operationKeys = new Set<string>();
+      for (const operation of batch.operations) {
+        validateOperation(ownerId, operation);
+        if (operation.historicalImportBatchId !== batch.id
+          || (operation.entity !== 'accounts' && operation.entity !== 'transfers')) {
+          throw new Error('Historical import batch contains an ordinary or unrelated operation');
+        }
+        const key = `${operation.entity}:${operation.recordId}`;
+        if (operationKeys.has(key)) throw new Error('Historical import batch contains duplicate operations');
+        operationKeys.add(key);
+      }
+      const endpointById = new Map(batch.endpointAccounts.map((endpoint) => {
+        if (endpoint.ownerId !== ownerId) throw new Error('Historical import endpoint owner mismatch');
+        return [endpoint.id, endpoint] as const;
+      }));
+      for (const operation of batch.operations.filter((candidate) => candidate.entity === 'transfers')) {
+        const candidate = operation.record as Transfer;
+        if (!endpointById.has(candidate.sourceAccountId)
+          || !endpointById.has(candidate.destinationAccountId)) {
+          throw new Error('Historical import endpoint manifest is incomplete');
+        }
+      }
+
+      const accountOperations = batch.operations
+        .filter((operation) => operation.entity === 'accounts')
+        .map((operation) => encodeRecord('accounts', operation.record));
+      const transferOperations = batch.operations
+        .filter((operation) => operation.entity === 'transfers')
+        .map((operation) => encodeRecord('transfers', operation.record));
+      const endpointAccounts = [...endpointById.values()]
+        .map((endpoint) => encodeRecord('accounts', endpoint));
+      const { data, error } = await client.rpc(
+        'finance_import_historical_transfer_batch' as never,
+        {
+          p_batch_id: batch.id,
+          p_account_operations: accountOperations,
+          p_endpoint_accounts: endpointAccounts,
+          p_transfer_operations: transferOperations,
+        } as never,
+      ) as unknown as {
+        data: unknown;
+        error: null | { code?: string; message?: string };
+      };
+      if (error) {
+        throw new Error(
+          `Unable to apply historical transfer import batch: ${error.code ?? 'unknown'}: ${error.message ?? 'unknown error'}`,
+        );
+      }
+      if (!Array.isArray(data)) {
+        throw new Error('Supabase historical import RPC returned an invalid confirmation payload');
+      }
+      const confirmedKeys = new Set(data.map((value) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+        const row = value as Record<string, unknown>;
+        if (typeof row.entity !== 'string' || typeof row.id !== 'string'
+          || typeof row.version !== 'number' || typeof row.last_operation_id !== 'string') return '';
+        const expected = batch.operations.find((operation) => (
+          operation.entity === row.entity && operation.recordId === row.id
+        ));
+        if (!expected || expected.record.version !== row.version || expected.id !== row.last_operation_id) return '';
+        return `${row.entity}:${row.id}`;
+      }));
+      if (confirmedKeys.has('') || confirmedKeys.size !== batch.operations.length
+        || [...operationKeys].some((key) => !confirmedKeys.has(key))) {
+        throw new Error('Supabase historical import RPC did not confirm every requested conflict clock');
       }
     },
 

@@ -232,6 +232,8 @@ class FakeSupabaseClient {
     details?: string;
     hint?: string;
   } | null;
+  rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  rpcResponse?: { data: unknown; error: null | { code: string; message: string } };
 
   constructor(ownerId = 'user-a') {
     this.auth = {
@@ -303,6 +305,11 @@ class FakeSupabaseClient {
     };
     return builder;
   }
+
+  async rpc(fn: string, args: Record<string, unknown>) {
+    this.rpcCalls.push({ fn, args });
+    return this.rpcResponse ?? { data: [], error: null };
+  }
 }
 
 function asSupabaseClient(client: FakeSupabaseClient): SupabaseClient {
@@ -310,6 +317,67 @@ function asSupabaseClient(client: FakeSupabaseClient): SupabaseClient {
 }
 
 describe('Supabase remote adapter', () => {
+  it('uses the dedicated RPC for an explicitly marked historical transfer import batch', async () => {
+    const client = new FakeSupabaseClient();
+    const source = account({ id: 'bank', name: '主要銀行', isActive: false });
+    const destination = account({ id: 'cash', name: '現金' });
+    const historical: Transfer = {
+      id: 'historical-transfer', ownerId: 'user-a', version: 1,
+      updatedAt: NOW, lastOperationId: 'historical-transfer-op',
+      amount: 250, sourceAccountId: source.id, sourceAccountName: '舊銀行名',
+      destinationAccountId: destination.id, destinationAccountName: destination.name,
+      occurredAt: '2026-08-20 08:00',
+    };
+    const transferPending: PendingOperation = {
+      id: historical.lastOperationId,
+      entity: 'transfers',
+      recordId: historical.id,
+      record: historical,
+      attempts: 0,
+      queuedAt: NOW,
+    };
+    const operations: PendingOperation[] = [
+      operation(source),
+      operation(destination),
+      transferPending,
+    ].map((pending) => ({
+      ...pending,
+      historicalImportBatchId: 'historical-import:restore-1',
+    }));
+    client.rpcResponse = {
+      data: operations.map((pending) => ({
+        entity: pending.entity,
+        id: pending.recordId,
+        version: pending.record.version,
+        last_operation_id: pending.id,
+      })),
+      error: null,
+    };
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    await remote.applyHistoricalImportBatch!('user-a', {
+      id: 'historical-import:restore-1',
+      operations,
+      endpointAccounts: [source, destination],
+    });
+
+    expect(client.rpcCalls).toEqual([expect.objectContaining({
+      fn: 'finance_import_historical_transfer_batch',
+      args: expect.objectContaining({
+        p_batch_id: 'historical-import:restore-1',
+        p_account_operations: expect.arrayContaining([
+          expect.objectContaining({ id: 'bank', is_active: false, user_id: 'user-a' }),
+        ]),
+        p_endpoint_accounts: expect.arrayContaining([
+          expect.objectContaining({ id: 'bank', name: '主要銀行', user_id: 'user-a' }),
+        ]),
+        p_transfer_operations: [expect.objectContaining({
+          id: 'historical-transfer', source_account_name: '舊銀行名', user_id: 'user-a',
+        })],
+      }),
+    })]);
+  });
+
   it('encodes and decodes one first-class transfer without paired transactions', async () => {
     const client = new FakeSupabaseClient();
     client.tables.set('accounts', [

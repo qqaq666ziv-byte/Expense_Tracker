@@ -154,6 +154,12 @@ export interface PendingOperation {
    * created the record. Used only for conflict-safe remote compensation.
    */
   batchBeforeRecord?: FinanceData[FinanceEntityName][number] | null;
+  /**
+   * Created only by an explicit guest import or JSON restore. Account and
+   * transfer members sharing this id are committed by the dedicated atomic
+   * historical-import server path, never by an ordinary table upsert.
+   */
+  historicalImportBatchId?: string;
   lastError?: string;
 }
 

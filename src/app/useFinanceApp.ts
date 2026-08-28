@@ -50,6 +50,12 @@ import {
   tombstoneRecordMeta,
 } from './state';
 import { assertCategoryUpsert, type CategoryAction } from '../domain/lifecycle';
+import {
+  assertTransferCollectionMutationAllowed,
+  assertTransferMutationAllowed,
+  createTransferReadOnlyRemoteAdapter,
+  TRANSFER_MUTATIONS_ENABLED,
+} from './transferMutationPolicy';
 
 export interface FinanceAppController {
   state: PersistedFinanceState;
@@ -61,6 +67,7 @@ export interface FinanceAppController {
   unresolvedSyncRecordKeys: ReadonlySet<string>;
   mutationLockedRecordKeys: ReadonlySet<string>;
   transferDependencyConflictIds: ReadonlySet<string>;
+  transferMutationsEnabled: boolean;
   conflictResolutionImpact: ReadonlyMap<string, number>;
   storageError?: string;
   storageRecovery?: LocalStateRecovery;
@@ -511,7 +518,12 @@ export function useFinanceApp(): FinanceAppController {
         started,
         ownerId,
         storageRecoveryRef.current,
-        () => createSupabaseRemoteAdapter(supabase),
+        () => {
+          const remote = createSupabaseRemoteAdapter(supabase);
+          return TRANSFER_MUTATIONS_ENABLED
+            ? remote
+            : createTransferReadOnlyRemoteAdapter(remote);
+        },
       );
       if (!result) return;
       if (ownerGenerationRef.current !== generation || activeOwnerRef.current !== ownerId) return;
@@ -580,6 +592,7 @@ export function useFinanceApp(): FinanceAppController {
     }
     try {
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertTransferMutationAllowed(entity, TRANSFER_MUTATIONS_ENABLED);
       assertSyncRecordMutationsAllowed(
         stateRef.current,
         syncMutationTargets(stateRef.current, entity, record),
@@ -607,6 +620,7 @@ export function useFinanceApp(): FinanceAppController {
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertTransferMutationAllowed('transfers', TRANSFER_MUTATIONS_ENABLED);
       if (stateRef.current.legacyBootstrap?.status === 'pending' || stateRef.current.initialBootstrap) {
         throw new Error('雲端帳本尚在安全讀取；完成前無法重新確認轉帳帳戶。');
       }
@@ -734,6 +748,7 @@ export function useFinanceApp(): FinanceAppController {
     }
     try {
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertTransferMutationAllowed(entity, TRANSFER_MUTATIONS_ENABLED);
       assertSyncRecordMutationsAllowed(
         stateRef.current,
         syncMutationTargets(stateRef.current, entity, record),
@@ -770,6 +785,11 @@ export function useFinanceApp(): FinanceAppController {
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertTransferCollectionMutationAllowed(
+        stateRef.current.data.transfers,
+        data.transfers,
+        TRANSFER_MUTATIONS_ENABLED,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setSafetyNotice(message);
@@ -945,6 +965,10 @@ export function useFinanceApp(): FinanceAppController {
       return;
     }
     const imported = remapOwner(loadedGuest.state.data, stateRef.current.ownerId);
+    if (!TRANSFER_MUTATIONS_ENABLED && imported.transfers.length > 0) {
+      setGuestImportNotice('緊急 transfer read-only 模式下不會匯入新轉帳；訪客快照仍保持不變。');
+      return;
+    }
     const plan = planGuestImport(stateRef.current, imported);
     if (plan.conflicts.length > 0) {
       setGuestImportNotice(`訪客匯入已中止：${plan.conflicts.length} 筆同來源資料在兩邊內容不同，本次未修改任何帳號資料，也未把此快照標記為已處理。請先下載兩邊 JSON 備份，再選擇保持分離或以備份還原流程明確合併。`);
@@ -1081,6 +1105,7 @@ export function useFinanceApp(): FinanceAppController {
     unresolvedSyncRecordKeys,
     mutationLockedRecordKeys,
     transferDependencyConflictIds,
+    transferMutationsEnabled: TRANSFER_MUTATIONS_ENABLED,
     conflictResolutionImpact,
     storageError,
     storageRecovery,

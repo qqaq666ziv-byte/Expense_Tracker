@@ -798,6 +798,44 @@ describe('owner-scoped local state', () => {
     expect(repeated.skippedCount).toBeGreaterThan(0);
   });
 
+  it('marks guest-imported accounts and historical transfers as one explicit server batch', () => {
+    const guest = createInitialState('guest').data;
+    const source = { ...guest.accounts[0], isActive: false };
+    const destination = {
+      ...guest.accounts[0],
+      id: 'guest-cash',
+      name: '現金',
+      lastOperationId: 'guest-cash-create',
+      isActive: true,
+      deletedAt: undefined,
+    };
+    guest.accounts = [source, destination];
+    guest.transfers = [{
+      ...newRecordForTest('guest-history-transfer', 'guest'),
+      amount: 250,
+      sourceAccountId: source.id,
+      sourceAccountName: source.name,
+      destinationAccountId: destination.id,
+      destinationAccountName: destination.name,
+      occurredAt: '2026-08-20 08:00',
+    }];
+
+    const imported = planGuestImport(
+      readyAuthenticatedState(),
+      remapOwner(guest, 'user-a'),
+    ).state;
+    const accountAndTransferOperations = imported.outbox.filter((operation) => (
+      operation.entity === 'accounts' || operation.entity === 'transfers'
+    ));
+    const importBatchIds = new Set(accountAndTransferOperations.map((operation) => (
+      (operation as typeof operation & { historicalImportBatchId?: string }).historicalImportBatchId
+    )));
+
+    expect(accountAndTransferOperations.some((operation) => operation.entity === 'transfers')).toBe(true);
+    expect(importBatchIds.size).toBe(1);
+    expect([...importBatchIds][0]).toMatch(/^historical-import:/);
+  });
+
   it('never remembers a guest import when its owner snapshot could not be persisted', () => {
     const imported = planGuestImport(
       readyAuthenticatedState(),

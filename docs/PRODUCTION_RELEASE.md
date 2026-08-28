@@ -183,14 +183,42 @@ an explicit migration/recovery rule and appropriate authorization.
 Frontend rollback and database rollback are separate operations.
 
 A frontend regression may be mitigated by restoring a previously verified
-Vercel deployment while leaving additive database schema changes intact.
+Vercel deployment while leaving additive database schema changes intact, but
+the safe target changes permanently after first-class transfer data exists:
 
-If the rollback crosses from the schema-v4 local-state client to schema v3,
-the older client may enter recovery protection even though it preserves the
-raw local payload and the cloud still retains every row. Do not clear browser
-storage or drop the transfer table/tombstones to make the old client start.
-Preserve a raw recovery export and prefer a reviewed forward repair when it is
-safer than making the older client reinterpret the newer ledger.
+- Before the first Production `public.transfers` row exists, a schema-v3
+  frontend may be considered only after confirming the table is empty and
+  preserving every schema-v4 local raw recovery payload. An upgraded browser
+  can still enter recovery protection.
+- After the first Production transfer row exists, never deploy a frontend that
+  does not pull, validate, display, and calculate transfer rows. In particular,
+  pre-transfer commit `d2510646961ff51f725b2e9a3c91bf9fb740516b` is not an
+  operationally safe rollback target: a clean device can appear healthy while
+  omitting cloud transfers from account balances and total assets.
+
+The repository contains a tested transfer-aware emergency frontend mode. From
+the reviewed transfer-capable release commit, run:
+
+```powershell
+npm.cmd ci
+npm.cmd run build:transfer-read-only
+npm.cmd run preview -- --host 127.0.0.1
+```
+
+`build:transfer-read-only` uses Vite mode `transfer-read-only`. It retains local
+schema v4, transfer pulls/validation, historical snapshots, tombstones, account
+balances, and total-assets calculations, while disabling transfer
+create/edit/delete in the UI and rejecting transfer writes (including queued
+historical-import batches) at the remote-adapter boundary. Non-transfer reads
+and writes continue normally. For a hosted emergency build, configure the
+deployment build command as `npm.cmd run build:transfer-read-only`, or set
+`VITE_TRANSFER_MUTATIONS_ENABLED=false` for the build. Verify the served bundle
+and canonical deployment before routing users to it.
+
+Do not clear browser storage or drop/hide the transfer table or tombstones to
+make an older client start. Preserve a raw recovery export and every cloud
+transfer row. Prefer a reviewed forward repair whenever it can restore the
+normal write path without increasing recovery risk.
 
 Do not reverse production database migrations merely because the frontend
 requires rollback unless database rollback is independently justified and safe.
