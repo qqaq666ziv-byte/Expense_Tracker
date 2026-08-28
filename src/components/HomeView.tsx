@@ -30,7 +30,7 @@ import {
 } from "../app/tutorial";
 import { FinanceIcon } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
-import { syncRecordKey } from "../domain/syncEngine";
+import { differingSyncRecordFields, syncRecordKey } from "../domain/syncEngine";
 import { buildTransferRecord } from "../domain/transfer";
 import { isEditorSnapshotStale } from "../domain/staleEditor";
 import {
@@ -416,8 +416,23 @@ function OwnerScopedHomeView({
       }
       return;
     }
-    if (editing && unresolvedSyncRecordKeys.has(syncRecordKey("transactions", editing.id))) {
-      setError("這筆交易有未解同步衝突；請先選擇雲端版本，本次修改未執行。");
+    const currentTransaction = editing
+      ? data.transactions.find((record) => record.id === editing.id)
+      : undefined;
+    const transactionPayloadChanged = Boolean(
+      editing
+      && currentTransaction
+      && differingSyncRecordFields("transactions", editing, currentTransaction).length > 0,
+    );
+    if (editing && (
+      transactionPayloadChanged
+      || isEditorSnapshotStale(editing, currentTransaction, {
+        hasUnresolvedConflict: unresolvedSyncRecordKeys.has(
+          syncRecordKey("transactions", editing.id),
+        ),
+      })
+    )) {
+      setError("這筆交易已在背景更新、刪除或發生同步衝突；請重新開啟編輯。");
       return;
     }
     if (quickReentryParents) {
@@ -470,10 +485,10 @@ function OwnerScopedHomeView({
     const creatingTutorial = tutorial?.step === "create" && !editing;
     const tutorialNote = editingTutorial || creatingTutorial;
 
-    const record: Transaction = editing
+    const record: Transaction = editing && currentTransaction
       ? {
-          ...editing,
-          ...changedRecordMeta(editing),
+          ...currentTransaction,
+          ...changedRecordMeta(currentTransaction),
           amount: numericAmount,
           type,
           categoryId: category.id,
