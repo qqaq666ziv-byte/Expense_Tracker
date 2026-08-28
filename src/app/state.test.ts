@@ -992,6 +992,183 @@ describe('owner-scoped local state', () => {
     expect(result.lastSyncedAt).toBe('2026-08-21T10:00:00.000Z');
   });
 
+  it('keeps one complete authoritative bootstrap snapshot across same-owner contexts', () => {
+    const started = createInitialState('user-a');
+    const remoteBase = structuredClone(started.initialBootstrap!.candidate);
+    const account = remoteBase.accounts[0];
+    const category = remoteBase.categories.find((item) => item.kind === 'expense')!;
+    const durableR1 = {
+      ...started,
+      data: {
+        ...remoteBase,
+        accounts: remoteBase.accounts.map((item) => item.id === account.id ? {
+          ...item,
+          name: 'Authoritative R1',
+          version: 2,
+          lastOperationId: 'remote-r1-account',
+        } : item),
+      },
+      initialBootstrap: undefined,
+      lastSyncedAt: '2026-08-28T12:00:00.000Z',
+    };
+    const remoteR2 = {
+      ...started,
+      data: {
+        ...remoteBase,
+        accounts: remoteBase.accounts.map((item) => item.id === account.id ? {
+          ...item,
+          name: 'Authoritative R2',
+          version: 3,
+          lastOperationId: 'remote-r2-account',
+        } : item),
+        transactions: [{
+          ...newRecordForTest('remote-r2-independent', 'user-a'),
+          amount: 80,
+          type: 'expense' as const,
+          accountId: account.id,
+          accountName: account.name,
+          categoryId: category.id,
+          categoryName: category.name,
+          occurredAt: '2026-08-28 20:00',
+        }],
+      },
+      initialBootstrap: undefined,
+      lastSyncedAt: '2026-08-28T12:00:01.000Z',
+    };
+
+    const result = applySyncCompletion(started, durableR1, remoteR2, 'user-a');
+
+    expect(result).toEqual(durableR1);
+  });
+
+  it('preserves a durable seeding lifecycle when another bootstrap completion arrives', () => {
+    const started = createInitialState('user-a');
+    const candidate = structuredClone(started.initialBootstrap!.candidate);
+    const account = candidate.accounts[0];
+    const durableSeeding = {
+      ...started,
+      data: candidate,
+      outbox: [{
+        id: account.lastOperationId,
+        entity: 'accounts' as const,
+        recordId: account.id,
+        record: account,
+        attempts: 1,
+        queuedAt: account.updatedAt,
+      }],
+      initialBootstrap: {
+        ...started.initialBootstrap!,
+        status: 'seeding' as const,
+        pendingOperations: [],
+      },
+    };
+    const completedElsewhere = {
+      ...durableSeeding,
+      outbox: [],
+      initialBootstrap: undefined,
+      lastSyncedAt: '2026-08-28T12:00:02.000Z',
+    };
+
+    const result = applySyncCompletion(started, durableSeeding, completedElsewhere, 'user-a');
+
+    expect(result).toEqual(durableSeeding);
+  });
+
+  it('accepts a successful bootstrap after another context only persisted failure metadata', () => {
+    const started = createInitialState('user-a');
+    const failedElsewhere = {
+      ...started,
+      lastSyncError: 'Temporary authoritative pull failure',
+    };
+    const successful = {
+      ...started,
+      data: structuredClone(started.initialBootstrap!.candidate),
+      initialBootstrap: undefined,
+      lastSyncedAt: '2026-08-28T12:00:04.000Z',
+      lastSyncError: undefined,
+    };
+
+    const result = applySyncCompletion(started, failedElsewhere, successful, 'user-a');
+
+    expect(result).toEqual(successful);
+  });
+
+  it('does not let an older same-owner sync completion overwrite a newer conflict clock', () => {
+    const started = readyAuthenticatedState();
+    const account = started.data.accounts[0];
+    const category = started.data.categories.find((item) => item.kind === 'expense')!;
+    const durableOlder = {
+      ...started,
+      data: {
+        ...started.data,
+        accounts: started.data.accounts.map((item) => item.id === account.id ? {
+          ...item,
+          name: 'Remote version 2',
+          version: 2,
+          lastOperationId: 'remote-account-v2',
+        } : item),
+      },
+      lastSyncedAt: '2026-08-28T12:00:00.000Z',
+    };
+    const syncedNewer = {
+      ...started,
+      data: {
+        ...started.data,
+        accounts: started.data.accounts.map((item) => item.id === account.id ? {
+          ...item,
+          name: 'Remote version 3',
+          version: 3,
+          lastOperationId: 'remote-account-v3',
+        } : item),
+        transactions: [{
+          ...newRecordForTest('remote-version-3-transaction', 'user-a'),
+          amount: 120,
+          type: 'expense' as const,
+          accountId: account.id,
+          accountName: account.name,
+          categoryId: category.id,
+          categoryName: category.name,
+          occurredAt: '2026-08-28 20:05',
+        }],
+      },
+      lastSyncedAt: '2026-08-28T12:00:01.000Z',
+    };
+
+    const result = mergeConcurrentSync(started, durableOlder, syncedNewer);
+
+    expect(result).toEqual(syncedNewer);
+  });
+
+  it('still replays a durable pending local edit over a higher remote conflict clock', () => {
+    const started = readyAuthenticatedState();
+    const account = started.data.accounts[0];
+    const localAccount = {
+      ...account,
+      name: 'Pending local edit',
+      version: 2,
+      lastOperationId: 'local-account-v2',
+    };
+    const latest = putRecord(started, 'accounts', localAccount);
+    const synced = {
+      ...started,
+      data: {
+        ...started.data,
+        accounts: started.data.accounts.map((item) => item.id === account.id ? {
+          ...item,
+          name: 'Remote version 3',
+          version: 3,
+          lastOperationId: 'remote-account-v3',
+        } : item),
+      },
+      lastSyncedAt: '2026-08-28T12:00:03.000Z',
+    };
+
+    const result = mergeConcurrentSync(started, latest, synced);
+
+    expect(result.data.accounts.find((item) => item.id === account.id)).toEqual(localAccount);
+    expect(result.outbox).toEqual(latest.outbox);
+  });
+
   it('rejects a delayed sync completion after switching from user A to guest or user B', () => {
     const started = readyAuthenticatedState();
     const synced = { ...started, outbox: [], lastSyncedAt: '2026-08-21T10:00:00.000Z' };
