@@ -14,7 +14,12 @@ import type {
   Transaction,
   Transfer,
 } from '../domain/model';
-import { activeOperationId, enqueueSyncRecord } from '../domain/syncEngine';
+import {
+  activeOperationId,
+  compareSyncRecords,
+  enqueueSyncRecord,
+  type SyncEntityRecord,
+} from '../domain/syncEngine';
 import { migrateLegacyData, stableLegacyId } from '../domain/legacyMigration';
 import { validateFinanceData } from '../domain/backup';
 import { isTutorialTransaction } from '../domain/tutorialRecord';
@@ -1285,6 +1290,13 @@ export function mergeConcurrentSync(
   if (started.ownerId !== latest.ownerId || latest.ownerId !== synced.ownerId) {
     throw new Error('Cannot merge concurrent sync snapshots for different owners');
   }
+  const operationKey = (operation: PersistedFinanceState['outbox'][number]) => `${operation.entity}:${operation.recordId}`;
+  const startedByRecord = new Map(started.outbox.map((operation) => [operationKey(operation), operation]));
+  const concurrentOperations = new Map(latest.outbox.flatMap((operation) => {
+    const key = operationKey(operation);
+    const atStart = startedByRecord.get(key);
+    return !atStart || atStart.id !== operation.id ? [[key, operation] as const] : [];
+  }));
   let data = structuredClone(synced.data);
   for (const entity of entityNames) {
     const startedById = new Map((started.data[entity] as SyncRecord[]).map((record) => [record.id, record]));
@@ -1302,6 +1314,13 @@ export function mergeConcurrentSync(
         indexById.set(record.id, merged.length);
         merged.push(structuredClone(record));
       } else {
+        const concurrentOperation = concurrentOperations.get(`${entity}:${record.id}`);
+        const isPendingLocalWinner = concurrentOperation?.record.lastOperationId === record.lastOperationId
+          && concurrentOperation.record.version === record.version;
+        if (!isPendingLocalWinner && compareSyncRecords(
+          record as SyncEntityRecord,
+          merged[index] as SyncEntityRecord,
+        ) <= 0) continue;
         merged[index] = structuredClone(record);
       }
     }
@@ -1311,12 +1330,9 @@ export function mergeConcurrentSync(
     data.settings = structuredClone(latest.data.settings);
   }
 
-  const operationKey = (operation: PersistedFinanceState['outbox'][number]) => `${operation.entity}:${operation.recordId}`;
-  const startedByRecord = new Map(started.outbox.map((operation) => [operationKey(operation), operation]));
   const combined = new Map(synced.outbox.map((operation) => [operationKey(operation), operation]));
-  for (const operation of latest.outbox) {
-    const atStart = startedByRecord.get(operationKey(operation));
-    if (!atStart || atStart.id !== operation.id) combined.set(operationKey(operation), structuredClone(operation));
+  for (const [key, operation] of concurrentOperations) {
+    combined.set(key, structuredClone(operation));
   }
   return { ...synced, data, outbox: [...combined.values()] };
 }
@@ -1333,5 +1349,33 @@ export function applySyncCompletion(
     || synced.ownerId !== activeOwnerId) {
     return latest;
   }
+  const authoritativeBootstrapInFlight = started.initialBootstrap !== undefined
+    || started.legacyBootstrap?.status === 'pending';
+  if (authoritativeBootstrapInFlight
+    && bootstrapDurableContent(latest) !== bootstrapDurableContent(started)) {
+    // Another same-owner context already advanced the durable bootstrap. Keep
+    // that complete winner instead of mixing it record-by-record with this
+    // independently authoritative response.
+    return latest;
+  }
   return mergeConcurrentSync(started, latest, synced);
+}
+
+function bootstrapDurableContent(state: PersistedFinanceState): string {
+  const operationContent = ({
+    attempts: _attempts,
+    lastError: _lastError,
+    ...operation
+  }: PendingOperation) => operation;
+  return JSON.stringify({
+    data: state.data,
+    outbox: state.outbox.map(operationContent),
+    unresolvedSyncRecordKeys: state.unresolvedSyncRecordKeys,
+    migratedFromLegacy: state.migratedFromLegacy,
+    legacyBootstrap: state.legacyBootstrap,
+    initialBootstrap: state.initialBootstrap === undefined ? undefined : {
+      ...state.initialBootstrap,
+      pendingOperations: state.initialBootstrap.pendingOperations.map(operationContent),
+    },
+  });
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AssetAccount, PendingOperation, Transfer } from '../domain/model';
-import type { RemoteAdapter } from '../domain/syncEngine';
+import { syncFinanceState, type RemoteAdapter } from '../domain/syncEngine';
 import { calculateFinancials } from '../domain/financeEngine';
 import { createInitialState, loadFinanceStateWithRecovery, saveFinanceState } from './state';
 import {
@@ -69,6 +69,29 @@ describe('transfer-aware emergency mode', () => {
       pending('transfers'),
     )).rejects.toThrow(/read-only/i);
     expect(apply).toHaveBeenCalledOnce();
+  });
+
+  it('preserves authoritative pull options through the configured read-only sync path', async () => {
+    const initial = createInitialState('user-a');
+    const pull = vi.fn<RemoteAdapter['pull']>(async () => ([{
+      entity: 'accounts',
+      record: initial.data.accounts[0],
+    }]));
+    const remote: RemoteAdapter = {
+      pull,
+      apply: vi.fn(async () => undefined),
+    };
+
+    await syncFinanceState(
+      initial,
+      'user-a',
+      createTransferReadOnlyRemoteAdapter(remote),
+    );
+
+    expect(pull.mock.calls[0]).toEqual([
+      'user-a',
+      { consistency: 'authoritative' },
+    ]);
   });
 
   it('fails closed at the local mutation guard for transfer create, edit, and delete', () => {

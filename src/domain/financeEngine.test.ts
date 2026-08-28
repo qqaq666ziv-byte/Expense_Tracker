@@ -114,8 +114,8 @@ describe('finance engine', () => {
   it.each([
     { sourceIncluded: true, destinationIncluded: true, expectedTotal: 1_500 },
     { sourceIncluded: false, destinationIncluded: false, expectedTotal: 0 },
-    { sourceIncluded: true, destinationIncluded: false, expectedTotal: 900 },
-    { sourceIncluded: false, destinationIncluded: true, expectedTotal: 600 },
+    { sourceIncluded: true, destinationIncluded: false, expectedTotal: 999.99 },
+    { sourceIncluded: false, destinationIncluded: true, expectedTotal: 500.01 },
   ])(
     'moves one transfer atomically across account balances and total-assets boundaries',
     ({ sourceIncluded, destinationIncluded, expectedTotal }) => {
@@ -126,7 +126,7 @@ describe('finance engine', () => {
           { ...baseData.accounts[1], includeInTotalAssets: destinationIncluded },
         ],
         transfers: [{
-          id: 'transfer-cash-to-jko', ownerId: 'guest', amount: 100,
+          id: 'transfer-cash-to-jko', ownerId: 'guest', amount: 0.005,
           sourceAccountId: 'cash', sourceAccountName: '現金',
           destinationAccountId: 'jkopay', destinationAccountName: '街口支付',
           occurredAt: '2026-08-21 10:00', note: '補充電子錢包', version: 1,
@@ -141,8 +141,8 @@ describe('finance engine', () => {
 
       expect(financials.accountBalances.map(({ accountId, balance }) => ({ accountId, balance })))
         .toEqual([
-          { accountId: 'cash', balance: 900 },
-          { accountId: 'jkopay', balance: 600 },
+          { accountId: 'cash', balance: 999.99 },
+          { accountId: 'jkopay', balance: 500.01 },
         ]);
       expect(financials.totalAssets).toBe(expectedTotal);
       expect(financials.allTime).toMatchObject({ income: 0, expense: 0, net: 0, expenseByCategory: [] });
@@ -156,6 +156,183 @@ describe('finance engine', () => {
       ]);
     },
   );
+
+  it('keeps transaction and adjustment midpoint effects independently observable', () => {
+    const includedAccount = {
+      ...baseData.accounts[0],
+      openingBalance: 0.005,
+    };
+    const excludedAccount = {
+      ...baseData.accounts[1],
+      openingBalance: 500.005,
+      includeInTotalAssets: false,
+    };
+    const incomeCategory = {
+      ...baseData.categories[0],
+      id: 'salary',
+      kind: 'income' as const,
+      name: '薪資',
+    };
+    const transactionData: FinanceData = {
+      ...baseData,
+      accounts: [includedAccount, excludedAccount],
+      categories: [...baseData.categories, incomeCategory],
+      transactions: [{
+        id: 'midpoint-income', ownerId: 'guest', amount: 0.005, type: 'income',
+        categoryId: incomeCategory.id, categoryName: incomeCategory.name,
+        accountId: includedAccount.id, accountName: includedAccount.name,
+        occurredAt: '2026-08-21 08:00', version: 1,
+        updatedAt: '2026-08-21T08:00:00.000Z', lastOperationId: 'midpoint-income',
+      }, {
+        id: 'tutorial-expense', ownerId: 'guest', amount: 500.005, type: 'expense',
+        categoryId: 'food', categoryName: '餐飲', note: TUTORIAL_RECORD_NOTE,
+        accountId: includedAccount.id, accountName: includedAccount.name,
+        occurredAt: '2026-08-21 08:01', version: 1,
+        updatedAt: '2026-08-21T08:01:00.000Z', lastOperationId: 'tutorial-expense',
+      }, {
+        id: 'excluded-income', ownerId: 'guest', amount: 500.005, type: 'income',
+        categoryId: incomeCategory.id, categoryName: incomeCategory.name,
+        accountId: excludedAccount.id, accountName: excludedAccount.name,
+        occurredAt: '2026-08-21 08:02', version: 1,
+        updatedAt: '2026-08-21T08:02:00.000Z', lastOperationId: 'excluded-income',
+      }],
+    };
+
+    expect(calculateFinancials(transactionData).totalAssets).toBe(0.02);
+
+    const adjustmentData: FinanceData = {
+      ...baseData,
+      accounts: [
+        { ...includedAccount, openingBalance: 0.02 },
+        excludedAccount,
+      ],
+      adjustments: [{
+        id: 'negative-midpoint-adjustment', ownerId: 'guest',
+        accountId: includedAccount.id, amountDelta: -0.005,
+        occurredAt: '2026-08-21 08:03', version: 1,
+        updatedAt: '2026-08-21T08:03:00.000Z', lastOperationId: 'negative-adjustment',
+      }, {
+        id: 'excluded-adjustment', ownerId: 'guest',
+        accountId: excludedAccount.id, amountDelta: 500.005,
+        occurredAt: '2026-08-21 08:04', version: 1,
+        updatedAt: '2026-08-21T08:04:00.000Z', lastOperationId: 'excluded-adjustment',
+      }],
+    };
+
+    expect(calculateFinancials(adjustmentData).totalAssets).toBe(0.01);
+  });
+
+  it('rounds every legacy monetary input before transfer-aware asset arithmetic', () => {
+    const includedSource = {
+      ...baseData.accounts[0],
+      openingBalance: 0.005,
+    };
+    const includedDestination = {
+      ...baseData.accounts[1],
+      openingBalance: 0.005,
+    };
+    const excludedSource = {
+      ...baseData.accounts[0],
+      id: 'excluded-source',
+      name: '排除來源',
+      openingBalance: 1_000.005,
+      includeInTotalAssets: false,
+    };
+    const excludedDestination = {
+      ...baseData.accounts[0],
+      id: 'excluded-destination',
+      name: '排除目的',
+      openingBalance: -0.005,
+      includeInTotalAssets: false,
+    };
+    const incomeCategory = {
+      ...baseData.categories[0],
+      id: 'salary',
+      kind: 'income' as const,
+      name: '薪資',
+    };
+    const data: FinanceData = {
+      ...baseData,
+      accounts: [
+        includedSource,
+        includedDestination,
+        excludedSource,
+        excludedDestination,
+      ],
+      categories: [...baseData.categories, incomeCategory],
+      transactions: [{
+        id: 'midpoint-income', ownerId: 'guest', amount: 0.005, type: 'income',
+        categoryId: incomeCategory.id, categoryName: incomeCategory.name,
+        accountId: includedSource.id, accountName: includedSource.name,
+        occurredAt: '2026-08-21 08:00', version: 1,
+        updatedAt: '2026-08-21T08:00:00.000Z', lastOperationId: 'midpoint-income',
+      }, {
+        id: 'midpoint-expense', ownerId: 'guest', amount: 0.005, type: 'expense',
+        categoryId: 'food', categoryName: '餐飲',
+        accountId: includedDestination.id, accountName: includedDestination.name,
+        occurredAt: '2026-08-21 08:01', version: 1,
+        updatedAt: '2026-08-21T08:01:00.000Z', lastOperationId: 'midpoint-expense',
+      }, {
+        id: 'excluded-income', ownerId: 'guest', amount: 500.005, type: 'income',
+        categoryId: incomeCategory.id, categoryName: incomeCategory.name,
+        accountId: excludedSource.id, accountName: excludedSource.name,
+        occurredAt: '2026-08-21 08:02', version: 1,
+        updatedAt: '2026-08-21T08:02:00.000Z', lastOperationId: 'excluded-income',
+      }],
+      adjustments: [{
+        id: 'positive-midpoint-adjustment', ownerId: 'guest',
+        accountId: includedSource.id, amountDelta: 0.005,
+        occurredAt: '2026-08-21 08:03', version: 1,
+        updatedAt: '2026-08-21T08:03:00.000Z', lastOperationId: 'positive-adjustment',
+      }, {
+        id: 'negative-midpoint-adjustment', ownerId: 'guest',
+        accountId: includedDestination.id, amountDelta: -0.005,
+        occurredAt: '2026-08-21 08:04', version: 1,
+        updatedAt: '2026-08-21T08:04:00.000Z', lastOperationId: 'negative-adjustment',
+      }, {
+        id: 'excluded-adjustment', ownerId: 'guest',
+        accountId: excludedDestination.id, amountDelta: 500.005,
+        occurredAt: '2026-08-21 08:05', version: 1,
+        updatedAt: '2026-08-21T08:05:00.000Z', lastOperationId: 'excluded-adjustment',
+      }],
+      transfers: [{
+        id: 'included-to-excluded', ownerId: 'guest', amount: 0.005,
+        sourceAccountId: includedSource.id, sourceAccountName: includedSource.name,
+        destinationAccountId: excludedDestination.id, destinationAccountName: excludedDestination.name,
+        occurredAt: '2026-08-21 08:06', version: 1,
+        updatedAt: '2026-08-21T08:06:00.000Z', lastOperationId: 'included-to-excluded',
+      }, {
+        id: 'excluded-to-included', ownerId: 'guest', amount: 0.005,
+        sourceAccountId: excludedSource.id, sourceAccountName: excludedSource.name,
+        destinationAccountId: includedDestination.id, destinationAccountName: includedDestination.name,
+        occurredAt: '2026-08-21 08:07', version: 1,
+        updatedAt: '2026-08-21T08:07:00.000Z', lastOperationId: 'excluded-to-included',
+      }, {
+        id: 'included-to-included', ownerId: 'guest', amount: 0.005,
+        sourceAccountId: includedSource.id, sourceAccountName: includedSource.name,
+        destinationAccountId: includedDestination.id, destinationAccountName: includedDestination.name,
+        occurredAt: '2026-08-21 08:08', version: 1,
+        updatedAt: '2026-08-21T08:08:00.000Z', lastOperationId: 'included-to-included',
+      }, {
+        id: 'excluded-to-excluded', ownerId: 'guest', amount: 0.005,
+        sourceAccountId: excludedSource.id, sourceAccountName: excludedSource.name,
+        destinationAccountId: excludedDestination.id, destinationAccountName: excludedDestination.name,
+        occurredAt: '2026-08-21 08:09', version: 1,
+        updatedAt: '2026-08-21T08:09:00.000Z', lastOperationId: 'excluded-to-excluded',
+      }],
+      allocations: [{
+        id: 'midpoint-allocation', ownerId: 'guest', goalId: 'goal', amountDelta: 0.005,
+        occurredAt: '2026-08-21 08:10', version: 1,
+        updatedAt: '2026-08-21T08:10:00.000Z', lastOperationId: 'midpoint-allocation',
+      }],
+    };
+
+    expect(calculateFinancials(data)).toMatchObject({
+      totalAssets: 0.02,
+      allocatedSavings: 0.01,
+      availableAssets: 0.01,
+    });
+  });
 
   it('reverses the prior transfer effect exactly once on edit and tombstone deletion', () => {
     const original = {
