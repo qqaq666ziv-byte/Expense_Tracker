@@ -34,7 +34,7 @@ For `finance_resource_abuse_guards`, the pre-release aggregate-only preflight re
 
 The completed transfer release applied `20260824023801_finance_resource_abuse_guards.sql` before `20260828013341_finance_account_transfers.sql`, released the transfer-capable frontend, and released the reviewed `finance-import-historical-transfer-batch` Edge Function. Its browser-facing handler verifies the user JWT and complete owner-scoped import/restore manifest, while the atomic database function is executable only by `service_role`; never expose that credential to a frontend. Production can therefore contain first-class `public.transfers` rows. For any future migration/function release, use isolated staging and verify that ordinary `authenticated` clients cannot execute the privileged RPC, transfer owner isolation, positive/distinct-account constraints, archived-account rejection for normal new endpoints, deterministic endpoint row locking, same-clock conflict rejection, tombstone retry, and all four included/excluded total-assets cases. Re-read remote metadata and take a fresh independently verified backup/PITR point before deployment.
 
-The repository release document and the domains currently attached to the active Vercel project have a known topology discrepancy. It remains a separate release follow-up; do not change domains or aliases as part of the transfer database release.
+The Production topology is reconciled: the active `shiba-expense-tracker` Vercel project serves `https://shiba-expense-tracker.vercel.app`, and the current Production deployment is built from the intended repository `main` branch. There is no current alias error.
 
 ## Code-only frontend rollback
 
