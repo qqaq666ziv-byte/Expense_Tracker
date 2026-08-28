@@ -938,14 +938,19 @@ describe('offline sync engine', () => {
       },
     };
     let applyCount = 0;
+    let pullConsistency: string | undefined;
     const remote: RemoteAdapter = {
       apply: async () => { applyCount += 1; },
-      pull: async () => [],
+      pull: async (_ownerId, options) => {
+        pullConsistency = options?.consistency;
+        return [];
+      },
     };
 
     const result = await syncFinanceState(bootstrap, 'user-a', remote, () => NOW);
 
     expect(applyCount).toBe(0);
+    expect(pullConsistency).toBe('authoritative');
     expect(result.report).toMatchObject({ status: 'synced', applied: 0, pulled: 0 });
     expect(result.state.data.transactions).toEqual([]);
     expect(result.state.outbox).toEqual([]);

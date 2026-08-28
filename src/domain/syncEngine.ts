@@ -204,7 +204,14 @@ export interface HistoricalImportBatch {
  * `(ownerId, operation.id)` and must not overwrite a record with a higher conflict clock.
  */
 export interface RemoteAdapter {
-  pull(ownerId: string): Promise<RemotePullResponse>;
+  /**
+   * `authoritative` requires one consistent remote view. Implementations must
+   * retry or reject instead of returning rows mixed across concurrent writes.
+   */
+  pull(
+    ownerId: string,
+    options?: { consistency?: 'authoritative' },
+  ): Promise<RemotePullResponse>;
   apply(ownerId: string, operation: PendingOperation): Promise<void>;
   /**
    * Atomically applies account final states and first-class historical
@@ -1051,7 +1058,10 @@ async function syncAuthenticatedLegacyBootstrap(
   const failures: SyncFailure[] = [];
   let remoteData = emptyRemoteData(state.data.settings);
   try {
-    const pullResult = normalizePullResponse(await remote.pull(authenticatedOwnerId));
+    const pullResult = normalizePullResponse(await remote.pull(
+      authenticatedOwnerId,
+      { consistency: 'authoritative' },
+    ));
     pulled = pullResult.records.length;
     failures.push(...pullResult.issues.map((issue) => ({ ...issue })));
     for (const remoteRecord of pullResult.records) {
@@ -1153,7 +1163,10 @@ async function syncInitialAuthenticatedBootstrap(
   let remoteData = emptyRemoteData(state.data.settings);
   let remoteHasRows = false;
   try {
-    const pullResult = normalizePullResponse(await remote.pull(authenticatedOwnerId));
+    const pullResult = normalizePullResponse(await remote.pull(
+      authenticatedOwnerId,
+      { consistency: 'authoritative' },
+    ));
     pulled = pullResult.records.length;
     remoteHasRows = pullResult.records.length > 0;
     failures.push(...pullResult.issues.map((issue) => ({ ...issue })));

@@ -14,12 +14,26 @@ const migrationDirectory = resolve(
 const migrationFiles = (await readdir(migrationDirectory))
   .filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name))
   .sort();
-const migrationSql = (await Promise.all(
+const migrationSources = await Promise.all(
   migrationFiles.map((name) => readFile(resolve(migrationDirectory, name), 'utf8')),
-)).join('\n\n');
+);
+const migrationSql = migrationSources.join('\n\n');
+const cloudConsistencyMigrationIndex = migrationFiles.findIndex((name) => (
+  name.endsWith('_finance_cloud_consistency.sql')
+));
+assert.notEqual(
+  cloudConsistencyMigrationIndex,
+  -1,
+  'Expected an additive finance_cloud_consistency migration',
+);
+const cloudConsistencyMigrationSql = migrationSources[cloudConsistencyMigrationIndex];
 
 const OWNER_A = '11111111-1111-4111-8111-111111111111';
 const OWNER_B = '22222222-2222-4222-8222-222222222222';
+const OWNER_C = '33333333-3333-4333-8333-333333333333';
+const OWNER_D = '44444444-4444-4444-8444-444444444444';
+const OWNER_E = '55555555-5555-4555-8555-555555555555';
+const OWNER_F = '66666666-6666-4666-8666-666666666666';
 const EXPECTED_TABLES = [
   'accounts',
   'adjustments',
@@ -2811,6 +2825,442 @@ async function verifyAtomicTransfers() {
   }
 }
 
+async function verifyMinorUnitAllocationCapacityParity() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseAuth(db);
+    await db.exec(`insert into auth.users (id) values
+      ('${OWNER_A}'), ('${OWNER_B}'), ('${OWNER_C}'), ('${OWNER_D}'),
+      ('${OWNER_E}'), ('${OWNER_F}')`);
+    await db.exec(migrationSql);
+    await db.exec('set role authenticated');
+
+    // Two included opening balances provide 0.02 after per-row rounding and
+    // the income contributes another independently observable 0.01. The
+    // client-only tutorial sentinel and large excluded/inactive values must
+    // not contribute.
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values
+        ($1, 'midpoint-included-a', '納入 A', 'vector', 'wallet', 0.005,
+          true, true, 1, 1, now(), 'midpoint-included-a-op'),
+        ($1, 'midpoint-included-b', '納入 B', 'vector', 'wallet', 0.005,
+          true, true, 2, 1, now(), 'midpoint-included-b-op'),
+        ($1, 'midpoint-excluded', '排除', 'vector', 'wallet', 1000.005,
+          false, true, 3, 1, now(), 'midpoint-excluded-op'),
+        ($1, 'midpoint-inactive', '停用', 'vector', 'wallet', 1000.005,
+          true, false, 4, 1, now(), 'midpoint-inactive-op')
+    `, [OWNER_A]);
+    await db.query(`
+      insert into public.categories (
+        user_id, id, kind, name, icon_type, icon_value, is_active,
+        sort_order, version, updated_at, last_operation_id
+      ) values
+        ($1, 'midpoint-income-category', 'income', '收入', 'vector', 'banknote',
+          true, 1, 1, now(), 'midpoint-income-category-op'),
+        ($1, 'midpoint-expense-category', 'expense', '支出', 'vector', 'tag',
+          true, 2, 1, now(), 'midpoint-expense-category-op')
+    `, [OWNER_A]);
+    await db.query(`
+      insert into public.transactions (
+        user_id, id, amount, type, category_id, category_name,
+        account_id, account_name, occurred_at, note, version, updated_at,
+        last_operation_id
+      ) values
+        ($1, 'midpoint-income', 0.005, 'income', 'midpoint-income-category', '收入',
+          'midpoint-included-a', '納入 A', '2026-08-28 10:00', null,
+          1, now(), 'midpoint-income-op'),
+        ($1, 'tutorial-expense', 500.005, 'expense', 'midpoint-expense-category', '支出',
+          'midpoint-included-b', '納入 B', '2026-08-28 10:01',
+          '🐕 柴柴互動教學紀錄（教學完成後會安全刪除）',
+          1, now(), 'tutorial-expense-op'),
+        ($1, 'excluded-income', 500.005, 'income', 'midpoint-income-category', '收入',
+          'midpoint-excluded', '排除', '2026-08-28 10:02', null,
+          1, now(), 'excluded-income-op')
+    `, [OWNER_A]);
+    await db.query(`
+      insert into public.goals (
+        user_id, id, name, target_amount, current_amount, unit, is_active,
+        version, updated_at, last_operation_id
+      ) values ($1, 'midpoint-ledger-goal', '逐筆金額', 10, 0, '元', true,
+        1, now(), 'midpoint-ledger-goal-op')
+    `, [OWNER_A]);
+    await db.query(`
+      insert into public.savings_allocations (
+        user_id, id, goal_id, amount_delta, occurred_at,
+        version, updated_at, last_operation_id
+      ) values ($1, 'midpoint-ledger-capacity', 'midpoint-ledger-goal', 0.03,
+        '2026-08-28 10:06', 1, now(), 'midpoint-ledger-capacity-op')
+    `, [OWNER_A]);
+
+    // Another owner may have abundant assets, but none can leak into A's
+    // exhausted 0.03 capacity.
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values ($1, 'owner-b-assets', 'B 資產', 'vector', 'wallet', 100000,
+        true, true, 1, 1, now(), 'owner-b-assets-op')
+    `, [OWNER_B]);
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    await assert.rejects(
+      db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'owner-isolation-over-capacity', 'midpoint-ledger-goal', 0.01,
+          '2026-08-28 10:07', 1, now(), 'owner-isolation-over-capacity-op')
+      `, [OWNER_A]),
+      /new savings allocation exceeds available assets/i,
+      'Another owner assets must not increase this owner allocation capacity',
+    );
+
+    // The negative adjustment midpoint is independently observable: an exact
+    // 0.02 opening balance minus -0.005 leaves 0.01 under minor-unit semantics,
+    // while raw numeric arithmetic would leave 0.015.
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_E]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values
+        ($1, 'adjustment-included', '調整納入', 'vector', 'wallet', 0.02,
+          true, true, 1, 1, now(), 'adjustment-included-op'),
+        ($1, 'adjustment-excluded', '調整排除', 'vector', 'wallet', 1000.005,
+          false, true, 2, 1, now(), 'adjustment-excluded-op')
+    `, [OWNER_E]);
+    await db.query(`
+      insert into public.adjustments (
+        user_id, id, account_id, amount_delta, occurred_at,
+        version, updated_at, last_operation_id
+      ) values
+        ($1, 'negative-midpoint-adjustment', 'adjustment-included', -0.005,
+          '2026-08-28 10:10', 1, now(), 'negative-midpoint-adjustment-op'),
+        ($1, 'excluded-adjustment', 'adjustment-excluded', 500.005,
+          '2026-08-28 10:11', 1, now(), 'excluded-adjustment-op')
+    `, [OWNER_E]);
+    await db.query(`
+      insert into public.goals (
+        user_id, id, name, target_amount, current_amount, unit, is_active,
+        version, updated_at, last_operation_id
+      ) values ($1, 'adjustment-midpoint-goal', '調整負中點', 10, 0, '元', true,
+        1, now(), 'adjustment-midpoint-goal-op')
+    `, [OWNER_E]);
+    await db.query(`
+      insert into public.savings_allocations (
+        user_id, id, goal_id, amount_delta, occurred_at,
+        version, updated_at, last_operation_id
+      ) values ($1, 'adjustment-midpoint-capacity', 'adjustment-midpoint-goal', 0.01,
+        '2026-08-28 10:12', 1, now(), 'adjustment-midpoint-capacity-op')
+    `, [OWNER_E]);
+    await assert.rejects(
+      db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'adjustment-midpoint-over-capacity', 'adjustment-midpoint-goal', 0.005,
+          '2026-08-28 10:13', 1, now(), 'adjustment-midpoint-over-capacity-op')
+      `, [OWNER_E]),
+      /new savings allocation exceeds available assets/i,
+      'Negative adjustment midpoint must remove one full minor unit',
+    );
+
+    // Allocation deltas themselves use the same legacy midpoint semantics.
+    // 0.025 assets become 0.03; three 0.005 events fit exactly, a fourth does not.
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_C]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values ($1, 'allocation-midpoint-assets', '配置小數資產', 'vector', 'wallet', 0.025,
+        true, true, 2, 1, now(), 'allocation-midpoint-assets-op')
+    `, [OWNER_C]);
+    await db.query(`
+      insert into public.goals (
+        user_id, id, name, target_amount, current_amount, unit, is_active,
+        version, updated_at, last_operation_id
+      ) values ($1, 'allocation-midpoint-goal', '配置逐筆進位', 10, 0, '元', true,
+        1, now(), 'allocation-midpoint-goal-op')
+    `, [OWNER_C]);
+    for (let index = 1; index <= 3; index += 1) {
+      await db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, $2, 'allocation-midpoint-goal', 0.005,
+          '2026-08-28 11:00', 1, now(), $3)
+      `, [OWNER_C, `allocation-midpoint-${index}`, `allocation-midpoint-${index}-op`]);
+    }
+    await assert.rejects(
+      db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'allocation-midpoint-4', 'allocation-midpoint-goal', 0.005,
+          '2026-08-28 11:01', 1, now(), 'allocation-midpoint-4-op')
+      `, [OWNER_C]),
+      /new savings allocation exceeds available assets/i,
+      'Each legacy allocation midpoint must consume one full minor unit',
+    );
+
+    // Included-to-excluded is independently observable. Included-to-included
+    // and excluded-to-excluded remain neutral.
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_D]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values
+        ($1, 'transfer-included-source', '納入來源', 'vector', 'wallet', 0.03,
+          true, true, 1, 1, now(), 'transfer-included-source-op'),
+        ($1, 'transfer-included-destination', '納入目的', 'vector', 'wallet', 0,
+          true, true, 2, 1, now(), 'transfer-included-destination-op'),
+        ($1, 'transfer-excluded-source', '排除來源', 'vector', 'wallet', 100,
+          false, true, 3, 1, now(), 'transfer-excluded-source-op'),
+        ($1, 'transfer-excluded-destination', '排除目的', 'vector', 'wallet', 100,
+          false, true, 4, 1, now(), 'transfer-excluded-destination-op')
+    `, [OWNER_D]);
+    await db.query(`
+      insert into public.transfers (
+        user_id, id, amount, source_account_id, source_account_name,
+        destination_account_id, destination_account_name, occurred_at,
+        version, updated_at, last_operation_id
+      ) values
+        ($1, 'midpoint-included-included', 0.005,
+          'transfer-included-source', '納入來源',
+          'transfer-included-destination', '納入目的',
+          '2026-08-28 12:00', 1, now(), 'midpoint-included-included-op'),
+        ($1, 'midpoint-excluded-excluded', 0.005,
+          'transfer-excluded-source', '排除來源',
+          'transfer-excluded-destination', '排除目的',
+          '2026-08-28 12:01', 1, now(), 'midpoint-excluded-excluded-op'),
+        ($1, 'midpoint-included-excluded', 0.005,
+          'transfer-included-source', '納入來源',
+          'transfer-excluded-destination', '排除目的',
+          '2026-08-28 12:02', 1, now(), 'midpoint-included-excluded-op')
+    `, [OWNER_D]);
+    await db.query(`
+      insert into public.goals (
+        user_id, id, name, target_amount, current_amount, unit, is_active,
+        version, updated_at, last_operation_id
+      ) values ($1, 'transfer-midpoint-goal', '轉帳逐筆進位', 10, 0, '元', true,
+        1, now(), 'transfer-midpoint-goal-op')
+    `, [OWNER_D]);
+    await db.query(`
+      insert into public.savings_allocations (
+        user_id, id, goal_id, amount_delta, occurred_at,
+        version, updated_at, last_operation_id
+      ) values ($1, 'transfer-midpoint-capacity', 'transfer-midpoint-goal', 0.02,
+        '2026-08-28 12:04', 1, now(), 'transfer-midpoint-capacity-op')
+    `, [OWNER_D]);
+    await assert.rejects(
+      db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'transfer-midpoint-over-capacity', 'transfer-midpoint-goal', 0.005,
+          '2026-08-28 12:05', 1, now(), 'transfer-midpoint-over-capacity-op')
+      `, [OWNER_D]),
+      /new savings allocation exceeds available assets/i,
+      'Included-to-excluded midpoint must remove one full minor unit',
+    );
+
+    // Excluded-to-included is tested on a separate owner, so omitting this
+    // direction or using the raw numeric value cannot be hidden by cancellation.
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_F]);
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values
+        ($1, 'inbound-included', '轉入納入', 'vector', 'wallet', 0.005,
+          true, true, 1, 1, now(), 'inbound-included-op'),
+        ($1, 'inbound-excluded', '轉入排除', 'vector', 'wallet', 100,
+          false, true, 2, 1, now(), 'inbound-excluded-op')
+    `, [OWNER_F]);
+    await db.query(`
+      insert into public.transfers (
+        user_id, id, amount, source_account_id, source_account_name,
+        destination_account_id, destination_account_name, occurred_at,
+        version, updated_at, last_operation_id
+      ) values ($1, 'midpoint-excluded-included', 0.005,
+        'inbound-excluded', '轉入排除', 'inbound-included', '轉入納入',
+        '2026-08-28 12:10', 1, now(), 'midpoint-excluded-included-op')
+    `, [OWNER_F]);
+    await db.query(`
+      insert into public.goals (
+        user_id, id, name, target_amount, current_amount, unit, is_active,
+        version, updated_at, last_operation_id
+      ) values ($1, 'inbound-midpoint-goal', '轉入逐筆進位', 10, 0, '元', true,
+        1, now(), 'inbound-midpoint-goal-op')
+    `, [OWNER_F]);
+    await db.query(`
+      insert into public.savings_allocations (
+        user_id, id, goal_id, amount_delta, occurred_at,
+        version, updated_at, last_operation_id
+      ) values ($1, 'inbound-midpoint-capacity', 'inbound-midpoint-goal', 0.02,
+        '2026-08-28 12:11', 1, now(), 'inbound-midpoint-capacity-op')
+    `, [OWNER_F]);
+    await assert.rejects(
+      db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'inbound-midpoint-over-capacity', 'inbound-midpoint-goal', 0.01,
+          '2026-08-28 12:12', 1, now(), 'inbound-midpoint-over-capacity-op')
+      `, [OWNER_F]),
+      /new savings allocation exceeds available assets/i,
+      'Excluded-to-included midpoint must add one full minor unit',
+    );
+  } finally {
+    await db.exec('reset role');
+    await db.close();
+  }
+}
+
+async function verifyAuthoritativeBootstrapRevisions() {
+  const db = new PGlite();
+  const readRevision = async () => {
+    const row = await one(db, `
+      select public.finance_v4_bootstrap_revision() ->> 'owner_id' as owner_id,
+        public.finance_v4_bootstrap_revision() ->> 'revision' as revision
+    `);
+    return { ownerId: row.owner_id, revision: BigInt(row.revision) };
+  };
+  try {
+    await bootstrapSupabaseAuth(db);
+    await db.exec(`insert into auth.users (id) values ('${OWNER_A}'), ('${OWNER_B}')`);
+    await db.exec(migrationSql);
+
+    const revisionStructure = await one(db, `
+      select
+        (select count(*)::integer
+          from pg_trigger as trigger
+          join pg_class as relation on relation.oid = trigger.tgrelid
+          join pg_namespace as namespace on namespace.oid = relation.relnamespace
+          where not trigger.tgisinternal
+            and trigger.tgname = 'finance_v4_bump_bootstrap_revision'
+            and namespace.nspname = 'public') as trigger_count,
+        has_table_privilege('anon',
+          'finance_private.bootstrap_revisions', 'select') as anon_table,
+        has_table_privilege('authenticated',
+          'finance_private.bootstrap_revisions', 'select') as authenticated_table,
+        has_table_privilege('service_role',
+          'finance_private.bootstrap_revisions', 'select') as service_table,
+        has_function_privilege('anon',
+          'public.finance_v4_bootstrap_revision()', 'execute') as anon_function,
+        has_function_privilege('authenticated',
+          'public.finance_v4_bootstrap_revision()', 'execute') as authenticated_function,
+        has_function_privilege('service_role',
+          'public.finance_v4_bootstrap_revision()', 'execute') as service_function
+    `);
+    assert.deepEqual(revisionStructure, {
+      trigger_count: 9,
+      anon_table: false,
+      authenticated_table: false,
+      service_table: false,
+      anon_function: false,
+      authenticated_function: true,
+      service_function: false,
+    }, 'All pulled tables need revision triggers and the RPC needs least-privilege grants');
+
+    await db.exec('set role anon');
+    await assert.rejects(
+      db.query('select public.finance_v4_bootstrap_revision()'),
+      /permission denied/i,
+      'Anonymous callers must not execute the bootstrap revision RPC',
+    );
+    await db.exec('reset role');
+    await db.exec('set role authenticated');
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    assert.deepEqual(await readRevision(), { ownerId: OWNER_A, revision: 0n });
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values ($1, 'revision-a', 'A', 'vector', 'wallet', 0,
+        true, true, 1, 1, now(), 'revision-a-op')
+    `, [OWNER_A]);
+    assert.deepEqual(await readRevision(), { ownerId: OWNER_A, revision: 1n });
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
+    assert.deepEqual(await readRevision(), { ownerId: OWNER_B, revision: 0n });
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values ($1, 'revision-b', 'B', 'vector', 'wallet', 0,
+        true, true, 1, 1, now(), 'revision-b-op')
+    `, [OWNER_B]);
+    assert.deepEqual(await readRevision(), { ownerId: OWNER_B, revision: 1n });
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    assert.deepEqual(
+      await readRevision(),
+      { ownerId: OWNER_A, revision: 1n },
+      'Another owner mutation must not change this owner revision',
+    );
+
+    await db.exec('begin');
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values ($1, 'revision-rolled-back', 'Rollback', 'vector', 'wallet', 0,
+        true, true, 2, 1, now(), 'revision-rolled-back-op')
+    `, [OWNER_A]);
+    assert.deepEqual(await readRevision(), { ownerId: OWNER_A, revision: 2n });
+    await db.exec('rollback');
+    assert.deepEqual(
+      await readRevision(),
+      { ownerId: OWNER_A, revision: 1n },
+      'A rolled-back financial write must roll back its revision increment',
+    );
+
+    await assert.rejects(
+      db.query('select * from finance_private.bootstrap_revisions'),
+      /permission denied/i,
+      'Authenticated callers must not read another owner private revision row',
+    );
+
+    await db.exec('reset role');
+    await db.exec(cloudConsistencyMigrationSql);
+    await db.exec('set role authenticated');
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    assert.deepEqual(
+      await readRevision(),
+      { ownerId: OWNER_A, revision: 1n },
+      'Retrying the additive migration must preserve existing revisions',
+    );
+    const triggerCountAfterRetry = await one(db, `
+      select count(*)::integer as count
+      from pg_trigger
+      where not tgisinternal and tgname = 'finance_v4_bump_bootstrap_revision'
+    `);
+    assert.equal(
+      numeric(triggerCountAfterRetry.count),
+      9,
+      'Retrying the migration must not duplicate revision triggers',
+    );
+  } finally {
+    await db.exec('reset role');
+    await db.close();
+  }
+}
+
 await verifyFreshAndRetry();
 console.log('[pass] fresh schema and retry-safe DDL');
 console.log('[pass] future public objects require explicit grants');
@@ -2834,4 +3284,8 @@ await verifyServerResourceAbuseGuards();
 console.log('[pass] server-side text, numeric, and RLS-complete per-owner resource abuse guards');
 await verifyAtomicTransfers();
 console.log('[pass] atomic transfer constraints, RLS, sync clock, and allocation capacity');
+await verifyMinorUnitAllocationCapacityParity();
+console.log('[pass] client-parity minor-unit capacity across legacy midpoints and transfer boundaries');
+await verifyAuthoritativeBootstrapRevisions();
+console.log('[pass] authoritative bootstrap revisions, owner isolation, grants, rollback, and retry safety');
 console.log('Supabase migration verification passed without an external database.');

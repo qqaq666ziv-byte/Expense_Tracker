@@ -234,6 +234,9 @@ class FakeSupabaseClient {
   } | null;
   rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   rpcResponse?: { data: unknown; error: null | { code: string; message: string } };
+  bootstrapRevision = '0';
+  bootstrapRevisionOwner: string;
+  rangeHook?: (table: string, from: number, to: number) => void;
   functionCalls: Array<{ fn: string; body: Record<string, unknown> }> = [];
   functionResponse?: { data: unknown; error: null | { code?: string; message: string } };
   readonly functions = {
@@ -244,6 +247,7 @@ class FakeSupabaseClient {
   };
 
   constructor(ownerId = 'user-a') {
+    this.bootstrapRevisionOwner = ownerId;
     this.auth = {
       getUser: async () => ({ data: { user: { id: ownerId } }, error: null }),
     };
@@ -276,10 +280,11 @@ class FakeSupabaseClient {
       select: (value = '*') => { projection = value; return builder; },
       eq: (column: string, value: unknown) => { filters.set(column, value); return builder; },
       order: () => builder,
-      range: async (from: number, to: number) => ({
-        data: (this.tables.get(table) ?? []).slice(from, to + 1).map(project),
-        error: null,
-      }),
+      range: async (from: number, to: number) => {
+        const data = (this.tables.get(table) ?? []).slice(from, to + 1).map(project);
+        this.rangeHook?.(table, from, to);
+        return { data, error: null };
+      },
       upsert: (row: Record<string, unknown>) => {
         upserted = row;
         return builder;
@@ -314,9 +319,19 @@ class FakeSupabaseClient {
     return builder;
   }
 
-  async rpc(fn: string, args: Record<string, unknown>) {
+  async rpc(fn: string, args: Record<string, unknown> = {}) {
     this.rpcCalls.push({ fn, args });
-    return this.rpcResponse ?? { data: [], error: null };
+    if (this.rpcResponse) return this.rpcResponse;
+    if (fn === 'finance_v4_bootstrap_revision') {
+      return {
+        data: {
+          owner_id: this.bootstrapRevisionOwner,
+          revision: this.bootstrapRevision,
+        },
+        error: null,
+      };
+    }
+    return { data: [], error: null };
   }
 }
 
@@ -325,6 +340,110 @@ function asSupabaseClient(client: FakeSupabaseClient): SupabaseClient {
 }
 
 describe('Supabase remote adapter', () => {
+  it('keeps a static pull complete beyond one 500-row page', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account())]);
+    client.tables.set('categories', [categoryRow('food')]);
+    client.tables.set('transactions', Array.from({ length: 501 }, (_, index) => (
+      transactionRow(`transaction-${String(index + 1).padStart(4, '0')}`)
+    )));
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const result = await remote.pull(
+      'user-a',
+      { consistency: 'authoritative' },
+    ) as RemotePullResult;
+
+    expect(result.records.filter(({ entity }) => entity === 'transactions')).toHaveLength(501);
+    expect(client.rpcCalls).toEqual([
+      { fn: 'finance_v4_bootstrap_revision', args: {} },
+      { fn: 'finance_v4_bootstrap_revision', args: {} },
+    ]);
+  });
+
+  it('reproduces the old offset race as a skipped independent transaction', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account())]);
+    client.tables.set('categories', [categoryRow('food')]);
+    client.tables.set('transactions', Array.from({ length: 501 }, (_, index) => (
+      transactionRow(`transaction-${String(index + 1).padStart(4, '0')}`)
+    )));
+    let insertedBehindCursor = false;
+    client.rangeHook = (table, from) => {
+      if (table !== 'transactions' || from !== 0 || insertedBehindCursor) return;
+      insertedBehindCursor = true;
+      client.tables.get('transactions')!.unshift(transactionRow('transaction-0000'));
+      client.bootstrapRevision = '1';
+    };
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const result = await remote.pull('user-a') as RemotePullResult;
+    const transactionIds = result.records
+      .filter(({ entity }) => entity === 'transactions')
+      .map(({ record }) => record.id);
+
+    expect(transactionIds).toHaveLength(502);
+    expect(new Set(transactionIds).size).toBe(501);
+    expect(transactionIds).not.toContain('transaction-0000');
+  });
+
+  it('retries the reproducible offset race instead of accepting a skipped transaction', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account())]);
+    client.tables.set('categories', [categoryRow('food')]);
+    client.tables.set('transactions', Array.from({ length: 501 }, (_, index) => (
+      transactionRow(`transaction-${String(index + 1).padStart(4, '0')}`)
+    )));
+    let insertedBehindCursor = false;
+    client.rangeHook = (table, from) => {
+      if (table !== 'transactions' || from !== 0 || insertedBehindCursor) return;
+      insertedBehindCursor = true;
+      client.tables.get('transactions')!.unshift(transactionRow('transaction-0000'));
+      client.bootstrapRevision = '1';
+    };
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const result = await remote.pull(
+      'user-a',
+      { consistency: 'authoritative' },
+    ) as RemotePullResult;
+    const transactionIds = result.records
+      .filter(({ entity }) => entity === 'transactions')
+      .map(({ record }) => record.id);
+
+    expect(transactionIds).toHaveLength(502);
+    expect(new Set(transactionIds).size).toBe(502);
+    expect(transactionIds).toContain('transaction-0000');
+    expect(client.rpcCalls).toHaveLength(4);
+  });
+
+  it('refuses an authoritative pull when every paged scan changes revision', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account())]);
+    client.rangeHook = (table, from) => {
+      if (table === 'accounts' && from === 0) {
+        client.bootstrapRevision = String(Number(client.bootstrapRevision) + 1);
+      }
+    };
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    await expect(remote.pull(
+      'user-a',
+      { consistency: 'authoritative' },
+    )).rejects.toThrow(/changed during the authoritative pull/i);
+  });
+
+  it('rejects an authoritative revision returned for a different owner', async () => {
+    const client = new FakeSupabaseClient();
+    client.bootstrapRevisionOwner = 'user-b';
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    await expect(remote.pull(
+      'user-a',
+      { consistency: 'authoritative' },
+    )).rejects.toThrow(/revision owner does not match/i);
+  });
+
   it('uses the trusted Edge Function for an explicitly marked historical transfer import batch', async () => {
     const client = new FakeSupabaseClient();
     const source = account({ id: 'bank', name: '主要銀行', isActive: false });

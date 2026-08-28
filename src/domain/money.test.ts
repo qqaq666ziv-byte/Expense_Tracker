@@ -19,6 +19,8 @@ describe('minor-unit money arithmetic', () => {
   });
 
   it('rounds legacy precision only for derived arithmetic', () => {
+    expect(toMinorUnits(0.005)).toBe(1n);
+    expect(toMinorUnits(-0.005)).toBe(-1n);
     expect(toMinorUnits(1.005)).toBe(101n);
     expect(toMinorUnits(-1.005)).toBe(-101n);
   });

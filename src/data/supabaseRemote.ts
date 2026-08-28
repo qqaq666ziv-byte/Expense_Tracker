@@ -31,6 +31,7 @@ import {
 type DatabaseRow = Record<string, unknown>;
 
 const PAGE_SIZE = 500;
+const MAX_AUTHORITATIVE_PULL_ATTEMPTS = 3;
 const DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(?:Z|([+-])(\d{2}):(\d{2}))?)?$/;
 
 const TABLE_BY_ENTITY: Record<FinanceEntityName, string> = {
@@ -639,6 +640,41 @@ async function pullEntity(
   return { records, issues };
 }
 
+async function pullAllEntities(
+  client: SupabaseClient,
+  ownerId: string,
+): Promise<RemotePullResult> {
+  const batches = await Promise.all(
+    ENTITY_NAMES.map((entity) => pullEntity(client, ownerId, entity)),
+  );
+  const graph = validateRemoteGraph(batches.flatMap((batch) => batch.records));
+  return {
+    records: graph.records,
+    issues: [...batches.flatMap((batch) => batch.issues), ...graph.issues],
+  };
+}
+
+async function readBootstrapRevision(
+  client: SupabaseClient,
+  ownerId: string,
+): Promise<string> {
+  const { data, error } = await client.rpc('finance_v4_bootstrap_revision');
+  if (error) {
+    throw new Error(errorText(error, 'Unable to read the authoritative bootstrap revision'));
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('Supabase returned an invalid authoritative bootstrap revision');
+  }
+  const manifest = data as { owner_id?: unknown; revision?: unknown };
+  if (manifest.owner_id !== ownerId) {
+    throw new Error('Supabase bootstrap revision owner does not match the requested finance-data owner');
+  }
+  if (typeof manifest.revision !== 'string' || !/^(?:0|[1-9]\d*)$/.test(manifest.revision)) {
+    throw new Error('Supabase returned an invalid authoritative bootstrap revision');
+  }
+  return manifest.revision;
+}
+
 /**
  * A row can be structurally valid while pointing at a row that was missing or
  * quarantined. Filter the decoded graph before reconciliation so one malformed
@@ -771,16 +807,22 @@ function validateOperation(ownerId: string, operation: PendingOperation): void {
  */
 export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapter {
   return {
-    async pull(ownerId) {
+    async pull(ownerId, options) {
       await assertAuthenticatedOwner(client, ownerId);
-      const batches = await Promise.all(
-        ENTITY_NAMES.map((entity) => pullEntity(client, ownerId, entity)),
+      if (options?.consistency !== 'authoritative') {
+        return pullAllEntities(client, ownerId);
+      }
+
+      for (let attempt = 0; attempt < MAX_AUTHORITATIVE_PULL_ATTEMPTS; attempt += 1) {
+        const revisionBefore = await readBootstrapRevision(client, ownerId);
+        const result = await pullAllEntities(client, ownerId);
+        const revisionAfter = await readBootstrapRevision(client, ownerId);
+        if (revisionBefore === revisionAfter) return result;
+      }
+
+      throw new Error(
+        'Supabase data changed during the authoritative pull; bootstrap remains pending',
       );
-      const graph = validateRemoteGraph(batches.flatMap((batch) => batch.records));
-      return {
-        records: graph.records,
-        issues: [...batches.flatMap((batch) => batch.issues), ...graph.issues],
-      };
     },
 
     async apply(ownerId, operation) {

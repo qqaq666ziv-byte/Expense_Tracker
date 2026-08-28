@@ -359,11 +359,13 @@ describe('owner-scoped local state', () => {
       occurredAt: '2026-08-24T09:30',
     };
     const calls: string[] = [];
+    const pullConsistencies: Array<string | undefined> = [];
 
     const result = await syncFinanceState(initial, 'user-a', {
       apply: async (_ownerId, operation) => { calls.push(`apply:${operation.entity}`); },
-      pull: async () => {
+      pull: async (_ownerId, options) => {
         calls.push('pull');
+        pullConsistencies.push(options?.consistency);
         return [
           { entity: 'accounts', record: cloudAccount },
           { entity: 'categories', record: cloudCategory },
@@ -373,6 +375,7 @@ describe('owner-scoped local state', () => {
     }, () => '2026-08-24T10:01:00.000Z');
 
     expect(calls).toEqual(['pull']);
+    expect(pullConsistencies).toEqual(['authoritative']);
     expect(result.state.data.accounts).toEqual([cloudAccount]);
     expect(result.state.data.categories).toEqual([cloudCategory]);
     expect(result.state.data.transactions).toEqual([cloudTransaction]);
