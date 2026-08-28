@@ -9,6 +9,7 @@ import type {
   SavingsAllocation,
   SavingsGoal,
   Transaction,
+  Transfer,
 } from './model';
 import type { RemoteAdapter, RemoteRecord } from './syncEngine';
 import {
@@ -26,6 +27,7 @@ function emptyData(): FinanceData {
     accounts: [],
     categories: [],
     transactions: [],
+    transfers: [],
     adjustments: [],
     goals: [],
     allocations: [],
@@ -91,13 +93,47 @@ function budgetOperation(record: Budget): PendingOperation {
   };
 }
 
+function transfer(
+  id: string,
+  ownerId: string,
+  version: number,
+  lastOperationId: string,
+  deletedAt?: string,
+): Transfer {
+  return {
+    id,
+    ownerId,
+    amount: 250,
+    sourceAccountId: 'bank',
+    sourceAccountName: '銀行',
+    destinationAccountId: 'cash',
+    destinationAccountName: '現金',
+    occurredAt: '2026-08-28 10:00',
+    version,
+    updatedAt: NOW,
+    lastOperationId,
+    deletedAt,
+  };
+}
+
+function transferOperation(record: Transfer): PendingOperation {
+  return {
+    id: record.lastOperationId,
+    entity: 'transfers',
+    recordId: record.id,
+    record,
+    attempts: 0,
+    queuedAt: NOW,
+  };
+}
+
 function state(
   ownerId: string,
   records: AssetAccount[],
   outbox: PendingOperation[],
 ): PersistedFinanceState {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     ownerId,
     data: { ...emptyData(), accounts: records },
     outbox,
@@ -180,6 +216,71 @@ class InMemoryRemote implements RemoteAdapter {
 }
 
 describe('offline sync engine', () => {
+  it('retries one atomic transfer row and converges create, edit, and tombstone without duplicates', async () => {
+    const remote = new InMemoryRemote();
+    const bank = account('bank', 'user-a', 1, 'bank-create');
+    const cash = account('cash', 'user-a', 1, 'cash-create');
+    const created = transfer('move-250', 'user-a', 1, 'transfer-create');
+    remote.failAfterApplyOnce.add(created.lastOperationId);
+    const createdState: PersistedFinanceState = {
+      ...state('user-a', [bank, cash], []),
+      data: { ...emptyData(), accounts: [bank, cash], transfers: [created] },
+      outbox: [transferOperation(created)],
+    };
+
+    const uncertain = await syncFinanceState(createdState, 'user-a', remote);
+    expect(uncertain.state.outbox).toHaveLength(1);
+    const createdRetry = await syncFinanceState(uncertain.state, 'user-a', remote);
+    expect(createdRetry.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers'))
+      .toEqual([{ entity: 'transfers', record: created }]);
+
+    const edited = { ...created, amount: 300, version: 2, lastOperationId: 'transfer-edit' };
+    const editedState = enqueueSyncRecord(createdRetry.state, 'transfers', edited);
+    const editedResult = await syncFinanceState(editedState, 'user-a', remote);
+    expect(editedResult.state.data.transfers).toEqual([edited]);
+
+    const tombstone = {
+      ...edited,
+      version: 3,
+      lastOperationId: 'tombstone:transfer-delete',
+      deletedAt: NOW,
+    };
+    const deletedResult = await syncFinanceState(
+      enqueueSyncRecord(editedResult.state, 'transfers', tombstone),
+      'user-a',
+      remote,
+    );
+    expect(deletedResult.state.outbox).toEqual([]);
+    expect(deletedResult.state.data.transfers).toEqual([tombstone]);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers'))
+      .toEqual([{ entity: 'transfers', record: tombstone }]);
+  });
+
+  it('keeps a divergent same-clock transfer locked until the cloud record is explicitly accepted', async () => {
+    const local = { ...transfer('conflicted-transfer', 'user-a', 2, 'same-clock'), note: '本機' };
+    const cloud = { ...local, note: '雲端' };
+    const bank = account('bank', 'user-a', 1, 'bank-create');
+    const cash = account('cash', 'user-a', 1, 'cash-create');
+    const remote = new InMemoryRemote([{ entity: 'transfers', record: cloud }]);
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [bank, cash], []),
+      data: { ...emptyData(), accounts: [bank, cash], transfers: [local] },
+      outbox: [transferOperation(local)],
+    };
+
+    const conflicted = await syncFinanceState(initial, 'user-a', remote);
+    expect(conflicted.state.unresolvedSyncRecordKeys).toContain('transfers:conflicted-transfer');
+    expect(conflicted.state.outbox).toHaveLength(1);
+
+    const accepted = acceptRemoteConflictRecord(conflicted.state, {
+      entity: 'transfers',
+      record: cloud,
+    });
+    expect(accepted.outbox).toEqual([]);
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(accepted.data.transfers).toEqual([cloud]);
+  });
   it('preserves the original batch manifest across a later offline edit', () => {
     const before = account('offline-batch-edit', 'user-a', 1, 'create');
     const first = { ...before, version: 2, lastOperationId: 'first-batch-edit', name: '第一次' };
@@ -259,7 +360,7 @@ describe('offline sync engine', () => {
       transactions: [staleCachedTransaction],
     };
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -293,7 +394,7 @@ describe('offline sync engine', () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const candidate: FinanceData = { ...emptyData(), accounts: [legacyAccount] };
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -332,7 +433,7 @@ describe('offline sync engine', () => {
   it('does not allow a local operation to enter a pending authenticated legacy bootstrap', () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -353,7 +454,7 @@ describe('offline sync engine', () => {
   it('keeps the candidate and pending gate when the authenticated legacy pull fails', async () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -385,7 +486,7 @@ describe('offline sync engine', () => {
   it('keeps the bootstrap gated when a nominally successful pull has an invalid graph', async () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -745,7 +846,7 @@ describe('offline sync engine', () => {
       deletedAt: '2026-08-21T10:01:00.000Z',
     };
     const releaseState = (record: SavingsAllocation): PersistedFinanceState => ({
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), goals: [goal], allocations: [record] },
       outbox: [allocationOperation(record)],
@@ -816,7 +917,7 @@ describe('offline sync engine', () => {
     const localAccount = { ...remoteAccount, version: 2, lastOperationId: 'local-stale', name: '本機' };
     const unrelated = account('unrelated-pending', 'user-a', 1, 'unrelated-create');
     const conflicted: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [localAccount, unrelated] },
       outbox: [{
@@ -963,7 +1064,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -1029,7 +1130,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -1078,7 +1179,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -1148,7 +1249,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -1186,7 +1287,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteReactivation }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [staleRollback] },
       outbox: [budgetOperation(staleRollback)],
@@ -1238,7 +1339,7 @@ describe('offline sync engine', () => {
       { entity: 'budgets', record: oldSemanticBudget },
     ]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),
@@ -1285,7 +1386,7 @@ describe('offline sync engine', () => {
       isActive: false,
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),
@@ -1353,7 +1454,7 @@ describe('offline sync engine', () => {
       lastOperationId: 'rule-account-mirror',
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(), accounts: [localAccount], categories: [category], recurringRules: [batchedRule],
@@ -1572,7 +1673,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), goals: [goal], allocations: [releasedA, releasedB] },
       outbox: [{
@@ -1631,7 +1732,7 @@ describe('offline sync engine', () => {
     ]);
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1699,7 +1800,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1728,7 +1829,7 @@ describe('offline sync engine', () => {
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     remote.failAfterCompareAndSwapOnce = true;
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1759,7 +1860,7 @@ describe('offline sync engine', () => {
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     remote.failAfterCompareAndSwapOnce = true;
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [createdA, desiredB] },
       outbox: [{
@@ -1801,7 +1902,7 @@ describe('offline sync engine', () => {
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     remote.failAfterCompareAndSwapOnce = true;
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1843,7 +1944,7 @@ describe('offline sync engine', () => {
     ]);
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     const foreignState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [foreignA, desiredB] },
       outbox: [{
@@ -1858,7 +1959,7 @@ describe('offline sync engine', () => {
     ));
 
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1898,7 +1999,7 @@ describe('offline sync engine', () => {
     const apply = vi.fn(async () => undefined);
     const remote: RemoteAdapter = { apply, pull: async () => [] };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),
@@ -1944,7 +2045,7 @@ describe('offline sync engine', () => {
       { entity: 'accounts', record: beforeB },
     ]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [localA, localB] },
       outbox: [{
@@ -1989,7 +2090,7 @@ describe('offline sync engine', () => {
       isActive: true,
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),
@@ -2044,7 +2145,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -2065,7 +2166,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: inactive }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [inactive] },
       outbox: [budgetOperation(inactive)],
@@ -2087,7 +2188,7 @@ describe('offline sync engine', () => {
     const remoteBudget: Budget = { ...localBudget, amount: 5_000 };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -2122,7 +2223,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -2149,7 +2250,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteReactivation }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localArchive] },
       outbox: [budgetOperation(localArchive)],
@@ -2375,7 +2476,7 @@ describe('offline sync engine', () => {
       occurredAt: '2026-08-21 09:30',
     };
     const original: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),

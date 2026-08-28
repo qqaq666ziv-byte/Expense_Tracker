@@ -5,6 +5,7 @@ import { syncFinanceState, type RemoteAdapter } from './syncEngine';
 import {
   createFinanceBackup,
   exportFinanceBackup,
+  exportTransfersCsv,
   exportTransactionsCsv,
   MAX_BACKUP_BYTES,
   parseFinanceBackup,
@@ -18,6 +19,10 @@ const fixture: FinanceData = {
     id: 'account-cash', ownerId: 'guest', name: '現金', icon: { type: 'emoji', value: '💵' },
     openingBalance: 1_000, includeInTotalAssets: true, isActive: true, sortOrder: 0,
     version: 1, updatedAt: '2026-08-21T08:00:00.000Z', lastOperationId: 'fixture',
+  }, {
+    id: 'account-bank', ownerId: 'guest', name: '銀行', icon: { type: 'vector', value: 'landmark' },
+    openingBalance: 2_000, includeInTotalAssets: true, isActive: true, sortOrder: 1,
+    version: 1, updatedAt: '2026-08-21T08:00:00.000Z', lastOperationId: 'fixture-bank',
   }],
   categories: [{
     id: 'category-food', ownerId: 'guest', kind: 'expense', name: '餐飲',
@@ -29,6 +34,13 @@ const fixture: FinanceData = {
     categoryId: 'category-food', categoryName: '餐飲', accountId: 'account-cash',
     accountName: '現金', occurredAt: '2026-08-21 08:30', note: '早餐',
     version: 1, updatedAt: '2026-08-21T08:31:00.000Z', lastOperationId: 'fixture',
+  }],
+  transfers: [{
+    id: 'transfer-withdrawal', ownerId: 'guest', amount: 500,
+    sourceAccountId: 'account-bank', sourceAccountName: '銀行',
+    destinationAccountId: 'account-cash', destinationAccountName: '現金',
+    occurredAt: '2026-08-21 08:45', note: '領現', version: 1,
+    updatedAt: '2026-08-21T08:45:00.000Z', lastOperationId: 'fixture-transfer',
   }],
   adjustments: [{
     id: 'adjustment-1', ownerId: 'guest', accountId: 'account-cash', amountDelta: 20,
@@ -61,7 +73,7 @@ const fixture: FinanceData = {
 };
 
 const emptyData = (): FinanceData => ({
-  accounts: [], categories: [], transactions: [], adjustments: [], goals: [], allocations: [],
+  accounts: [], categories: [], transactions: [], transfers: [], adjustments: [], goals: [], allocations: [],
   budgets: [], recurringRules: [], settings: { currency: 'TWD', locale: 'zh-TW' },
 });
 
@@ -71,7 +83,7 @@ describe('versioned finance backup', () => {
     const restored = restoreFinanceBackup(emptyData(), backup, { ownerId: 'guest' });
 
     expect(backup).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportedAt: '2026-08-21T10:00:00.000Z',
     });
     expect(restored).toEqual(fixture);
@@ -241,6 +253,7 @@ describe('versioned finance backup', () => {
         incoming.accounts,
         incoming.categories,
         incoming.transactions,
+        incoming.transfers,
         incoming.adjustments,
         incoming.goals,
         incoming.allocations,
@@ -251,12 +264,12 @@ describe('versioned finance backup', () => {
       }
       incoming[entity][0].amountDelta = 0;
       const backup = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         exportedAt: '2026-08-21T10:00:00.000Z',
         data: incoming,
       };
       const current: PersistedFinanceState = {
-        schemaVersion: 3,
+        schemaVersion: 4,
         ownerId: 'user-a',
         data: emptyData(),
         outbox: [],
@@ -308,7 +321,8 @@ describe('versioned finance backup', () => {
 
     expect(secondRestore).toEqual(firstRestore);
     expect(secondRestore.transactions).toHaveLength(1);
-    expect(secondRestore.accounts).toHaveLength(1);
+    expect(secondRestore.accounts).toHaveLength(2);
+    expect(secondRestore.transfers).toHaveLength(1);
   });
 
   it('rejects equal-version divergent payloads that reuse one operation identity', () => {
@@ -321,6 +335,21 @@ describe('versioned finance backup', () => {
 
     expect(() => restoreFinanceBackup(current, createFinanceBackup(incoming), { ownerId: 'guest' }))
       .toThrow(/conflicting.*tx-breakfast/i);
+  });
+
+  it('imports a legacy version-1 backup by adding an explicit empty transfer collection', () => {
+    const legacy = structuredClone(createFinanceBackup(fixture));
+    const legacyData = legacy.data as Partial<FinanceData>;
+    delete legacyData.transfers;
+
+    expect(parseFinanceBackup({ ...legacy, schemaVersion: 1 }).data.transfers).toEqual([]);
+  });
+
+  it('rejects a mislabeled version-1 backup that contains transfers instead of dropping them', () => {
+    expect(() => parseFinanceBackup({
+      ...createFinanceBackup(fixture),
+      schemaVersion: 1,
+    })).toThrow(/version 1.*transfers/i);
   });
 
   it('uses operation id after version regardless of timestamp ordering', () => {
@@ -478,6 +507,18 @@ describe('versioned finance backup', () => {
 });
 
 describe('transaction CSV export', () => {
+  it('preserves the transaction contract and exports transfers separately without disguising them as cash flow', () => {
+    const transactionCsv = exportTransactionsCsv(fixture);
+    const transferCsv = exportTransfersCsv(fixture);
+
+    expect(transactionCsv).not.toContain('transfer-withdrawal');
+    expect(transferCsv.startsWith(
+      'id,owner_id,amount,occurred_at,source_account_id,source_account_name,destination_account_id,destination_account_name,note,deleted_at\r\n',
+    )).toBe(true);
+    expect(transferCsv).toContain('"transfer-withdrawal","guest","500"');
+    expect(transferCsv).toContain('"account-bank","銀行","account-cash","現金"');
+  });
+
   it('includes stable identifiers and display fields with RFC 4180 escaping', () => {
     const data = structuredClone(fixture);
     data.transactions[0].note = '="早餐, 大份"\n第二行';

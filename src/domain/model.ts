@@ -47,6 +47,17 @@ export interface Transaction extends SyncRecord {
   occurrenceDate?: string;
 }
 
+/** One atomic movement between two owner-scoped asset accounts. */
+export interface Transfer extends SyncRecord {
+  amount: number;
+  sourceAccountId: string;
+  sourceAccountName: string;
+  destinationAccountId: string;
+  destinationAccountName: string;
+  occurredAt: string;
+  note?: string;
+}
+
 export interface BalanceAdjustment extends SyncRecord {
   accountId: string;
   amountDelta: number;
@@ -106,6 +117,7 @@ export interface FinanceData {
   accounts: AssetAccount[];
   categories: Category[];
   transactions: Transaction[];
+  transfers: Transfer[];
   adjustments: BalanceAdjustment[];
   goals: SavingsGoal[];
   allocations: SavingsAllocation[];
@@ -158,7 +170,7 @@ export interface InitialAuthenticatedBootstrap {
 }
 
 export interface PersistedFinanceState {
-  schemaVersion: 3;
+  schemaVersion: 4;
   ownerId: OwnerId;
   data: FinanceData;
   outbox: PendingOperation[];

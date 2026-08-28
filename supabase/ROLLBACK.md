@@ -4,8 +4,9 @@ Migrations:
 
 - `20260821103249_finance_v3_additive_schema.sql` — applied to production on 2026-08-24 after an independently stored PostgreSQL backup.
 - `20260824023801_finance_resource_abuse_guards.sql` — reviewed and locally verified, **not applied to production** pending explicit authorization.
+- `20260828013341_finance_account_transfers.sql` — additive first-class transfer table and capacity-guard extension, locally verified, **not applied to production** pending explicit authorization.
 
-The first migration preserves legacy financial rows and columns while expanding the schema and correcting legacy IDs to owner-scoped primary keys. The second migration changes no row values: it adds `NOT VALID` future-write text/numeric checks and a trigger-enforced per-owner row ceiling. The Git restore points are:
+The first migration preserves legacy financial rows and columns while expanding the schema and correcting legacy IDs to owner-scoped primary keys. The second migration changes no row values: it adds `NOT VALID` future-write text/numeric checks and a trigger-enforced per-owner row ceiling. The transfer migration creates one owner-scoped row per logical transfer, adds no backfill, and updates the server allocation-capacity calculation so included/excluded account boundaries agree with the client. The Git restore points are:
 
 - tag: `checkpoint/20260821-180842-before-autonomous-build`
 - SHA: `56df3f31d2a3c7b93954faef9c352859c8f1f3d5`
@@ -30,6 +31,10 @@ Before applying any pending migration to a non-local database:
 6. Confirm there are no unexpected incoming foreign keys to the four legacy tables. The migration intentionally aborts rather than dropping an unknown dependency.
 
 For `finance_resource_abuse_guards`, also record aggregate-only preflight results for every guarded text/numeric field and each owner's table count. The 2026-08-24 production preflight found zero text or numeric violations in all currently non-empty finance tables and every owner below quota. Re-run it immediately before deployment because production can change. A `NOT VALID` constraint preserves an existing violating row at creation time but rejects a later update to that row; if preflight ever reports a violation, stop and design a reviewed, data-preserving cleanup before applying the guard.
+
+For `finance_account_transfers`, preserve migration order: apply `20260824023801_finance_resource_abuse_guards.sql` before `20260828013341_finance_account_transfers.sql`. On an isolated staging database, verify clean install and upgrade from the production-like state, then prove transfer owner isolation, positive/distinct-account constraints, archived-account rejection for new endpoints, same-clock conflict rejection, tombstone retry, and all four included/excluded total-assets cases. Immediately before an authorized Production release, re-read remote migration metadata and take a fresh independently verified backup/PITR point. Do not deploy a frontend that can create transfers until the transfer table and policies are confirmed available.
+
+The repository release document and the domains currently attached to the active Vercel project have a known topology discrepancy. It remains a separate release follow-up; do not change domains or aliases as part of the transfer database release.
 
 ## Safest application rollback
 
@@ -63,6 +68,18 @@ The guard migration is additive and performs no backfill. If it is later authori
 4. Re-run owner isolation, row/orphan, legacy-client, authenticated CRUD, and advisor checks before reopening rollout.
 
 No executable destructive down migration is checked in because guard removal weakens a security boundary and requires action-time authorization. Exact point-in-time reversal remains the external backup/PITR path.
+
+### Transfer migration release and rollback
+
+For a later explicitly authorized release:
+
+1. Create and verify a fresh external database backup/PITR restore point; record aggregate row counts and current policies/grants without exporting financial rows.
+2. Apply pending migrations in timestamp order on isolated staging, run `npm.cmd run verify:migration`, then repeat owner/RLS and transfer-capacity smoke checks.
+3. Apply the same pending migrations to Production through the reviewed Supabase migration workflow.
+4. Verify that `public.transfers` has exactly three authenticated owner policies, no authenticated `DELETE` grant, both owner-scoped account foreign keys, conflict/resource/account guards, and no orphan rows.
+5. Deploy the compatible frontend only after the schema check succeeds; verify guest and an authorized isolated authenticated ledger without touching genuine user financial rows.
+
+The preferred rollback is code-only: restore the previous frontend while leaving `public.transfers` and its rows intact. Older clients synchronize known entity tables individually and therefore do not delete unknown transfer rows. Do not drop the table, its tombstones, policies, or triggers. If a database-level reversal is unavoidable, restore the fresh pre-release backup/PITR point; any selective removal requires separate authorization plus proof that no transfer rows would be lost. A forward repair migration is preferred for constraint, policy, trigger, or capacity-calculation defects.
 
 ## Post-rollback verification
 

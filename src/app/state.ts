@@ -68,6 +68,7 @@ export function createInitialData(ownerId: OwnerId): FinanceData {
       sortOrder: index,
     })),
     transactions: [],
+    transfers: [],
     adjustments: [],
     goals: [],
     allocations: [],
@@ -82,6 +83,7 @@ function createEmptyData(): FinanceData {
     accounts: [],
     categories: [],
     transactions: [],
+    transfers: [],
     adjustments: [],
     goals: [],
     allocations: [],
@@ -94,7 +96,7 @@ function createEmptyData(): FinanceData {
 export function createInitialState(ownerId: OwnerId): PersistedFinanceState {
   const data = createInitialData(ownerId);
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     ownerId,
     data,
     outbox: [],
@@ -133,6 +135,37 @@ export interface LocalStateRecovery {
 export interface LoadedFinanceState {
   state: PersistedFinanceState;
   recovery?: LocalStateRecovery;
+}
+
+function addTransferCollection(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  return Object.hasOwn(record, 'transfers') ? record : { ...record, transfers: [] };
+}
+
+/** Upgrade the last local envelope in memory while keeping its raw JSON untouched for recovery. */
+function upgradePersistedFinanceState(value: unknown): PersistedFinanceState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value as PersistedFinanceState;
+  }
+  const envelope = value as Record<string, unknown>;
+  if (envelope.schemaVersion !== 3) return envelope as unknown as PersistedFinanceState;
+  const upgradeBootstrap = (bootstrap: unknown): unknown => {
+    if (!bootstrap || typeof bootstrap !== 'object' || Array.isArray(bootstrap)) return bootstrap;
+    const record = bootstrap as Record<string, unknown>;
+    return { ...record, candidate: addTransferCollection(record.candidate) };
+  };
+  return {
+    ...envelope,
+    schemaVersion: 4,
+    data: addTransferCollection(envelope.data),
+    ...(envelope.legacyBootstrap === undefined
+      ? {}
+      : { legacyBootstrap: upgradeBootstrap(envelope.legacyBootstrap) }),
+    ...(envelope.initialBootstrap === undefined
+      ? {}
+      : { initialBootstrap: upgradeBootstrap(envelope.initialBootstrap) }),
+  } as unknown as PersistedFinanceState;
 }
 
 /**
@@ -191,8 +224,8 @@ export function loadFinanceStateWithRecovery(
     }
   }
   try {
-    const parsed = JSON.parse(raw) as PersistedFinanceState;
-    if (parsed.schemaVersion !== 3 || parsed.ownerId !== ownerId || !parsed.data || !Array.isArray(parsed.outbox)) {
+    const parsed = upgradePersistedFinanceState(JSON.parse(raw));
+    if (parsed.schemaVersion !== 4 || parsed.ownerId !== ownerId || !parsed.data || !Array.isArray(parsed.outbox)) {
       throw new Error('invalid local state envelope');
     }
     validateFinanceData(parsed.data, 'local state');
@@ -430,7 +463,7 @@ function loadLegacyState(
       : []
   ));
   const state: PersistedFinanceState = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     ownerId,
     data: ownerId === 'guest' ? migrated : createEmptyData(),
     outbox: [],
@@ -508,6 +541,7 @@ export const entityNames: readonly FinanceEntityName[] = [
   'accounts',
   'categories',
   'transactions',
+  'transfers',
   'adjustments',
   'goals',
   'allocations',
@@ -941,6 +975,7 @@ export function hasUserContent(data: FinanceData): boolean {
     legacyKey: record.legacyKey,
   }));
   return data.transactions.some((transaction) => !isTutorialTransaction(transaction))
+    || data.transfers.length > 0
     || data.adjustments.length > 0
     || data.goals.length > 0
     || data.allocations.length > 0
@@ -996,6 +1031,11 @@ export function remapOwner(data: FinanceData, ownerId: string): FinanceData {
         ...(recurringRuleId ? { recurringRuleId } : {}),
       }, id);
       }),
+    transfers: data.transfers.map((record) => remap({
+      ...record,
+      sourceAccountId: accountIds.get(record.sourceAccountId)!,
+      destinationAccountId: accountIds.get(record.destinationAccountId)!,
+    }, stableLegacyId('transfer', ownerId, 'guest-import', record.id))),
     adjustments: data.adjustments.map((record) => remap({
       ...record,
       accountId: accountIds.get(record.accountId)!,

@@ -31,6 +31,7 @@ const EXPECTED_TABLES = [
   'settings',
   'subscriptions',
   'transactions',
+  'transfers',
 ];
 
 function base64Url(value) {
@@ -119,7 +120,7 @@ async function verifyFreshAndRetry() {
     `);
     assert.equal(
       numeric(policyCount.count),
-      34,
+      37,
       'Expected owner CRUD policies plus DELETE only where a tombstone bridge exists',
     );
     const deletePolicyCount = await one(db, `
@@ -140,7 +141,7 @@ async function verifyFreshAndRetry() {
       where tgname = 'finance_v3_conflict_clock'
         and not tgisinternal
     `);
-    assert.equal(numeric(triggerCount.count), 8, 'Expected one conflict-clock trigger per sync entity');
+    assert.equal(numeric(triggerCount.count), 9, 'Expected one conflict-clock trigger per sync entity');
 
     const allocationCapacityTriggerCount = await one(db, `
       select count(*)::integer as count
@@ -232,7 +233,7 @@ async function verifyFreshAndRetry() {
       from pg_constraint
       where conname ~ '^finance_v3_.*_operation_check$'
     `);
-    assert.equal(numeric(operationCheckCount.count), 10, 'Expected a stable operation check on every finance table');
+    assert.equal(numeric(operationCheckCount.count), 11, 'Expected a stable operation check on every finance table');
 
     const resourceGuardCounts = await one(db, `
       select
@@ -247,9 +248,9 @@ async function verifyFreshAndRetry() {
           from pg_constraint
           where conname ~ '^finance_v3_.*_len_chk$') as text_checks
     `);
-    assert.equal(numeric(resourceGuardCounts.triggers), 9, 'Expected one row quota trigger per owner-scoped entity table');
-    assert.equal(numeric(resourceGuardCounts.numeric_checks), 9, 'Expected one future-write check per finance numeric column');
-    assert.equal(numeric(resourceGuardCounts.text_checks), 70, 'Expected a future-write check on every persisted text field');
+    assert.equal(numeric(resourceGuardCounts.triggers), 10, 'Expected one row quota trigger per owner-scoped entity table');
+    assert.equal(numeric(resourceGuardCounts.numeric_checks), 10, 'Expected one future-write check per finance numeric column');
+    assert.equal(numeric(resourceGuardCounts.text_checks), 78, 'Expected a future-write check on every persisted text field');
 
     const domainCheckCount = await one(db, `
       select count(*)::integer as count
@@ -265,9 +266,12 @@ async function verifyFreshAndRetry() {
         'finance_v3_budgets_relation_check',
         'finance_v3_accounts_name_check',
         'finance_v3_categories_name_check'
+        ,'finance_v3_transfers_amount_check'
+        ,'finance_v3_transfers_distinct_accounts_check'
+        ,'finance_v3_transfers_relations_check'
       )
     `);
-    assert.equal(numeric(domainCheckCount.count), 10, 'Expected future-write domain checks');
+    assert.equal(numeric(domainCheckCount.count), 13, 'Expected future-write domain checks');
 
     const recurrenceIndex = await one(db, `
       select count(*)::integer as count
@@ -2382,6 +2386,124 @@ async function verifyServerResourceAbuseGuards() {
   }
 }
 
+async function verifyAtomicTransfers() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseAuth(db);
+    await db.exec(`insert into auth.users (id) values ('${OWNER_A}'), ('${OWNER_B}')`);
+    await db.exec(migrationSql);
+    await db.exec('set role authenticated');
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values
+        ($1, 'included-a', '計入 A', 'vector', 'wallet', 1000, true, true, 1, 1, now(), 'account-a-op'),
+        ($1, 'included-b', '計入 B', 'vector', 'wallet', 1000, true, true, 2, 1, now(), 'account-b-op'),
+        ($1, 'excluded-a', '排除 A', 'vector', 'wallet', 0, false, true, 3, 1, now(), 'account-c-op'),
+        ($1, 'excluded-b', '排除 B', 'vector', 'wallet', 0, false, true, 4, 1, now(), 'account-d-op')
+    `, [OWNER_A]);
+
+    await db.query(`
+      insert into public.transfers (
+        user_id, id, amount, source_account_id, source_account_name,
+        destination_account_id, destination_account_name, occurred_at,
+        version, updated_at, last_operation_id
+      ) values
+        ($1, 'included-to-included', 100, 'included-a', '計入 A', 'included-b', '計入 B', '2026-08-28 09:00', 1, now(), 'transfer-1-op'),
+        ($1, 'included-to-excluded', 100, 'included-a', '計入 A', 'excluded-a', '排除 A', '2026-08-28 09:01', 1, now(), 'transfer-2-op'),
+        ($1, 'excluded-to-included', 40, 'excluded-a', '排除 A', 'included-b', '計入 B', '2026-08-28 09:02', 1, now(), 'transfer-3-op'),
+        ($1, 'excluded-to-excluded', 30, 'excluded-a', '排除 A', 'excluded-b', '排除 B', '2026-08-28 09:03', 1, now(), 'transfer-4-op')
+    `, [OWNER_A]);
+
+    const transferCount = await one(db, `
+      select count(*)::integer as count from public.transfers where user_id = $1
+    `, [OWNER_A]);
+    assert.equal(numeric(transferCount.count), 4, 'Each transfer must persist as one atomic row');
+
+    await assert.rejects(
+      db.query(`
+        insert into public.transfers (
+          user_id, id, amount, source_account_id, source_account_name,
+          destination_account_id, destination_account_name, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'same-account', 1, 'included-a', '計入 A', 'included-a', '計入 A',
+          '2026-08-28 10:00', 1, now(), 'same-account-op')
+      `, [OWNER_A]),
+      /distinct_accounts|check constraint/i,
+      'A transfer must not target the same account',
+    );
+
+    await db.query(`
+      insert into public.goals (
+        user_id, id, name, target_amount, current_amount, unit, is_active,
+        version, updated_at, last_operation_id
+      ) values ($1, 'transfer-capacity-goal', '轉帳容量', 5000, 0, '元', true,
+        1, now(), 'transfer-capacity-goal-op')
+    `, [OWNER_A]);
+    await db.query(`
+      insert into public.savings_allocations (
+        user_id, id, goal_id, amount_delta, occurred_at,
+        version, updated_at, last_operation_id
+      ) values ($1, 'transfer-capacity-fit', 'transfer-capacity-goal', 1940,
+        '2026-08-28', 1, now(), 'transfer-capacity-fit-op')
+    `, [OWNER_A]);
+    await assert.rejects(
+      db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'transfer-capacity-over', 'transfer-capacity-goal', 0.01,
+          '2026-08-28', 1, now(), 'transfer-capacity-over-op')
+      `, [OWNER_A]),
+      /allocation_capacity|exceeds available assets/i,
+      'Allocation capacity must include transfer net effects across the total-assets boundary',
+    );
+
+    await db.query(`
+      update public.accounts
+      set is_active = false, version = 2, last_operation_id = 'archive-excluded-b-op'
+      where user_id = $1 and id = 'excluded-b'
+    `, [OWNER_A]);
+    await db.query(`
+      update public.transfers
+      set note = '歷史端點仍可修改', version = 2, last_operation_id = 'transfer-4-edit-op'
+      where user_id = $1 and id = 'excluded-to-excluded'
+    `, [OWNER_A]);
+    await assert.rejects(
+      db.query(`
+        insert into public.transfers (
+          user_id, id, amount, source_account_id, source_account_name,
+          destination_account_id, destination_account_name, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'new-to-archived', 1, 'included-a', '計入 A', 'excluded-b', '排除 B',
+          '2026-08-28 10:01', 1, now(), 'new-to-archived-op')
+      `, [OWNER_A]),
+      /destination account must be active|transfer_active_destination/i,
+      'New transfers must not target an archived account',
+    );
+    await assert.rejects(
+      db.query(`
+        update public.transfers
+        set note = 'divergent same clock'
+        where user_id = $1 and id = 'included-to-included'
+      `, [OWNER_A]),
+      /conflicting payload|40001/i,
+      'A divergent same-clock transfer payload must fail closed',
+    );
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
+    const foreignCount = await one(db, `select count(*)::integer as count from public.transfers`);
+    assert.equal(numeric(foreignCount.count), 0, 'Transfer RLS must isolate owners');
+  } finally {
+    await db.exec('reset role');
+    await db.close();
+  }
+}
+
 await verifyFreshAndRetry();
 console.log('[pass] fresh schema and retry-safe DDL');
 console.log('[pass] future public objects require explicit grants');
@@ -2403,4 +2525,6 @@ console.log('[pass] legacy negative goal delete tombstones allocations atomicall
 
 await verifyServerResourceAbuseGuards();
 console.log('[pass] server-side text, numeric, and RLS-complete per-owner resource abuse guards');
+await verifyAtomicTransfers();
+console.log('[pass] atomic transfer constraints, RLS, sync clock, and allocation capacity');
 console.log('Supabase migration verification passed without an external database.');

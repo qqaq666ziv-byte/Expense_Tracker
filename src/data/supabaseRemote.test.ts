@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { MAX_SAFE_MONEY } from '../domain/money';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { AssetAccount, PendingOperation, SavingsAllocation } from '../domain/model';
+import type { AssetAccount, PendingOperation, SavingsAllocation, Transfer } from '../domain/model';
 import type { RemotePullResult } from '../domain/syncEngine';
 import { createSupabaseRemoteAdapter } from './supabaseRemote';
 
@@ -119,6 +119,23 @@ function transactionRow(
   };
 }
 
+function transferRow(
+  id: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    ...commonRow(id),
+    amount: 100,
+    source_account_id: 'bank',
+    source_account_name: '銀行',
+    destination_account_id: 'cash',
+    destination_account_name: 'Cash',
+    occurred_at: '2026-08-21T09:30',
+    note: '領現',
+    ...overrides,
+  };
+}
+
 function recurringRow(
   id: string,
   overrides: Record<string, unknown> = {},
@@ -230,6 +247,7 @@ class FakeSupabaseClient {
     const moneyColumn = new Map([
       ['accounts', 'opening_balance'],
       ['transactions', 'amount'],
+      ['transfers', 'amount'],
       ['adjustments', 'amount_delta'],
       ['goals', 'target_amount'],
       ['savings_allocations', 'amount_delta'],
@@ -292,6 +310,63 @@ function asSupabaseClient(client: FakeSupabaseClient): SupabaseClient {
 }
 
 describe('Supabase remote adapter', () => {
+  it('encodes and decodes one first-class transfer without paired transactions', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [
+      accountRow(account({ id: 'bank', name: '銀行' })),
+      accountRow(account()),
+    ]);
+    client.tables.set('transfers', [transferRow('transfer-1')]);
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const pulled = await remote.pull('user-a') as RemotePullResult;
+    expect(pulled.records).toContainEqual({
+      entity: 'transfers',
+      record: expect.objectContaining({
+        id: 'transfer-1', amount: 100, sourceAccountId: 'bank',
+        destinationAccountId: 'cash', note: '領現',
+      }),
+    });
+
+    let encoded: Record<string, unknown> | undefined;
+    client.applyResponse = (table, row) => {
+      if (table === 'transfers') encoded = row;
+      return row;
+    };
+    const record = pulled.records.find((entry) => entry.entity === 'transfers')!.record as Transfer;
+    await remote.apply('user-a', {
+      id: record.lastOperationId,
+      entity: 'transfers',
+      recordId: record.id,
+      record,
+      attempts: 0,
+      queuedAt: NOW,
+    });
+    expect(encoded).toMatchObject({
+      source_account_id: 'bank', destination_account_id: 'cash', amount: 100,
+    });
+  });
+
+  it('quarantines a transfer with missing or identical endpoints', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account())]);
+    client.tables.set('transfers', [
+      transferRow('missing-source'),
+      transferRow('same-account', {
+        source_account_id: 'cash', destination_account_id: 'cash',
+      }),
+    ]);
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+
+    const pulled = await remote.pull('user-a') as RemotePullResult;
+
+    expect(pulled.records.map((entry) => entry.record.id)).toEqual(['cash']);
+    expect(pulled.issues).toEqual([
+      expect.objectContaining({ entity: 'transfers', recordId: 'same-account' }),
+      expect.objectContaining({ entity: 'transfers', recordId: 'missing-source' }),
+    ]);
+  });
+
   it('maps allocation capacity rejection to a private actionable message', async () => {
     const client = new FakeSupabaseClient();
     client.applyError = () => ({

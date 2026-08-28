@@ -25,6 +25,7 @@ import {
   tombstoneRecordMeta,
 } from './state';
 import { TUTORIAL_RECORD_NOTE } from '../domain/tutorialRecord';
+import type { FinanceData } from '../domain/model';
 import { activeOperationId, syncFinanceState, type RemoteRecord } from '../domain/syncEngine';
 
 function memoryStorage() {
@@ -42,6 +43,53 @@ function readyAuthenticatedState(ownerId = 'user-a') {
 }
 
 describe('owner-scoped local state', () => {
+  it('upgrades a schema-3 snapshot and bootstrap candidates without losing the original key', () => {
+    const legacy = createInitialState('user-a') as unknown as Record<string, unknown>;
+    legacy.schemaVersion = 3;
+    const legacyData = legacy.data as Record<string, unknown>;
+    delete legacyData.transfers;
+    const bootstrap = legacy.initialBootstrap as { candidate: Record<string, unknown> };
+    delete bootstrap.candidate.transfers;
+    const raw = JSON.stringify(legacy);
+    const storage = {
+      getItem: (key: string) => key === storageKey('user-a') ? raw : null,
+    };
+
+    const loaded = loadFinanceStateWithRecovery('user-a', storage);
+
+    expect(loaded.recovery).toBeUndefined();
+    expect(loaded.state.schemaVersion).toBe(4);
+    expect(loaded.state.data.transfers).toEqual([]);
+    expect(loaded.state.initialBootstrap?.candidate.transfers).toEqual([]);
+  });
+
+  it('round-trips a pending authenticated transfer across an app restart', () => {
+    const storage = memoryStorage();
+    const initial = readyAuthenticatedState();
+    const source = initial.data.accounts[0];
+    const destination = {
+      ...source, id: 'account-bank', name: '銀行', sortOrder: 1,
+      lastOperationId: 'account-bank-create',
+    };
+    initial.data.accounts.push(destination);
+    const record = {
+      id: 'offline-transfer', ownerId: initial.ownerId, amount: 321,
+      sourceAccountId: source.id, sourceAccountName: source.name,
+      destinationAccountId: destination.id, destinationAccountName: destination.name,
+      occurredAt: '2026-08-28 10:30', note: '離線建立', version: 1,
+      updatedAt: '2026-08-28T02:30:00.000Z', lastOperationId: 'offline-transfer-create',
+    } satisfies FinanceData['transfers'][number];
+    const pending = putRecord(initial, 'transfers', record);
+
+    saveFinanceState(pending, storage);
+    const reloaded = loadFinanceState('user-a', storage);
+
+    expect(reloaded.data.transfers).toEqual([record]);
+    expect(reloaded.outbox).toEqual([expect.objectContaining({
+      entity: 'transfers', recordId: record.id, record,
+    })]);
+  });
+
   it('quarantines an impossible guest conflict lock so backup recovery remains available', () => {
     const impossible = createInitialState('guest');
     impossible.unresolvedSyncRecordKeys = [`accounts:${impossible.data.accounts[0].id}`];
@@ -791,7 +839,7 @@ describe('owner-scoped local state', () => {
       decisionError: 'decision storage denied',
     });
     expect(JSON.parse(values.get(storageKey('user-a')) ?? '{}')).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
     });
   });

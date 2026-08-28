@@ -10,6 +10,7 @@ import type {
   SavingsGoal,
   PersistedFinanceState,
   SyncRecord,
+  Transfer,
 } from '../domain/model';
 import { catchUpRecurringTransactions } from '../domain/recurrence';
 import { recurringRuleParentIssue } from '../domain/recurringSafety';
@@ -276,6 +277,16 @@ export function syncMutationTargets<E extends FinanceEntityName>(
       if (candidate.recurringRuleId) {
         targets.push({ entity: 'recurringRules', recordId: candidate.recurringRuleId });
       }
+    }
+  }
+  if (entity === 'transfers') {
+    const transfer = record as Transfer;
+    const existing = state.data.transfers.find((candidate) => candidate.id === transfer.id);
+    for (const candidate of [transfer, existing].filter(Boolean) as Transfer[]) {
+      targets.push(
+        { entity: 'accounts', recordId: candidate.sourceAccountId },
+        { entity: 'accounts', recordId: candidate.destinationAccountId },
+      );
     }
   }
   if (entity === 'adjustments') {

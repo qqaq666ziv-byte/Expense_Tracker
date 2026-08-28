@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { RecurringRule, Transaction } from '../domain/model';
+import type { RecurringRule, Transaction, Transfer } from '../domain/model';
 import {
   createInitialState,
   loadFinanceStateWithRecovery,
@@ -241,6 +241,52 @@ describe('unresolved sync conflict mutation lock', () => {
     ]));
     expect(() => assertSyncRecordMutationsAllowed(state, editTargets)).toThrow(/未解同步衝突/);
     expect(() => assertSyncRecordMutationsAllowed(state, deleteTargets)).toThrow(/未解同步衝突/);
+  });
+
+  it('locks a transfer behind both old and newly selected source and destination accounts', () => {
+    const state = createInitialState('user-a');
+    state.initialBootstrap = undefined;
+    state.outbox = [];
+    const oldSource = state.data.accounts[0];
+    const oldDestination = {
+      ...oldSource, id: 'old-destination', name: '舊目的', sortOrder: 1,
+      lastOperationId: 'old-destination-create',
+    };
+    state.data.accounts.push(oldDestination);
+    const newSource = { ...oldSource, id: 'new-source', name: '新來源', lastOperationId: 'new-source-create' };
+    const newDestination = {
+      ...oldDestination, id: 'new-destination', name: '新目的', lastOperationId: 'new-destination-create',
+    };
+    state.data.accounts.push(newSource, newDestination);
+    const existing = {
+      id: 'transfer-parent-locks', ownerId: 'user-a', amount: 100,
+      sourceAccountId: oldSource.id, sourceAccountName: oldSource.name,
+      destinationAccountId: oldDestination.id, destinationAccountName: oldDestination.name,
+      occurredAt: '2026-08-27 08:00', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'transfer-create',
+    } satisfies Transfer;
+    state.data.transfers = [existing];
+    state.unresolvedSyncRecordKeys = [`accounts:${oldSource.id}`];
+    const moved = {
+      ...existing,
+      sourceAccountId: newSource.id,
+      sourceAccountName: newSource.name,
+      destinationAccountId: newDestination.id,
+      destinationAccountName: newDestination.name,
+      version: 2,
+      lastOperationId: 'transfer-move',
+    };
+
+    const targets = syncMutationTargets(state, 'transfers', moved);
+
+    expect(targets).toEqual(expect.arrayContaining([
+      { entity: 'transfers', recordId: existing.id },
+      { entity: 'accounts', recordId: oldSource.id },
+      { entity: 'accounts', recordId: oldDestination.id },
+      { entity: 'accounts', recordId: newSource.id },
+      { entity: 'accounts', recordId: newDestination.id },
+    ]));
+    expect(() => assertSyncRecordMutationsAllowed(state, targets)).toThrow(/未解同步衝突/);
   });
 
   it('does not materialize a recurring transaction while a referenced parent is conflicted', () => {

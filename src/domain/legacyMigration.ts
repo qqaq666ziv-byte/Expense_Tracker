@@ -488,6 +488,7 @@ export function migrateLegacyData(source: unknown, options: LegacyMigrationOptio
     accounts,
     categories,
     transactions,
+    transfers: [],
     adjustments: [],
     goals,
     allocations,

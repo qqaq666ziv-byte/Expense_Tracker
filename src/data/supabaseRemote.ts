@@ -11,6 +11,7 @@ import type {
   SavingsGoal,
   SyncRecord,
   Transaction,
+  Transfer,
 } from '../domain/model';
 import type {
   RemoteAdapter,
@@ -35,6 +36,7 @@ const TABLE_BY_ENTITY: Record<FinanceEntityName, string> = {
   accounts: 'accounts',
   categories: 'categories',
   transactions: 'transactions',
+  transfers: 'transfers',
   adjustments: 'adjustments',
   goals: 'goals',
   allocations: 'savings_allocations',
@@ -47,6 +49,7 @@ const ENTITY_NAMES = Object.keys(TABLE_BY_ENTITY) as FinanceEntityName[];
 const MONEY_COLUMN_BY_ENTITY: Partial<Record<FinanceEntityName, string>> = {
   accounts: 'opening_balance',
   transactions: 'amount',
+  transfers: 'amount',
   adjustments: 'amount_delta',
   goals: 'target_amount',
   allocations: 'amount_delta',
@@ -414,6 +417,7 @@ function decodeRemoteRecord(entity: FinanceEntityName, row: DatabaseRow): Remote
     case 'accounts': return { entity, record: decodeAccount(row) };
     case 'categories': return { entity, record: decodeCategory(row) };
     case 'transactions': return { entity, record: decodeTransaction(row) };
+    case 'transfers': return { entity, record: decodeTransfer(row) };
     case 'adjustments': return { entity, record: decodeAdjustment(row) };
     case 'goals': return { entity, record: decodeGoal(row) };
     case 'allocations': return { entity, record: decodeAllocation(row) };
@@ -472,6 +476,19 @@ function encodeRecord(entity: FinanceEntityName, record: SyncEntityRecord): Data
         account: transaction.accountName,
         date: transaction.occurredAt,
         icon: 'SPARKLES',
+      };
+    }
+    case 'transfers': {
+      const transfer = record as Transfer;
+      return {
+        ...common,
+        amount: transfer.amount,
+        source_account_id: transfer.sourceAccountId,
+        source_account_name: transfer.sourceAccountName,
+        destination_account_id: transfer.destinationAccountId,
+        destination_account_name: transfer.destinationAccountName,
+        occurred_at: transfer.occurredAt,
+        note: transfer.note ?? null,
       };
     }
     case 'adjustments': {
@@ -679,6 +696,13 @@ function validateRemoteGraph(records: readonly RemoteRecord[]): RemotePullResult
         }
         break;
       }
+      case 'transfers':
+        if (!accountIds.has(entry.record.sourceAccountId)) reason = 'references a missing source account';
+        else if (!accountIds.has(entry.record.destinationAccountId)) reason = 'references a missing destination account';
+        else if (entry.record.sourceAccountId === entry.record.destinationAccountId) {
+          reason = 'uses the same source and destination account';
+        }
+        break;
       case 'adjustments':
         if (!accountIds.has(entry.record.accountId)) reason = 'references a missing account';
         break;
@@ -837,5 +861,24 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
       }
       return { entity: replacement.entity, record: persisted } as RemoteRecord;
     },
+  };
+}
+
+function decodeTransfer(row: DatabaseRow): Transfer {
+  const note = optionalString(row, 'note');
+  const sourceAccountId = requiredString(row, 'source_account_id');
+  const destinationAccountId = requiredString(row, 'destination_account_id');
+  if (sourceAccountId === destinationAccountId) {
+    throw new Error('Supabase transfer requires different source and destination accounts');
+  }
+  return {
+    ...commonRecord(row),
+    amount: requiredPositiveNumber(row, 'amount'),
+    sourceAccountId,
+    sourceAccountName: requiredString(row, 'source_account_name'),
+    destinationAccountId,
+    destinationAccountName: requiredString(row, 'destination_account_name'),
+    occurredAt: requiredDate(row, 'occurred_at'),
+    ...(note === undefined ? {} : { note }),
   };
 }
