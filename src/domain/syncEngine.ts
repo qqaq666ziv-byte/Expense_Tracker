@@ -35,6 +35,21 @@ export function hasTransferDependencyConflict(
     && operation.lastError?.startsWith(TRANSFER_DEPENDENCY_CONFLICT_PREFIX) === true;
 }
 
+function transferDependencyAccountIds(operation: PendingOperation): ReadonlySet<string> {
+  if (!hasTransferDependencyConflict(operation) || !operation.lastError) return new Set();
+  const marker = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: accounts=`;
+  if (!operation.lastError.startsWith(marker)) return new Set();
+  const serialized = operation.lastError.slice(marker.length).split(';', 1)[0];
+  try {
+    return new Set(serialized
+      .split(',')
+      .filter(Boolean)
+      .map((accountId) => decodeURIComponent(accountId)));
+  } catch {
+    return new Set();
+  }
+}
+
 function budgetConflictRollbackOperationId(): string {
   return activeOperationId(`${BUDGET_CONFLICT_ROLLBACK_MARKER}${crypto.randomUUID()}`);
 }
@@ -271,11 +286,23 @@ export function confirmTransferDependencyConflict(
     || source.deletedAt || destination.deletedAt || !source.isActive || !destination.isActive) {
     throw new Error('請重新選擇兩個目前可用的帳戶。');
   }
-  if (source.id === destination.id
-    || replacement.sourceAccountName !== source.name
-    || replacement.destinationAccountName !== destination.name) {
-    throw new Error('帳戶選擇或名稱快照不是目前明確確認的版本。');
+  if (source.id === destination.id) throw new Error('來源帳戶與目的帳戶必須不同。');
+  const dependencyAccountIds = transferDependencyAccountIds(pending);
+  const refreshSourceSnapshot = source.id !== current.sourceAccountId
+    || dependencyAccountIds.has(source.id);
+  const refreshDestinationSnapshot = destination.id !== current.destinationAccountId
+    || dependencyAccountIds.has(destination.id);
+  if ((refreshSourceSnapshot && replacement.sourceAccountName !== source.name)
+    || (refreshDestinationSnapshot && replacement.destinationAccountName !== destination.name)) {
+    throw new Error('新選或已變更帳戶的名稱快照不是目前明確確認的版本。');
   }
+  const confirmedReplacement = {
+    ...replacement,
+    sourceAccountName: refreshSourceSnapshot ? source.name : current.sourceAccountName,
+    destinationAccountName: refreshDestinationSnapshot
+      ? destination.name
+      : current.destinationAccountName,
+  };
   const affectedAccountIds = new Set([
     current.sourceAccountId,
     current.destinationAccountId,
@@ -292,18 +319,18 @@ export function confirmTransferDependencyConflict(
       throw new Error('來源或目的帳戶仍有未解同步衝突，轉帳帳戶確認未套用。');
     }
   }
-  assertFinanceRecordWithinWriteLimits('transfers', replacement);
+  assertFinanceRecordWithinWriteLimits('transfers', confirmedReplacement);
 
-  const data = replaceRecord(state.data, { entity: 'transfers', record: replacement });
+  const data = replaceRecord(state.data, { entity: 'transfers', record: confirmedReplacement });
   validateFinanceData(data, 'confirmed transfer account dependency');
   const outbox = state.outbox.map((operation) => (
     operation === pending
       ? {
           ...operation,
-          id: replacement.lastOperationId,
-          record: replacement,
+          id: confirmedReplacement.lastOperationId,
+          record: confirmedReplacement,
           attempts: 0,
-          queuedAt: replacement.updatedAt,
+          queuedAt: confirmedReplacement.updatedAt,
           lastError: undefined,
         }
       : operation
@@ -1379,19 +1406,19 @@ export async function syncFinanceState(
           // Direct transfer conflicts retain the normal accept-cloud path.
           if (transferComparison < 0 || divergentSameClock) continue;
         }
-        const changedEndpoint = [
+        const changedEndpoints = [
           [transfer.sourceAccountId, remoteTransfer?.sourceAccountId],
           [transfer.destinationAccountId, remoteTransfer?.destinationAccountId],
-        ].find(([accountId, historicalAccountId]) => {
+        ].flatMap(([accountId, historicalAccountId]) => {
             // Unchanged endpoints intentionally retain their historical
             // snapshots, including accounts archived after the transfer.
-            if (historicalAccountId === accountId) return false;
+            if (historicalAccountId === accountId) return [];
             const accountKey = recordKey('accounts', accountId);
             const localAccount = state.data.accounts.find((account) => account.id === accountId);
             const remoteAccount = preflightByKey.get(accountKey);
             if (localAccount && remoteAccount?.entity === 'accounts'
               && differingSyncRecordFields('accounts', localAccount, remoteAccount.record).length === 0) {
-              return false;
+              return [];
             }
             const parentOperationIndex = state.outbox.findIndex((candidate) => (
               candidate.entity === 'accounts' && candidate.recordId === accountId
@@ -1408,10 +1435,11 @@ export async function syncFinanceState(
               && differingSyncRecordFields('accounts', parentOperation.record, localAccount).length === 0
               && (!remoteAccount || compareSyncRecords(parentOperation.record, remoteAccount.record) > 0),
             );
-            return !parentWillEstablishExactLocalState;
-          })?.[0];
-        if (!changedEndpoint) continue;
-        const reason = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: account/${changedEndpoint}; `
+            return parentWillEstablishExactLocalState ? [] : [accountId];
+          });
+        if (changedEndpoints.length === 0) continue;
+        const dependencyIds = [...new Set(changedEndpoints)].map(encodeURIComponent).join(',');
+        const reason = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: accounts=${dependencyIds}; `
           + '請重新開啟轉帳並明確確認來源與目的帳戶。';
         preflightBlockedKeys.add(transferKey);
         preflightBlockedReasons.set(transferKey, reason);

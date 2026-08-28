@@ -285,7 +285,7 @@ describe('offline sync engine', () => {
   });
 
   it('holds an offline retarget when the newly selected endpoint changed remotely', async () => {
-    const bank = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const bank = { ...account('bank', 'user-a', 2, 'bank-renamed'), name: '主要銀行' };
     const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
     const localBroker = { ...account('broker', 'user-a', 1, 'broker-create'), name: '券商舊名' };
     const remoteBroker = {
@@ -295,7 +295,10 @@ describe('offline sync engine', () => {
       updatedAt: '2026-08-28T03:00:00.000Z',
       lastOperationId: 'broker-remote-rename',
     };
-    const cloudTransfer = transfer('retarget-transfer', 'user-a', 1, 'transfer-cloud-create');
+    const cloudTransfer = {
+      ...transfer('retarget-transfer', 'user-a', 1, 'transfer-cloud-create'),
+      sourceAccountName: '銀行舊名',
+    };
     const localRetarget = {
       ...cloudTransfer,
       destinationAccountId: localBroker.id,
@@ -324,6 +327,9 @@ describe('offline sync engine', () => {
 
     const replacement = {
       ...localRetarget,
+      // Home rebuilds both names from current selections. The domain resolver
+      // must restore the unchanged cloud endpoint's immutable historical name.
+      sourceAccountName: bank.name,
       destinationAccountName: remoteBroker.name,
       version: 3,
       updatedAt: '2026-08-28T03:01:00.000Z',
@@ -341,6 +347,8 @@ describe('offline sync engine', () => {
       destinationAccountName: cash.name,
     })).toThrow(/帳戶仍有未解同步衝突/);
     const confirmed = confirmTransferDependencyConflict(blocked.state, replacement);
+    expect(confirmed.data.transfers[0].sourceAccountName).toBe('銀行舊名');
+    expect(confirmed.data.transfers[0].destinationAccountName).toBe(remoteBroker.name);
     const converged = await syncFinanceState(confirmed, 'user-a', remote);
     expect(converged.state.outbox).toEqual([]);
     expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
