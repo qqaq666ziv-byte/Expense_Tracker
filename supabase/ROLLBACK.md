@@ -3,8 +3,8 @@
 Migrations:
 
 - `20260821103249_finance_v3_additive_schema.sql` — applied to production on 2026-08-24 after an independently stored PostgreSQL backup.
-- `20260824023801_finance_resource_abuse_guards.sql` — reviewed and locally verified, **not applied to production** pending explicit authorization.
-- `20260828013341_finance_account_transfers.sql` — additive first-class transfer table and capacity-guard extension, locally verified, **not applied to production** pending explicit authorization.
+- `20260824023801_finance_resource_abuse_guards.sql` — applied to Production as part of the completed transfer release.
+- `20260828013341_finance_account_transfers.sql` — additive first-class transfer table and capacity-guard extension, applied to Production as part of the completed transfer release.
 
 The first migration preserves legacy financial rows and columns while expanding the schema and correcting legacy IDs to owner-scoped primary keys. The second migration changes no row values: it adds `NOT VALID` future-write text/numeric checks and a trigger-enforced per-owner row ceiling. The transfer migration creates one owner-scoped row per logical transfer, adds no backfill, and updates the server allocation-capacity calculation so included/excluded account boundaries agree with the client. The Git restore points are:
 
@@ -30,9 +30,9 @@ Before applying any pending migration to a non-local database:
 5. Verify migrated entity counts, orphan checks, RLS owner isolation, recurrence uniqueness, server allocation-capacity rejection, parent-archive atomic pauses, the bidirectional legacy-goal/subscription mirrors, and the owner-scoped primary keys before production approval.
 6. Confirm there are no unexpected incoming foreign keys to the four legacy tables. The migration intentionally aborts rather than dropping an unknown dependency.
 
-For `finance_resource_abuse_guards`, also record aggregate-only preflight results for every guarded text/numeric field and each owner's table count. The 2026-08-24 production preflight found zero text or numeric violations in all currently non-empty finance tables and every owner below quota. Re-run it immediately before deployment because production can change. A `NOT VALID` constraint preserves an existing violating row at creation time but rejects a later update to that row; if preflight ever reports a violation, stop and design a reviewed, data-preserving cleanup before applying the guard.
+For `finance_resource_abuse_guards`, the pre-release aggregate-only preflight recorded every guarded text/numeric field and each owner's table count. The 2026-08-24 production preflight found zero text or numeric violations in all currently non-empty finance tables and every owner below quota. For any future guard-related deployment, re-run the preflight immediately beforehand because production can change. A `NOT VALID` constraint preserves an existing violating row at creation time but rejects a later update to that row; if preflight ever reports a violation, stop and design a reviewed, data-preserving cleanup before applying a further guard change.
 
-For `finance_account_transfers`, preserve migration order: apply `20260824023801_finance_resource_abuse_guards.sql` before `20260828013341_finance_account_transfers.sql`. The release also requires the reviewed `finance-import-historical-transfer-batch` Edge Function. Its browser-facing handler verifies the user JWT and complete owner-scoped import/restore manifest, while the atomic database function is executable only by `service_role`; never expose that credential to a frontend. Deploy and smoke the function on isolated staging before enabling authenticated import/restore. Then prove ordinary `authenticated` clients cannot execute the privileged RPC, transfer owner isolation, positive/distinct-account constraints, archived-account rejection for normal new endpoints, deterministic endpoint row locking, same-clock conflict rejection, tombstone retry, and all four included/excluded total-assets cases. Immediately before an authorized Production release, re-read remote migration/function metadata and take a fresh independently verified backup/PITR point. Do not deploy a frontend that can create transfers until the table, policies, grants, and required Edge Function are confirmed available.
+The completed transfer release applied `20260824023801_finance_resource_abuse_guards.sql` before `20260828013341_finance_account_transfers.sql`, released the transfer-capable frontend, and released the reviewed `finance-import-historical-transfer-batch` Edge Function. Its browser-facing handler verifies the user JWT and complete owner-scoped import/restore manifest, while the atomic database function is executable only by `service_role`; never expose that credential to a frontend. Production can therefore contain first-class `public.transfers` rows. For any future migration/function release, use isolated staging and verify that ordinary `authenticated` clients cannot execute the privileged RPC, transfer owner isolation, positive/distinct-account constraints, archived-account rejection for normal new endpoints, deterministic endpoint row locking, same-clock conflict rejection, tombstone retry, and all four included/excluded total-assets cases. Re-read remote metadata and take a fresh independently verified backup/PITR point before deployment.
 
 The repository release document and the domains currently attached to the active Vercel project have a known topology discrepancy. It remains a separate release follow-up; do not change domains or aliases as part of the transfer database release.
 
@@ -95,16 +95,17 @@ The guard migration is additive and performs no backfill. If it is later authori
 
 No executable destructive down migration is checked in because guard removal weakens a security boundary and requires action-time authorization. Exact point-in-time reversal remains the external backup/PITR path.
 
-### Transfer migration release and rollback
+### Completed transfer release and rollback
 
-For a later explicitly authorized release:
-
-1. Create and verify a fresh external database backup/PITR restore point; record aggregate row counts and current policies/grants without exporting financial rows.
-2. Apply pending migrations in timestamp order on isolated staging, deploy the reviewed `finance-import-historical-transfer-batch` Edge Function there, run `npm.cmd run verify:migration`, then repeat owner/RLS, import-authorization, and transfer-capacity smoke checks.
-3. Confirm `authenticated` and `anon` cannot execute `finance_import_historical_transfer_batch`; only the server-side `service_role` used by the JWT-verifying Edge Function may execute it. Never place the service-role credential in a browser build.
-4. Apply the same pending migrations and Edge Function to Production only through the separately authorized Supabase release workflow.
-5. Verify that `public.transfers` has exactly three authenticated owner policies, no authenticated `DELETE` grant, both owner-scoped account foreign keys, conflict/resource/account guards, deterministic endpoint row locking, and no orphan rows.
-6. Deploy the compatible frontend only after the schema and function checks succeed; verify guest and an authorized isolated authenticated ledger without touching genuine user financial rows.
+`20260824023801_finance_resource_abuse_guards.sql`,
+`20260828013341_finance_account_transfers.sql`, the
+`finance-import-historical-transfer-batch` Edge Function, and the
+transfer-capable frontend were released to Production. Production can contain
+`public.transfers` rows; preserve the table, policies, tombstones, and
+associated financial records during incident response. For a future migration
+or function release, create and independently verify a fresh external database
+backup/PITR restore point; record aggregate row counts and current
+policies/grants without exporting financial rows.
 
 For code-only rollback, follow the rule in [Code-only frontend rollback](#code-only-frontend-rollback):
 when a Production transfer row may exist, use the transfer-aware emergency

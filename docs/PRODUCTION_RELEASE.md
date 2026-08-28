@@ -176,16 +176,18 @@ invalid, or conflicting before changing the guard.
 Do not bulk rewrite, delete, reassign, or merge real financial records without
 an explicit migration/recovery rule and appropriate authorization.
 
-The transfer release has one server artifact in addition to the additive
-migration: `supabase/functions/finance-import-historical-transfer-batch`. Its
-public handler verifies the Supabase user JWT and complete owner-scoped
-import/restore manifest, then uses the server-only service role to enter the
-single atomic database transaction. `anon` and ordinary `authenticated` roles
-must have no `EXECUTE` privilege on that RPC. On isolated staging, deploy and
-smoke the reviewed Edge Function together with the migration, verify the role
-grants and endpoint row locks, and only then enable the matching frontend.
-Production migration/function deployment remains a separately authorized
-operation; never copy a service-role credential into Vercel or browser code.
+The completed transfer release applied
+`20260824023801_finance_resource_abuse_guards.sql` and
+`20260828013341_finance_account_transfers.sql`, released the transfer-capable
+frontend, and released the server artifact
+`supabase/functions/finance-import-historical-transfer-batch`. Its public
+handler verifies the Supabase user JWT and complete owner-scoped import/restore
+manifest, then uses the server-only service role to enter the single atomic
+database transaction. `anon` and ordinary `authenticated` roles must have no
+`EXECUTE` privilege on that RPC. Future migration/function releases still
+require isolated staging verification, a fresh independent backup/PITR point,
+and explicit authorization; never copy a service-role credential into Vercel
+or browser code.
 
 ---
 
@@ -263,17 +265,20 @@ Do not stack speculative fixes across multiple layers at once.
 
 ---
 
-## Release record
+## Historical release record — 2026-08-24
+
+This is historical topology and release evidence, not the current or latest
+Production-state record after the completed transfer release.
 
 Canonical Vercel project ID:
 
 `prj_PDwYdTxA52vgkfRek2AzNofUJCHW`
 
-Latest known-good production commit:
+Recorded production commit:
 
 `3b36bc0d63a635ef66fe2aadb8eb52a610ffd0dd`
 
-Latest known-good production deployment:
+Recorded production deployment:
 
 `dpl_14dFNW7J6LfgwLtuMtEuQufxi3KC`
 
@@ -299,9 +304,11 @@ Verified production topology and evidence:
   a newer project deployment was ready while the canonical alias still resolved
   to an older deployment. The canonical alias was explicitly assigned to the
   recorded deployment and then verified by hostname.
-- No production database migration or bulk financial-data mutation was part of
-  this release. In particular,
-  `20260824023801_finance_resource_abuse_guards.sql` was not deployed.
+- This historical release did not include a production database migration or
+  bulk financial-data mutation. In particular,
+  `20260824023801_finance_resource_abuse_guards.sql` was not deployed as part
+  of this 2026-08-24 release; it was applied later as part of the completed
+  transfer release.
 - Source restore point:
   `checkpoint/20260824-194448-before-auth-production-sync-incident` at
   `ba2e4f282817d1056d38dcce389e5804c0c09ae1`.
