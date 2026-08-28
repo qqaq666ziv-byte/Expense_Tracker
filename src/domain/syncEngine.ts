@@ -1,4 +1,5 @@
 import type {
+  Budget,
   FinanceData,
   FinanceEntityName,
   OwnerId,
@@ -6,8 +7,146 @@ import type {
   PersistedFinanceState,
 } from './model';
 import { validateFinanceData } from './backup';
+import { hasSameBudgetSemantics } from './budgetEngine';
+import { assertLifecycleTransition } from './lifecycle';
 
 export type SyncEntityRecord = FinanceData[FinanceEntityName][number];
+
+/**
+ * Active updates must sort below every canonical legacy UUID. This makes an
+ * equal-version delete win even when it reaches the server between the
+ * preflight pull and this write. `0-` is lower than the first two characters
+ * of any canonical v4 UUID. Even if a locale ignores punctuation, the all-zero
+ * UUID shape sorts below the mandatory v4 version nibble (`0` versus `4`).
+ */
+export function activeOperationId(operationId: string = crypto.randomUUID()): string {
+  return `00000000-0000-0000-0000-000000000000:active:${operationId}`;
+}
+
+const BUDGET_CONFLICT_ROLLBACK_MARKER = 'budget-conflict-rollback:';
+export const UNRESOLVED_PAYLOAD_CONFLICT_PREFIX = 'unresolved same-clock payload conflict';
+
+function budgetConflictRollbackOperationId(): string {
+  return activeOperationId(`${BUDGET_CONFLICT_ROLLBACK_MARKER}${crypto.randomUUID()}`);
+}
+
+function isBudgetConflictRollback(operation: PendingOperation): boolean {
+  return operation.record.lastOperationId.includes(`:${BUDGET_CONFLICT_ROLLBACK_MARKER}`);
+}
+
+async function batchCompensationOperationId(
+  operation: PendingOperation,
+): Promise<string | undefined> {
+  if (!operation.batchId || operation.batchBeforeRecord === undefined) return undefined;
+  const identity = JSON.stringify([
+    operation.batchId,
+    operation.entity,
+    operation.recordId,
+    operation.id,
+    operation.record.ownerId,
+  ]);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity));
+  const fingerprint = Array.from(new Uint8Array(digest), (byte) => (
+    byte.toString(16).padStart(2, '0')
+  )).join('');
+  return operation.batchBeforeRecord === null || operation.batchBeforeRecord.deletedAt
+    ? `tombstone:batch-compensation:${fingerprint}`
+    : activeOperationId(`batch-compensation:${fingerprint}`);
+}
+
+async function batchCompensationOperation(
+  operation: PendingOperation,
+  remoteRecord: SyncEntityRecord,
+  timestamp: string,
+): Promise<PendingOperation | undefined> {
+  const operationId = await batchCompensationOperationId(operation);
+  if (!operationId) return undefined;
+  const before = operation.batchBeforeRecord;
+  const record = before === null
+    ? {
+        ...operation.record,
+        version: remoteRecord.version + 1,
+        updatedAt: timestamp,
+        lastOperationId: operationId,
+        deletedAt: timestamp,
+        ...('isActive' in operation.record ? { isActive: false } : {}),
+      }
+    : {
+        ...before,
+        version: remoteRecord.version + 1,
+        updatedAt: timestamp,
+        lastOperationId: operationId,
+      };
+  return {
+    ...operation,
+    id: record.lastOperationId,
+    record,
+    attempts: 0,
+    queuedAt: timestamp,
+    lastError: '批次遇到同步衝突；已將先完成的成員安全補償回操作前狀態，等待整批採用雲端版本。',
+  };
+}
+
+function batchRetryOperation(
+  operation: PendingOperation,
+  compensation: PendingOperation,
+  timestamp: string,
+): PendingOperation {
+  const desired = {
+    ...operation.record,
+    version: compensation.record.version + 1,
+    updatedAt: timestamp,
+    lastOperationId: operation.record.deletedAt
+      ? `tombstone:${crypto.randomUUID()}`
+      : activeOperationId(`batch-retry:${crypto.randomUUID()}`),
+  };
+  return {
+    ...operation,
+    id: desired.lastOperationId,
+    record: desired,
+    attempts: 0,
+    queuedAt: timestamp,
+    batchBeforeRecord: structuredClone(compensation.record),
+    lastError: '批次尚未完整套用；遠端已回復前態，本機完整意圖會在下次同步整批重試。',
+  };
+}
+
+async function recoveredBatchRetryOperation(
+  operation: PendingOperation,
+  remoteRecord: RemoteRecord,
+  timestamp: string,
+): Promise<PendingOperation | undefined> {
+  const expectedCompensationId = await batchCompensationOperationId(operation);
+  if (!expectedCompensationId
+    || remoteRecord.record.lastOperationId !== expectedCompensationId
+    || remoteRecord.record.version <= operation.record.version) return undefined;
+  const expectedPayload = operation.batchBeforeRecord === null
+    ? {
+        ...operation.record,
+        version: remoteRecord.record.version,
+        updatedAt: remoteRecord.record.updatedAt,
+        lastOperationId: remoteRecord.record.lastOperationId,
+        deletedAt: remoteRecord.record.deletedAt,
+        ...('isActive' in operation.record ? { isActive: false } : {}),
+      }
+    : {
+        ...operation.batchBeforeRecord,
+        version: remoteRecord.record.version,
+        updatedAt: remoteRecord.record.updatedAt,
+        lastOperationId: remoteRecord.record.lastOperationId,
+      };
+  if (operation.batchBeforeRecord === null && !remoteRecord.record.deletedAt) return undefined;
+  if (differingSyncRecordFields(
+    operation.entity,
+    expectedPayload,
+    remoteRecord.record,
+  ).length > 0) return undefined;
+  return batchRetryOperation(operation, {
+    ...operation,
+    id: remoteRecord.record.lastOperationId,
+    record: remoteRecord.record,
+  }, timestamp);
+}
 
 export type RemoteRecord = {
   [Entity in FinanceEntityName]: {
@@ -37,6 +176,12 @@ export type RemotePullResponse = readonly RemoteRecord[] | RemotePullResult;
 export interface RemoteAdapter {
   pull(ownerId: string): Promise<RemotePullResponse>;
   apply(ownerId: string, operation: PendingOperation): Promise<void>;
+  /** Atomically replace `expected` only while its conflict clock is unchanged. */
+  compareAndSwap?(
+    ownerId: string,
+    expected: RemoteRecord,
+    replacement: PendingOperation,
+  ): Promise<RemoteRecord | undefined>;
 }
 
 export interface SyncPending {
@@ -79,6 +224,254 @@ export interface SyncResult {
   report: SyncReport;
 }
 
+export function syncRecordKey(entity: FinanceEntityName, recordId: string): string {
+  return `${entity}:${recordId}`;
+}
+
+export function hasUnresolvedPayloadConflict(
+  operations: readonly PendingOperation[],
+  entity: FinanceEntityName,
+  recordId: string,
+  persistedKeys: readonly string[] = [],
+): boolean {
+  const key = syncRecordKey(entity, recordId);
+  const directlyLocked = new Set([
+    ...persistedKeys,
+    ...operations
+      .filter((operation) => operation.lastError?.startsWith(UNRESOLVED_PAYLOAD_CONFLICT_PREFIX))
+      .map((operation) => syncRecordKey(operation.entity, operation.recordId)),
+  ]);
+  if (directlyLocked.has(key)) return true;
+  const lockedBatchIds = new Set(operations.flatMap((operation) => (
+    operation.batchId
+      ? [operation.batchId]
+      : []
+  )));
+  return operations.some((operation) => (
+    syncRecordKey(operation.entity, operation.recordId) === key
+    && operation.batchId !== undefined
+    && lockedBatchIds.has(operation.batchId)
+  ));
+}
+
+export function unresolvedPayloadConflictKeys(
+  operations: readonly PendingOperation[],
+  conflicts: readonly SyncConflict[] = [],
+  persistedKeys: readonly string[] = [],
+): ReadonlySet<string> {
+  const keys = new Set([
+    ...persistedKeys,
+    ...operations
+      .filter((operation) => operation.lastError?.startsWith(UNRESOLVED_PAYLOAD_CONFLICT_PREFIX))
+      .map((operation) => syncRecordKey(operation.entity, operation.recordId)),
+    ...conflicts
+      .filter((conflict) => conflict.winner === 'unresolved')
+      .map((conflict) => syncRecordKey(conflict.entity, conflict.recordId)),
+  ]);
+  const lockedBatchIds = new Set(operations.flatMap((operation) => (
+    operation.batchId && keys.has(syncRecordKey(operation.entity, operation.recordId))
+      ? [operation.batchId]
+      : []
+  )));
+  for (const operation of operations) {
+    if (operation.batchId && lockedBatchIds.has(operation.batchId)) {
+      keys.add(syncRecordKey(operation.entity, operation.recordId));
+    }
+  }
+  return keys;
+}
+
+/**
+ * Resolve a record-level conflict by explicitly accepting the last validated
+ * cloud record. This is the only path that clears a persisted conflict lock;
+ * ordinary pulls may change clocks but cannot infer the user's intent.
+ */
+export function acceptRemoteConflictRecord(
+  state: PersistedFinanceState,
+  remoteRecord: RemoteRecord,
+  remoteRecords: readonly RemoteRecord[] = [remoteRecord],
+): PersistedFinanceState {
+  const key = syncRecordKey(remoteRecord.entity, remoteRecord.record.id);
+  const targetOperation = state.outbox.find((operation) => (
+    syncRecordKey(operation.entity, operation.recordId) === key
+  ));
+  const targetBatchHasConflict = targetOperation?.batchId !== undefined
+    && state.outbox.some((operation) => (
+      operation.batchId === targetOperation.batchId
+      && state.unresolvedSyncRecordKeys?.includes(
+        syncRecordKey(operation.entity, operation.recordId),
+      )
+    ));
+  if (!state.unresolvedSyncRecordKeys?.includes(key) && !targetBatchHasConflict) {
+    throw new Error('這筆資料目前沒有可解除的同步衝突。');
+  }
+  if (remoteRecord.record.ownerId !== state.ownerId) {
+    throw new Error('雲端資料不屬於目前使用者，衝突未解除。');
+  }
+  const acceptedOperations = targetOperation?.batchId
+    ? state.outbox.filter((operation) => operation.batchId === targetOperation.batchId)
+    : targetOperation ? [targetOperation] : [];
+  const acceptedKeys = new Set([
+    key,
+    ...acceptedOperations.map((operation) => syncRecordKey(operation.entity, operation.recordId)),
+  ]);
+  const remoteByKey = new Map(remoteRecords.map((candidate) => [
+    syncRecordKey(candidate.entity, candidate.record.id),
+    candidate,
+  ]));
+  const preservedBeforeByKey = new Map<string, SyncEntityRecord>();
+  const acceptedRemoteRecords = [...acceptedKeys].flatMap((acceptedKey) => {
+    const accepted = remoteByKey.get(acceptedKey);
+    if (!accepted) {
+      const relatedOperation = acceptedOperations.find((operation) => (
+        syncRecordKey(operation.entity, operation.recordId) === acceptedKey
+      ));
+      if (acceptedKey !== key && relatedOperation?.batchBeforeRecord) {
+        // No cloud row cannot acknowledge an independently queued create/edit
+        // that existed before the lifecycle batch absorbed this member.
+        preservedBeforeByKey.set(
+          acceptedKey,
+          structuredClone(relatedOperation.batchBeforeRecord),
+        );
+      }
+      return [];
+    }
+    if (accepted.record.ownerId !== state.ownerId) {
+      throw new Error('關聯雲端資料不屬於目前使用者，衝突未解除。');
+    }
+    const current = (state.data[accepted.entity] as SyncEntityRecord[])
+      .find((candidate) => candidate.id === accepted.record.id);
+    if (!current || (
+      acceptedKey === key && compareSyncRecords(accepted.record, current) < 0
+    )) {
+      throw new Error('雲端版本比本機舊，為避免資料回滾，衝突未解除。');
+    }
+    const relatedOperation = acceptedOperations.find((operation) => (
+      syncRecordKey(operation.entity, operation.recordId) === acceptedKey
+    ));
+    const before = relatedOperation?.batchBeforeRecord;
+    if (acceptedKey !== key && before) {
+      const comparison = compareSyncRecords(accepted.record, before);
+      const sameClockExactPayload = comparison === 0
+        && differingSyncRecordFields(accepted.entity, accepted.record, before).length === 0;
+      if (comparison < 0 || (comparison === 0 && !sameClockExactPayload)) {
+        // A lifecycle batch may have absorbed an independently queued edit.
+        // Accepting the conflicted parent must not discard that earlier intent;
+        // restore it as a standalone operation and let normal sync reconcile it.
+        preservedBeforeByKey.set(acceptedKey, structuredClone(before));
+        return [];
+      }
+    }
+    return [accepted];
+  });
+  if (!remoteByKey.has(key)) {
+    throw new Error('雲端回應中找不到衝突主體，衝突未解除。');
+  }
+  const acceptedRemoteKeys = new Set(acceptedRemoteRecords.map((accepted) => (
+    syncRecordKey(accepted.entity, accepted.record.id)
+  )));
+
+  let data = state.data;
+  for (const accepted of acceptedRemoteRecords) data = replaceRecord(data, accepted);
+  let outbox = state.outbox.filter((operation) => (
+    !acceptedRemoteKeys.has(syncRecordKey(operation.entity, operation.recordId))
+  ));
+  for (const operation of acceptedOperations) {
+    const operationKey = syncRecordKey(operation.entity, operation.recordId);
+    const acceptedRelatedRecord = acceptedRemoteKeys.has(operationKey)
+      ? remoteByKey.get(operationKey)?.record
+      : undefined;
+    const preservedBefore = preservedBeforeByKey.get(operationKey);
+    let record = preservedBefore ?? acceptedRelatedRecord ?? operation.record;
+    let requiresStandaloneOperation = !acceptedRelatedRecord;
+    if (operation.entity === 'recurringRules') {
+      const rule = record as FinanceData['recurringRules'][number];
+      if (remoteRecord.entity === 'accounts' && rule.accountId === remoteRecord.record.id) {
+        const account = remoteRecord.record as FinanceData['accounts'][number];
+        const mustPause = Boolean(
+          !rule.deletedAt && (!account.isActive || account.deletedAt) && rule.isActive,
+        );
+        const mustRefreshMirror = Boolean(
+          !rule.deletedAt && !preservedBefore && rule.accountName !== account.name,
+        );
+        if (mustPause || mustRefreshMirror) {
+          record = {
+            ...rule,
+            ...(mustRefreshMirror ? { accountName: account.name } : {}),
+            ...(mustPause ? { isActive: false } : {}),
+            version: Math.max(rule.version, operation.record.version) + 1,
+            updatedAt: new Date().toISOString(),
+            lastOperationId: activeOperationId(`accept-cloud-parent:${crypto.randomUUID()}`),
+          };
+          requiresStandaloneOperation = true;
+        }
+      }
+      if (remoteRecord.entity === 'categories' && rule.categoryId === remoteRecord.record.id) {
+        const category = remoteRecord.record as FinanceData['categories'][number];
+        const mustPause = Boolean(
+          !rule.deletedAt && (!category.isActive || category.deletedAt) && rule.isActive,
+        );
+        const mustRefreshMirror = Boolean(
+          !rule.deletedAt && !preservedBefore && rule.categoryName !== category.name,
+        );
+        if (mustPause || mustRefreshMirror) {
+          record = {
+            ...rule,
+            ...(mustRefreshMirror ? { categoryName: category.name } : {}),
+            ...(mustPause ? { isActive: false } : {}),
+            version: Math.max(rule.version, operation.record.version) + 1,
+            updatedAt: new Date().toISOString(),
+            lastOperationId: activeOperationId(`accept-cloud-parent:${crypto.randomUUID()}`),
+          };
+          requiresStandaloneOperation = true;
+        }
+      }
+    }
+    if (!requiresStandaloneOperation) continue;
+    data = replaceRecord(data, { entity: operation.entity, record } as RemoteRecord);
+    const pending = outbox.find((candidate) => (
+      candidate.entity === operation.entity && candidate.recordId === operation.recordId
+    )) ?? operation;
+    outbox = [
+      ...outbox.filter((candidate) => (
+        candidate.entity !== operation.entity || candidate.recordId !== operation.recordId
+      )),
+      {
+        ...pending,
+        id: record.lastOperationId,
+        record,
+        attempts: preservedBefore || acceptedRelatedRecord ? 0 : pending.attempts,
+        queuedAt: preservedBefore || acceptedRelatedRecord ? record.updatedAt : pending.queuedAt,
+        batchId: undefined,
+        batchBeforeRecord: undefined,
+        lastError: preservedBefore
+          ? '已採用批次的雲端版本；批次前已排隊的獨立修改仍保留等待同步。'
+          : pending.lastError,
+      },
+    ];
+  }
+  validateFinanceData(data, 'accepted remote conflict record');
+  assertLifecycleTransition(state.data, data);
+  const unresolvedSyncRecordKeys = (state.unresolvedSyncRecordKeys ?? []).filter((candidate) => (
+    !acceptedRemoteKeys.has(candidate)
+  ));
+  const remainingErrors = new Set(outbox.flatMap((operation) => (
+    operation.lastError ? [operation.lastError] : []
+  )));
+  for (const unresolvedKey of unresolvedSyncRecordKeys) {
+    remainingErrors.add(`unresolved sync conflict for ${unresolvedKey}`);
+  }
+  return {
+    ...state,
+    data,
+    outbox,
+    unresolvedSyncRecordKeys: unresolvedSyncRecordKeys.length > 0
+      ? unresolvedSyncRecordKeys
+      : undefined,
+    lastSyncError: remainingErrors.size > 0 ? [...remainingErrors].join('; ') : undefined,
+  };
+}
+
 const ENTITY_NAMES: readonly FinanceEntityName[] = [
   'accounts',
   'categories',
@@ -113,7 +506,7 @@ function findRecord(data: FinanceData, { entity, record }: RemoteRecord): SyncEn
 }
 
 /** Compare the documented conflict clock: version first, then operation id. */
-function compareRecords(left: SyncEntityRecord, right: SyncEntityRecord): number {
+export function compareSyncRecords(left: SyncEntityRecord, right: SyncEntityRecord): number {
   if (left.version !== right.version) {
     return left.version > right.version ? 1 : -1;
   }
@@ -169,9 +562,7 @@ export function differingSyncRecordFields(
   )).sort();
 }
 
-function recordKey(entity: FinanceEntityName, recordId: string): string {
-  return `${entity}:${recordId}`;
-}
+const recordKey = syncRecordKey;
 
 function normalizePullResponse(response: RemotePullResponse): RemotePullResult {
   if (Array.isArray(response)) return { records: response, issues: [] };
@@ -190,7 +581,7 @@ function reconcileRecord(
     return replaceRecord(data, remoteRecord);
   }
 
-  const comparison = compareRecords(localRecord, remoteRecord.record);
+  const comparison = compareSyncRecords(localRecord, remoteRecord.record);
   if (comparison === 0) {
     const differingFields = differingSyncRecordFields(
       remoteRecord.entity,
@@ -214,7 +605,7 @@ function reconcileRecord(
       });
       failures.push({
         stage: 'conflict',
-        message: `unresolved same-clock payload conflict for ${remoteRecord.entity}/${remoteRecord.record.id} at fields: ${differingFields.join(', ')}`,
+        message: `${UNRESOLVED_PAYLOAD_CONFLICT_PREFIX} for ${remoteRecord.entity}/${remoteRecord.record.id} at fields: ${differingFields.join(', ')}`,
         entity: remoteRecord.entity,
         recordId: remoteRecord.record.id,
       });
@@ -226,6 +617,23 @@ function reconcileRecord(
   const hasPendingLocalMutation = pendingKeys.has(
     recordKey(remoteRecord.entity, remoteRecord.record.id),
   );
+  if (remoteRecord.record.deletedAt && !localRecord.deletedAt && hasPendingLocalMutation) {
+    conflicts.push({
+      entity: remoteRecord.entity,
+      recordId: remoteRecord.record.id,
+      winner: 'remote',
+      reason: localRecord.version === remoteRecord.record.version ? 'operation-id' : 'version',
+      local: {
+        version: localRecord.version,
+        lastOperationId: localRecord.lastOperationId,
+      },
+      remote: {
+        version: remoteRecord.record.version,
+        lastOperationId: remoteRecord.record.lastOperationId,
+      },
+    });
+    return replaceRecord(data, remoteRecord);
+  }
   if (!localWins && hasPendingLocalMutation) {
     conflicts.push({
       entity: remoteRecord.entity,
@@ -352,6 +760,27 @@ function validateOwnership(
       failures.push({
         stage: 'validation',
         message: `operation ${operation.id} does not match lastOperationId ${operation.record.lastOperationId}`,
+        operationId: operation.id,
+        entity: operation.entity,
+        recordId: operation.recordId,
+      });
+    }
+    if (operation.batchBeforeRecord !== undefined
+      && operation.batchBeforeRecord !== null
+      && (operation.batchBeforeRecord.ownerId !== state.ownerId
+        || operation.batchBeforeRecord.id !== operation.recordId)) {
+      failures.push({
+        stage: 'validation',
+        message: `operation ${operation.id} has an invalid batch before-record`,
+        operationId: operation.id,
+        entity: operation.entity,
+        recordId: operation.recordId,
+      });
+    }
+    if ((operation.batchId === undefined) !== (operation.batchBeforeRecord === undefined)) {
+      failures.push({
+        stage: 'validation',
+        message: `operation ${operation.id} has incomplete batch recovery metadata`,
         operationId: operation.id,
         entity: operation.entity,
         recordId: operation.recordId,
@@ -701,6 +1130,7 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
   entity: E,
   record: FinanceData[E][number],
   queuedAt: string = record.updatedAt,
+  batchId?: string,
 ): PersistedFinanceState {
   if (state.ownerId === 'guest') {
     throw new Error('guest state is local-only and cannot enqueue remote sync operations');
@@ -719,6 +1149,12 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
   }
 
   const syncRecord = record as SyncEntityRecord;
+  const existingRecord = (state.data[entity] as SyncEntityRecord[])
+    .find((candidate) => candidate.id === syncRecord.id);
+  const existingOperation = state.outbox.find((operation) => (
+    operation.entity === entity && operation.recordId === syncRecord.id
+  ));
+  const effectiveBatchId = existingOperation?.batchId ?? batchId;
   const nextOperation: PendingOperation = {
     id: syncRecord.lastOperationId,
     entity,
@@ -726,6 +1162,11 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
     record: syncRecord,
     attempts: 0,
     queuedAt,
+    ...(effectiveBatchId ? {
+      batchId: effectiveBatchId,
+      batchBeforeRecord: existingOperation?.batchBeforeRecord
+        ?? (existingRecord ? structuredClone(existingRecord) : null),
+    } : {}),
   };
 
   return {
@@ -771,12 +1212,302 @@ export async function syncFinanceState(
   let failures: SyncFailure[] = [];
   const conflicts: SyncConflict[] = [];
   const remaining: PendingOperation[] = [];
+  const appliedActiveBudgetOperations: PendingOperation[] = [];
+  const unresolvedKeys = new Set(state.unresolvedSyncRecordKeys ?? []);
+  const unresolvedBatchIds = new Set(state.outbox.flatMap((operation) => (
+    operation.batchId && unresolvedKeys.has(recordKey(operation.entity, operation.recordId))
+      ? [operation.batchId]
+      : []
+  )));
   let applied = 0;
 
-  for (const operation of state.outbox) {
+  // Pull before active writes to resolve known tombstones and legacy semantic
+  // budget conflicts. The low active-operation prefix separately closes the
+  // race where a legacy UUID tombstone arrives after this preflight.
+  let preflightBlockedKeys = new Set<string>();
+  const preflightBlockedReasons = new Map<string, string>();
+  const preflightDeactivatedBudgetKeys = new Set<string>();
+  const preflightBudgetOverrides = new Map<string, PendingOperation>();
+  const preflightApplyOverrides = new Map<string, PendingOperation>();
+  const preflightOptimisticBudgets = new Map<string, Budget>();
+  const preflightOptimisticRecords = new Map<string, RemoteRecord>();
+  if (state.outbox.length > 0) {
+    try {
+      const preflight = normalizePullResponse(await remote.pull(authenticatedOwnerId));
+      const blockEveryActiveWrite = preflight.issues.some((issue) => !issue.recordId)
+        || preflight.records.some((entry) => entry.record.ownerId !== authenticatedOwnerId);
+      preflightBlockedKeys = new Set([
+        ...preflight.records
+          .filter((entry) => entry.record.ownerId === authenticatedOwnerId && Boolean(entry.record.deletedAt))
+          .map((entry) => recordKey(entry.entity, entry.record.id)),
+        ...preflight.issues
+          .filter((issue) => issue.recordId)
+          .map((issue) => recordKey(issue.entity, issue.recordId!)),
+        ...(blockEveryActiveWrite
+          ? state.outbox.map((operation) => recordKey(operation.entity, operation.recordId))
+          : []),
+      ]);
+      for (const issue of preflight.issues) {
+        if (!issue.recordId) continue;
+        preflightBlockedReasons.set(
+          recordKey(issue.entity, issue.recordId),
+          issue.message,
+        );
+      }
+      if (blockEveryActiveWrite) {
+        for (const operation of state.outbox) {
+          preflightBlockedReasons.set(
+            recordKey(operation.entity, operation.recordId),
+            '雲端回應未通過擁有者或資料完整性驗證；待同步資料未上傳。',
+          );
+        }
+      }
+      const preflightByKey = new Map(preflight.records
+        .filter((entry) => entry.record.ownerId === authenticatedOwnerId)
+        .map((entry) => [recordKey(entry.entity, entry.record.id), entry]));
+      for (const operation of state.outbox.filter((candidate) => candidate.batchId)) {
+        const key = recordKey(operation.entity, operation.recordId);
+        const remoteRecord = preflightByKey.get(key);
+        if (!remoteRecord) continue;
+        const recoveredRetry = await recoveredBatchRetryOperation(operation, remoteRecord, now());
+        if (recoveredRetry) {
+          preflightBlockedKeys.delete(key);
+          preflightBlockedReasons.delete(key);
+          preflightApplyOverrides.set(key, recoveredRetry);
+          preflightOptimisticRecords.set(key, {
+            entity: recoveredRetry.entity,
+            record: recoveredRetry.record,
+          } as RemoteRecord);
+          continue;
+        }
+        const comparison = compareSyncRecords(operation.record, remoteRecord.record);
+        const divergentSameClock = comparison === 0 && differingSyncRecordFields(
+          operation.entity,
+          operation.record,
+          remoteRecord.record,
+        ).length > 0;
+        if (comparison < 0 || divergentSameClock) {
+          preflightBlockedKeys.add(key);
+          preflightBlockedReasons.set(
+            key,
+            `同一批次的 ${operation.entity}/${operation.recordId} 與雲端版本衝突；整批未上傳。`,
+          );
+        }
+      }
+      const remoteBudgets = preflight.records
+        .filter((entry): entry is Extract<RemoteRecord, { entity: 'budgets' }> => (
+          entry.entity === 'budgets'
+          && entry.record.ownerId === authenticatedOwnerId
+          && !entry.record.deletedAt
+        ))
+        .map((entry) => entry.record);
+      const remoteActiveBudgets = remoteBudgets.filter((budget) => budget.isActive);
+      for (const operation of state.outbox) {
+        if (
+          operation.entity !== 'budgets'
+          || operation.record.deletedAt
+        ) continue;
+        const candidate = operation.record as Budget;
+        const key = recordKey(operation.entity, operation.recordId);
+        if (state.unresolvedSyncRecordKeys?.includes(key)) continue;
+        if (!candidate.isActive) {
+          const sameRemoteRecord = remoteBudgets.find((budget) => budget.id === candidate.id);
+          if (!sameRemoteRecord) continue;
+          const candidateComparison = compareSyncRecords(candidate, sameRemoteRecord);
+          if (candidateComparison > 0) {
+            // The queued inactive edit owns the newer clock. Send its complete
+            // payload instead of replacing it merely because both sides happen
+            // to be inactive.
+            continue;
+          }
+          if (candidateComparison === 0) {
+            const differingFields = differingSyncRecordFields(
+              'budgets',
+              candidate,
+              sameRemoteRecord,
+            );
+            if (differingFields.length > 0) {
+              // Same-clock payload divergence must remain pending for the
+              // ordinary reconciliation path to expose as unresolved.
+              continue;
+            }
+          }
+          const timestamp = now();
+          const semanticConflictStillActive = remoteActiveBudgets.some((budget) => (
+            budget.id !== sameRemoteRecord.id && hasSameBudgetSemantics(budget, sameRemoteRecord)
+          ));
+          if (
+            !sameRemoteRecord.isActive
+            || !isBudgetConflictRollback(operation)
+            || !semanticConflictStillActive
+          ) {
+            const exact: PendingOperation = {
+              id: sameRemoteRecord.lastOperationId,
+              entity: 'budgets',
+              recordId: sameRemoteRecord.id,
+              record: sameRemoteRecord,
+              attempts: 0,
+              queuedAt: timestamp,
+            };
+            preflightApplyOverrides.set(key, exact);
+            preflightOptimisticBudgets.set(key, sameRemoteRecord);
+            continue;
+          }
+          const rollbackId = budgetConflictRollbackOperationId();
+          const archived: Budget = {
+            ...sameRemoteRecord,
+            version: sameRemoteRecord.version + 1,
+            updatedAt: timestamp,
+            lastOperationId: rollbackId,
+            isActive: false,
+          };
+          preflightApplyOverrides.set(key, {
+            id: rollbackId,
+            entity: 'budgets',
+            recordId: archived.id,
+            record: archived,
+            attempts: 0,
+            queuedAt: timestamp,
+          });
+          preflightOptimisticBudgets.set(key, archived);
+          continue;
+        }
+        const conflict = remoteActiveBudgets.find((budget) => (
+          budget.id !== candidate.id && hasSameBudgetSemantics(budget, candidate)
+        ));
+        if (!conflict) continue;
+        preflightBlockedKeys.add(key);
+        preflightBlockedReasons.set(
+          key,
+          `雲端有效預算 ${conflict.id} 已使用相同範圍、週期與分類；本機預算未啟用。`,
+        );
+        const sameRemoteRecord = remoteActiveBudgets.find((budget) => budget.id === candidate.id);
+        if (!sameRemoteRecord) {
+          // This local create has never reached the server. Reject only the
+          // attempted activation and preserve its fields as an archived,
+          // retryable record; never alter an existing remote duplicate here.
+          preflightDeactivatedBudgetKeys.add(key);
+        } else if (
+          sameRemoteRecord.version === candidate.version
+          && sameRemoteRecord.lastOperationId === operation.id
+        ) {
+          // A previous apply succeeded but its semantic confirmation pull did
+          // not. We may safely roll back only this exact pending activation;
+          // unrelated pre-existing Production duplicates remain untouched.
+          const timestamp = now();
+          const rollbackId = budgetConflictRollbackOperationId();
+          const archived: Budget = {
+            ...sameRemoteRecord,
+            version: sameRemoteRecord.version + 1,
+            updatedAt: timestamp,
+            lastOperationId: rollbackId,
+            isActive: false,
+          };
+          preflightDeactivatedBudgetKeys.add(key);
+          preflightBudgetOverrides.set(key, {
+            id: rollbackId,
+            entity: 'budgets',
+            recordId: archived.id,
+            record: archived,
+            attempts: 0,
+            queuedAt: timestamp,
+            lastError: preflightBlockedReasons.get(key),
+          });
+        }
+      }
+      const preflightBlockedBatchIds = new Set(state.outbox.flatMap((operation) => {
+        const key = recordKey(operation.entity, operation.recordId);
+        const blocksThisOperation = preflightBlockedKeys.has(key)
+          && (!operation.record.deletedAt || preflightBlockedReasons.has(key));
+        return operation.batchId && blocksThisOperation
+          ? [operation.batchId]
+          : [];
+      }));
+      for (const operation of state.outbox) {
+        if (!operation.batchId || !preflightBlockedBatchIds.has(operation.batchId)) continue;
+        const key = recordKey(operation.entity, operation.recordId);
+        preflightBlockedKeys.add(key);
+        if (!preflightBlockedReasons.has(key)) {
+          preflightBlockedReasons.set(key, '同一批次的另一筆資料有同步衝突；為避免部分套用，整批未上傳。');
+        }
+      }
+    } catch (error) {
+      return {
+        state: {
+          ...state,
+          lastSyncError: `preflight pull failed; no pending writes were sent: ${errorMessage(error)}`,
+        },
+        report: {
+          ownerId: state.ownerId,
+          status: 'partial',
+          applied: 0,
+          pulled: 0,
+          pending: pendingReport(state.outbox),
+          failures: [{ stage: 'pull', message: `preflight pull failed; no pending writes were sent: ${errorMessage(error)}` }],
+          conflicts: [],
+        },
+      };
+    }
+  }
+
+  for (const queuedOperation of state.outbox) {
+    const key = recordKey(queuedOperation.entity, queuedOperation.recordId);
+    const operation = preflightApplyOverrides.get(key) ?? queuedOperation;
+    if (
+      unresolvedKeys.has(key)
+      || (queuedOperation.batchId !== undefined && unresolvedBatchIds.has(queuedOperation.batchId))
+    ) {
+      const message = `unresolved sync conflict for ${operation.entity}/${operation.recordId}; pending write was not sent`;
+      remaining.push({ ...operation, lastError: message });
+      failures.push({
+        stage: 'conflict',
+        message,
+        operationId: operation.id,
+        entity: operation.entity,
+        recordId: operation.recordId,
+      });
+      continue;
+    }
+    if (
+      preflightBlockedKeys.has(key)
+      && (!operation.record.deletedAt || preflightBlockedReasons.has(key))
+    ) {
+      const reason = preflightBlockedReasons.get(key);
+      if (reason === undefined) {
+        remaining.push(operation);
+      } else {
+        const override = preflightBudgetOverrides.get(key);
+        const safeRecord = preflightDeactivatedBudgetKeys.has(key)
+          ? { ...operation.record, isActive: false }
+          : operation.record;
+        remaining.push(override ?? {
+          ...operation,
+          record: safeRecord,
+          attempts: operation.attempts + 1,
+          lastError: reason,
+        });
+      }
+      if (reason !== undefined) {
+        failures.push({
+          stage: 'apply',
+          message: reason,
+          operationId: operation.id,
+          entity: operation.entity,
+          recordId: operation.recordId,
+        });
+      }
+      continue;
+    }
     try {
       await remote.apply(authenticatedOwnerId, operation);
       applied += 1;
+      if (
+        operation.entity === 'budgets'
+        && !operation.record.deletedAt
+        && (operation.record as Budget).isActive
+      ) {
+        appliedActiveBudgetOperations.push(operation);
+      }
     } catch (error) {
       const message = errorMessage(error);
       remaining.push({
@@ -795,6 +1526,48 @@ export async function syncFinanceState(
   }
 
   let data = state.data;
+  for (const [key, budget] of preflightOptimisticBudgets) {
+    if (!state.outbox.some((operation) => recordKey(operation.entity, operation.recordId) === key)) continue;
+    data = replaceRecord(data, { entity: 'budgets', record: budget });
+  }
+  for (const [key, record] of preflightOptimisticRecords) {
+    if (!state.outbox.some((operation) => recordKey(operation.entity, operation.recordId) === key)) continue;
+    data = replaceRecord(data, record);
+  }
+
+  // A lifecycle batch is acknowledged only as a unit. If one member was
+  // blocked or failed, retain every original member (including idempotently
+  // applied members) so a retry or explicit cloud resolution still has the
+  // complete manifest.
+  const incompleteBatchIds = new Set(remaining.flatMap((operation) => (
+    operation.batchId ? [operation.batchId] : []
+  )));
+  if (incompleteBatchIds.size > 0) {
+    const retainedByKey = new Map(
+      remaining.map((operation) => [recordKey(operation.entity, operation.recordId), operation]),
+    );
+    for (const operation of state.outbox) {
+      if (!operation.batchId || !incompleteBatchIds.has(operation.batchId)) continue;
+      const key = recordKey(operation.entity, operation.recordId);
+      if (!retainedByKey.has(key)) {
+        const retryableOperation = preflightApplyOverrides.get(key) ?? operation;
+        retainedByKey.set(key, {
+          ...retryableOperation,
+          lastError: '同一批次的另一筆資料尚未完成；本筆將安全重試。',
+        });
+        applied = Math.max(0, applied - 1);
+      }
+    }
+    remaining.splice(0, remaining.length, ...state.outbox.flatMap((operation) => {
+      const retained = retainedByKey.get(recordKey(operation.entity, operation.recordId));
+      return retained ? [retained] : [];
+    }));
+  }
+  for (const operation of remaining) {
+    const key = recordKey(operation.entity, operation.recordId);
+    if (!preflightDeactivatedBudgetKeys.has(key) || operation.entity !== 'budgets') continue;
+    data = replaceRecord(data, { entity: 'budgets', record: operation.record as Budget });
+  }
   let finalRemaining = remaining;
   let pulled = 0;
   let pullSucceeded = false;
@@ -825,7 +1598,15 @@ export async function syncFinanceState(
         .filter((conflict) => conflict.winner === 'unresolved')
         .map((conflict) => [recordKey(conflict.entity, conflict.recordId), conflict] as const),
     );
-    if (unresolvedByKey.size > 0) {
+    const conflictedBatchIds = new Set(state.outbox.flatMap((operation) => {
+      const conflict = conflicts.find((candidate) => (
+        candidate.entity === operation.entity && candidate.recordId === operation.recordId
+      ));
+      return operation.batchId && conflict && conflict.winner !== 'local'
+        ? [operation.batchId]
+        : [];
+    }));
+    if (unresolvedByKey.size > 0 || conflictedBatchIds.size > 0) {
       const retainedByKey = new Map(
         remaining.map((operation) => [recordKey(operation.entity, operation.recordId), operation]),
       );
@@ -833,16 +1614,20 @@ export async function syncFinanceState(
       for (const operation of state.outbox) {
         const key = recordKey(operation.entity, operation.recordId);
         const conflict = unresolvedByKey.get(key);
-        if (!conflict || retainedByKey.has(key)) continue;
-        const lastError = conflict.reason === 'payload'
-          ? `unresolved same-clock payload conflict for ${operation.entity}/${operation.recordId}`
-          : `pending local mutation for ${operation.entity}/${operation.recordId} requires explicit review after the remote clock won`;
+        const batchConflict = operation.batchId && conflictedBatchIds.has(operation.batchId);
+        if (!conflict && !batchConflict) continue;
+        const retained = retainedByKey.get(key);
+        const lastError = conflict?.reason === 'payload'
+          ? `${UNRESOLVED_PAYLOAD_CONFLICT_PREFIX} for ${operation.entity}/${operation.recordId}`
+          : batchConflict
+            ? `batch conflict for ${operation.entity}/${operation.recordId} requires explicit cloud resolution as one unit`
+            : `pending local mutation for ${operation.entity}/${operation.recordId} requires explicit review after the remote clock won`;
         retainedByKey.set(key, {
-          ...operation,
-          attempts: operation.attempts + 1,
+          ...(retained ?? operation),
+          attempts: retained?.attempts ?? operation.attempts + 1,
           lastError,
         });
-        requeuedSuccessful += 1;
+        if (!retained) requeuedSuccessful += 1;
       }
       finalRemaining = state.outbox.flatMap((operation) => {
         const retained = retainedByKey.get(recordKey(operation.entity, operation.recordId));
@@ -857,7 +1642,8 @@ export async function syncFinanceState(
     );
     if (remoteWinnerKeys.size > 0) {
       finalRemaining = finalRemaining.filter(
-        (operation) => !remoteWinnerKeys.has(recordKey(operation.entity, operation.recordId)),
+        (operation) => !remoteWinnerKeys.has(recordKey(operation.entity, operation.recordId))
+          || (operation.batchId !== undefined && conflictedBatchIds.has(operation.batchId)),
       );
       // The pull proved that the server clock superseded this stale operation.
       // Treat it as a resolved conflict rather than an endlessly retrying error.
@@ -868,13 +1654,209 @@ export async function syncFinanceState(
         && remoteWinnerKeys.has(recordKey(failure.entity, failure.recordId))
       ));
     }
+
+    const batchesRequiringCompensation = new Set([
+      ...incompleteBatchIds,
+      ...conflictedBatchIds,
+    ]);
+    if (batchesRequiringCompensation.size > 0) {
+      const retainedByKey = new Map(
+        finalRemaining.map((operation) => [recordKey(operation.entity, operation.recordId), operation]),
+      );
+      const remoteByKey = new Map(remoteRecords.map((entry) => [
+        recordKey(entry.entity, entry.record.id),
+        entry,
+      ]));
+      for (const operation of state.outbox) {
+        if (!operation.batchId || !batchesRequiringCompensation.has(operation.batchId)) continue;
+        const key = recordKey(operation.entity, operation.recordId);
+        const effectiveOperation = preflightApplyOverrides.get(key) ?? operation;
+        if (effectiveOperation.record.lastOperationId.includes(':batch-compensation:')) continue;
+        const currentRemote = remoteByKey.get(key);
+        if (!currentRemote) continue;
+        const isExactAppliedMember = compareSyncRecords(effectiveOperation.record, currentRemote.record) === 0
+          && differingSyncRecordFields(
+            effectiveOperation.entity,
+            effectiveOperation.record,
+            currentRemote.record,
+          ).length === 0;
+        if (!isExactAppliedMember) continue;
+        const compensation = await batchCompensationOperation(
+          effectiveOperation,
+          currentRemote.record,
+          now(),
+        );
+        if (!compensation) {
+          failures.push({
+            stage: 'conflict',
+            message: `舊版批次 ${operation.batchId} 缺少可驗證前態；未自動補償 ${operation.entity}/${operation.recordId}。`,
+            operationId: operation.id,
+            entity: operation.entity,
+            recordId: operation.recordId,
+          });
+          continue;
+        }
+        try {
+          if (!remote.compareAndSwap) {
+            throw new Error('遠端不支援具 expected-clock 條件的安全補償');
+          }
+          const persistedCompensation = await remote.compareAndSwap(
+            authenticatedOwnerId,
+            currentRemote,
+            compensation,
+          );
+          if (!persistedCompensation) throw new Error('補償前遠端版本已再次變更');
+          if (compareSyncRecords(compensation.record, persistedCompensation.record) !== 0
+            || differingSyncRecordFields(
+              compensation.entity,
+              compensation.record,
+              persistedCompensation.record,
+            ).length > 0) {
+            throw new Error('條件式補償未回傳相同版本');
+          }
+          const retry = batchRetryOperation(effectiveOperation, compensation, now());
+          retainedByKey.set(key, retry);
+          data = replaceRecord(data, {
+            entity: retry.entity,
+            record: retry.record,
+          } as RemoteRecord);
+          failures.push({
+            stage: 'conflict',
+            message: `批次未完整套用，已安全補償 ${operation.entity}/${operation.recordId} 的遠端狀態；本機完整意圖仍保留等待重試或明確採用雲端版本。`,
+            operationId: compensation.id,
+            entity: compensation.entity,
+            recordId: compensation.recordId,
+          });
+        } catch (error) {
+          failures.push({
+            stage: 'apply',
+            message: `批次競態補償尚未確認：${errorMessage(error)}`,
+            operationId: compensation.id,
+            entity: compensation.entity,
+            recordId: compensation.recordId,
+          });
+        }
+      }
+      finalRemaining = state.outbox.flatMap((operation) => {
+        const retained = retainedByKey.get(recordKey(operation.entity, operation.recordId));
+        return retained ? [retained] : [];
+      });
+    }
   } catch (error) {
     failures.push({ stage: 'pull', message: errorMessage(error) });
+  }
+
+  if (!pullSucceeded) {
+    const retainedByKey = new Map(
+      finalRemaining.map((operation) => [recordKey(operation.entity, operation.recordId), operation]),
+    );
+    for (const operation of state.outbox) {
+      if (!operation.batchId || retainedByKey.has(recordKey(operation.entity, operation.recordId))) continue;
+      retainedByKey.set(recordKey(operation.entity, operation.recordId), {
+        ...operation,
+        lastError: '批次寫入後尚未完成雲端確認；本筆將安全重試。',
+      });
+      applied = Math.max(0, applied - 1);
+    }
+    finalRemaining = state.outbox.flatMap((operation) => {
+      const retained = retainedByKey.get(recordKey(operation.entity, operation.recordId));
+      return retained ? [retained] : [];
+    });
+  }
+
+  if (!pullSucceeded && appliedActiveBudgetOperations.length > 0) {
+    const retained = new Map(
+      finalRemaining.map((operation) => [recordKey(operation.entity, operation.recordId), operation]),
+    );
+    for (const operation of appliedActiveBudgetOperations) {
+      retained.set(recordKey(operation.entity, operation.recordId), {
+        ...operation,
+        lastError: '有效預算已寫入，但尚未完成雲端語義衝突確認。',
+      });
+    }
+    finalRemaining = [...retained.values()];
+  }
+
+  if (pullSucceeded) {
+    for (const operation of appliedActiveBudgetOperations) {
+      const candidate = data.budgets.find((budget) => (
+        budget.id === operation.recordId
+        && budget.isActive
+        && !budget.deletedAt
+        && budget.version === operation.record.version
+        && budget.lastOperationId === operation.id
+      ));
+      if (!candidate) continue;
+      const conflict = data.budgets.find((budget) => (
+        budget.id !== candidate.id
+        && budget.isActive
+        && !budget.deletedAt
+        && hasSameBudgetSemantics(budget, candidate)
+      ));
+      if (!conflict) continue;
+
+      const timestamp = now();
+      const rollbackId = budgetConflictRollbackOperationId();
+      const archived: Budget = {
+        ...candidate,
+        version: candidate.version + 1,
+        updatedAt: timestamp,
+        lastOperationId: rollbackId,
+        isActive: false,
+      };
+      const rollback: PendingOperation = {
+        id: rollbackId,
+        entity: 'budgets',
+        recordId: archived.id,
+        record: archived,
+        attempts: 0,
+        queuedAt: timestamp,
+      };
+      data = replaceRecord(data, { entity: 'budgets', record: archived });
+      try {
+        await remote.apply(authenticatedOwnerId, rollback);
+        applied += 1;
+        failures.push({
+          stage: 'conflict',
+          message: `同步期間出現同語義雲端預算 ${conflict.id}；本次新增已安全保留為封存。`,
+          operationId: rollback.id,
+          entity: 'budgets',
+          recordId: archived.id,
+        });
+      } catch (error) {
+        const message = `預算衝突回滾尚未同步：${errorMessage(error)}`;
+        finalRemaining = [
+          ...finalRemaining.filter((pending) => (
+            pending.entity !== 'budgets' || pending.recordId !== archived.id
+          )),
+          { ...rollback, attempts: 1, lastError: message },
+        ];
+        failures.push({
+          stage: 'apply',
+          message,
+          operationId: rollback.id,
+          entity: 'budgets',
+          recordId: archived.id,
+        });
+      }
+    }
+  }
+
+  // Persisted snapshots require every outbox payload to match the visible
+  // local record exactly. A late remote tombstone can otherwise replace one
+  // batch member during reconciliation while the complete local batch is
+  // intentionally retained for explicit resolution.
+  for (const operation of finalRemaining) {
+    data = replaceRecord(data, {
+      entity: operation.entity,
+      record: operation.record,
+    } as RemoteRecord);
   }
 
   if (pullSucceeded) {
     try {
       validateFinanceData(data, 'final reconciled graph');
+      assertLifecycleTransition(state.data, data);
     } catch (error) {
       failures.push({
         stage: 'validation',
@@ -891,10 +1873,34 @@ export async function syncFinanceState(
   }
 
   const lastSyncError = failures.map((failure) => failure.message).join('; ') || undefined;
+  const currentUnresolvedKeys = new Set(
+    conflicts
+      .filter((conflict) => conflict.winner === 'unresolved')
+      .map((conflict) => recordKey(conflict.entity, conflict.recordId)),
+  );
+  for (const operation of state.outbox) {
+    if (!operation.batchId || !finalRemaining.some((pending) => (
+      pending.batchId === operation.batchId
+      && pending.lastError?.includes('batch conflict')
+    ))) continue;
+    const conflict = conflicts.find((candidate) => (
+      candidate.entity === operation.entity && candidate.recordId === operation.recordId
+      && candidate.winner !== 'local'
+    ));
+    if (conflict) currentUnresolvedKeys.add(recordKey(operation.entity, operation.recordId));
+  }
+  const unresolvedSyncRecordKeys = new Set(state.unresolvedSyncRecordKeys ?? []);
+  // A later pull can change the conflict shape without proving which payload
+  // the user intended to keep. Persist the lock until the explicit
+  // accept-remote resolution path clears it.
+  for (const key of currentUnresolvedKeys) unresolvedSyncRecordKeys.add(key);
   const nextState: PersistedFinanceState = {
     ...state,
     data,
     outbox: finalRemaining,
+    unresolvedSyncRecordKeys: unresolvedSyncRecordKeys.size > 0
+      ? [...unresolvedSyncRecordKeys].sort()
+      : undefined,
     ...(state.initialBootstrap?.status === 'seeding' && finalRemaining.length === 0
       ? { initialBootstrap: undefined }
       : {}),

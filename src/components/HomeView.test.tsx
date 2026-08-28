@@ -1,10 +1,34 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../app/state';
+import { resolveExplicitSelection } from '../app/explicitSelection';
 import { TUTORIAL_RECORD_NOTE, startTutorial } from '../app/tutorial';
 import { HomeView } from './HomeView';
 
 describe('HomeView ledger access', () => {
+  it('fails closed instead of retargeting a transaction when its selected parents become unavailable', () => {
+    const state = createInitialState('guest');
+    const categories = state.data.categories.filter((item) => item.kind === 'expense');
+    const [categoryA, categoryB] = categories;
+    const accountA = state.data.accounts[0];
+    const accountB = { ...accountA, id: 'account-b', name: '帳戶 B' };
+
+    expect(resolveExplicitSelection(categoryA.id, [categoryA, categoryB])).toBe(categoryA.id);
+    expect(resolveExplicitSelection('', [categoryA, categoryB])).toBe('');
+    expect(resolveExplicitSelection(categoryA.id, [categoryB])).toBe('');
+    expect(resolveExplicitSelection(categoryB.id, [categoryB])).toBe(categoryB.id);
+    expect(resolveExplicitSelection(accountA.id, [accountA, accountB])).toBe(accountA.id);
+    expect(resolveExplicitSelection(accountA.id, [accountB])).toBe('');
+    expect(resolveExplicitSelection(accountB.id, [accountB])).toBe(accountB.id);
+
+    const html = renderToStaticMarkup(
+      <HomeView data={state.data} ownerId="guest" put={() => true} deleteTransaction={() => true} />,
+    );
+    expect(html).not.toMatch(/class="category-choice[^"]*" aria-pressed="true"/);
+    expect(html).not.toMatch(/class="account-chip[^"]*" aria-pressed="true"/);
+    expect(html.match(/<button[^>]*data-tutorial="create"[^>]*>/)?.[0]).toContain('disabled=""');
+  });
+
   it('keeps the primary entry path in amount, category, account order', () => {
     const state = createInitialState('guest');
     const html = renderToStaticMarkup(
@@ -79,5 +103,81 @@ describe('HomeView ledger access', () => {
     expect(normalHtml).not.toContain('教學紀錄 · 完成後刪除');
     expect(tutorialHtml).toContain('教學紀錄 · 完成後刪除');
     expect(tutorialHtml).toContain('data-tutorial="tutorial-record"');
+  });
+
+  it('shows a record-level conflict and disables transaction edit and delete actions', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.transactions = [{
+      id: 'transaction-conflict', ownerId: 'guest', version: 3,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'same-clock',
+      amount: 100, type: 'expense', categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name, occurredAt: '2026-08-27 08:00',
+    }];
+
+    const html = renderToStaticMarkup(
+      <HomeView
+        data={state.data}
+        ownerId="guest"
+        put={() => true}
+        deleteTransaction={() => true}
+        unresolvedSyncRecordKeys={new Set(['transactions:transaction-conflict'])}
+        acceptRemoteConflict={() => undefined}
+      />,
+    );
+
+    expect(html).toContain('同步衝突：編輯與刪除已暫停');
+    expect(html).toContain('使用雲端版本');
+    expect(html.match(/<button[^>]*aria-label="編輯 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
+    expect(html.match(/<button[^>]*aria-label="刪除 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
+  });
+
+  it('disables conflicted account and category choices for new transactions', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const html = renderToStaticMarkup(
+      <HomeView
+        data={state.data}
+        ownerId="guest"
+        put={() => true}
+        deleteTransaction={() => true}
+        unresolvedSyncRecordKeys={new Set([
+          `accounts:${account.id}`,
+          `categories:${category.id}`,
+        ])}
+      />,
+    );
+
+    expect(html).toContain('title="此分類有未解同步衝突，暫時無法用於新交易。"');
+    expect(html).toContain('title="此帳戶有未解同步衝突，暫時無法用於新交易。"');
+    expect(html.match(/<button[^>]*title="此分類有未解同步衝突[^>]*>/)?.[0]).toContain('disabled=""');
+    expect(html.match(/<button[^>]*title="此帳戶有未解同步衝突[^>]*>/)?.[0]).toContain('disabled=""');
+  });
+
+  it('disables transaction edit and delete when an existing parent is conflicted', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.transactions = [{
+      id: 'transaction-parent-conflict', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'transaction-create',
+      amount: 100, type: 'expense', categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name, occurredAt: '2026-08-27 08:00',
+    }];
+    const html = renderToStaticMarkup(
+      <HomeView
+        data={state.data}
+        ownerId="guest"
+        put={() => true}
+        deleteTransaction={() => true}
+        unresolvedSyncRecordKeys={new Set([`accounts:${account.id}`])}
+      />,
+    );
+
+    expect(html).toContain('關聯帳戶、分類或週期規則有同步衝突：編輯與刪除已暫停。');
+    expect(html.match(/<button[^>]*aria-label="編輯 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
+    expect(html.match(/<button[^>]*aria-label="刪除 餐飲"[^>]*>/)?.[0]).toContain('disabled=""');
   });
 });

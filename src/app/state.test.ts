@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   applySyncCompletion,
+  applyAccountArchiveMutation,
+  applyGoalAllocationReleaseMutation,
   applyRestoredData,
+  applyCategoryLifecycleMutation,
   advanceFinanceStateRef,
   canAutoSaveFinanceState,
   createInitialState,
@@ -13,13 +16,16 @@ import {
   persistGuestImportState,
   planGuestImport,
   putRecord,
+  putCategoryWithDependents,
+  putAccountWithDependents,
   releaseGoalAllocations,
   remapOwner,
   saveFinanceState,
   storageKey,
+  tombstoneRecordMeta,
 } from './state';
 import { TUTORIAL_RECORD_NOTE } from '../domain/tutorialRecord';
-import { syncFinanceState, type RemoteRecord } from '../domain/syncEngine';
+import { activeOperationId, syncFinanceState, type RemoteRecord } from '../domain/syncEngine';
 
 function memoryStorage() {
   const values = new Map<string, string>();
@@ -36,6 +42,244 @@ function readyAuthenticatedState(ownerId = 'user-a') {
 }
 
 describe('owner-scoped local state', () => {
+  it('quarantines an impossible guest conflict lock so backup recovery remains available', () => {
+    const impossible = createInitialState('guest');
+    impossible.unresolvedSyncRecordKeys = [`accounts:${impossible.data.accounts[0].id}`];
+    const storage = {
+      getItem: (key: string) => key === storageKey('guest') ? JSON.stringify(impossible) : null,
+    };
+
+    const loaded = loadFinanceStateWithRecovery('guest', storage);
+
+    expect(loaded.recovery?.message).toMatch(/unresolved sync record keys/);
+    expect(loaded.recovery?.raw).toContain('unresolvedSyncRecordKeys');
+    expect(loaded.state.unresolvedSyncRecordKeys).toBeUndefined();
+  });
+
+  it('archives an account and pauses its active recurring rules atomically', () => {
+    const state = readyAuthenticatedState();
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.recurringRules = [{
+      id: 'rule-account', ownerId: state.ownerId, version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-created',
+      name: '月租', type: 'expense', amount: 10_000,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    }];
+
+    const next = applyAccountArchiveMutation(
+      state,
+      account.id,
+      new Date('2026-08-27T01:00:00.000Z'),
+      () => 'account-archive',
+    );
+
+    expect(next.data.accounts[0].isActive).toBe(false);
+    expect(next.data.recurringRules[0].isActive).toBe(false);
+    expect(next.outbox.map((operation) => operation.recordId)).toEqual([
+      'rule-account',
+      account.id,
+    ]);
+    expect(state.data.accounts[0].isActive).toBe(true);
+    expect(state.data.recurringRules[0].isActive).toBe(true);
+  });
+
+  it('releases every goal allocation in one authenticated outbox batch', () => {
+    const state = readyAuthenticatedState();
+    state.data.goals = [{
+      id: 'goal-trip', ownerId: state.ownerId, version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'goal-create',
+      name: '旅行', targetAmount: 10_000, isActive: true,
+    }];
+    state.data.allocations = ['a1', 'a2'].map((id) => ({
+      id, ownerId: state.ownerId, version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: `${id}-create`,
+      goalId: 'goal-trip', amountDelta: 500, occurredAt: '2026-08-27 08:00',
+    }));
+
+    const next = applyGoalAllocationReleaseMutation(
+      state,
+      'goal-trip',
+      new Date('2026-08-27T01:00:00.000Z'),
+      (() => {
+        let index = 0;
+        return () => `release-${++index}`;
+      })(),
+      'release-goal-batch',
+    );
+
+    expect(next.data.allocations.every((allocation) => Boolean(allocation.deletedAt))).toBe(true);
+    expect(next.outbox).toHaveLength(2);
+    expect(next.outbox.every((operation) => operation.batchId === 'release-goal-batch')).toBe(true);
+    expect(state.data.allocations.every((allocation) => !allocation.deletedAt)).toBe(true);
+  });
+
+  it('archives a category and pauses its active recurring rules in one state transition', () => {
+    const state = createInitialState('guest');
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const account = state.data.accounts[0];
+    state.data.recurringRules = [{
+      id: 'rule-food', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-created',
+      name: '午餐', type: 'expense', amount: 100,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    }];
+
+    const next = applyCategoryLifecycleMutation(
+      state,
+      category.id,
+      'archive',
+      new Date('2026-08-27T01:00:00.000Z'),
+      () => 'operation',
+    );
+
+    expect(next.data.categories.find((item) => item.id === category.id)?.isActive).toBe(false);
+    expect(next.data.recurringRules[0].isActive).toBe(false);
+    expect(state.data.recurringRules[0].isActive).toBe(true);
+  });
+
+  it('soft-deletes an unused authenticated category as a retryable tombstone', () => {
+    const state = readyAuthenticatedState();
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+
+    const next = applyCategoryLifecycleMutation(
+      state,
+      category.id,
+      'delete',
+      new Date('2026-08-27T01:00:00.000Z'),
+      () => 'category-delete',
+    );
+
+    expect(next.data.categories.find((item) => item.id === category.id)).toMatchObject({
+      isActive: false,
+      deletedAt: '2026-08-27T01:00:00.000Z',
+      lastOperationId: 'tombstone:category-delete',
+    });
+    expect(next.outbox).toEqual([
+      expect.objectContaining({
+        entity: 'categories',
+        recordId: category.id,
+        id: 'tombstone:category-delete',
+      }),
+    ]);
+  });
+
+  it('renames future recurring occurrences without rewriting historical transaction snapshots', () => {
+    const state = createInitialState('guest');
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const account = state.data.accounts[0];
+    state.data.transactions = [{
+      id: 'history', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'history-created',
+      amount: 100, type: 'expense', categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name, occurredAt: '2026-08-27 08:00',
+    }];
+    state.data.recurringRules = [{
+      id: 'rule', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-created',
+      name: '早餐', type: 'expense', amount: 100,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    }];
+
+    const next = putCategoryWithDependents(state, {
+      ...category,
+      name: '外食',
+      version: category.version + 1,
+      updatedAt: '2026-08-27T01:00:00.000Z',
+      lastOperationId: 'category-renamed',
+    }, new Date('2026-08-27T01:00:00.000Z'), () => 'rule-renamed');
+
+    expect(next.data.transactions[0].categoryName).toBe(category.name);
+    expect(next.data.recurringRules[0].categoryName).toBe('外食');
+  });
+
+  it('renames future recurring account snapshots without rewriting history or adjustments', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.transactions = [{
+      id: 'history-account', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'history-account-created',
+      amount: 100, type: 'expense', categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name, occurredAt: '2026-08-27 08:00',
+    }];
+    state.data.adjustments = [{
+      id: 'adjustment-history', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'adjustment-created',
+      accountId: account.id, amountDelta: 50, occurredAt: '2026-08-27 09:00', reason: '盤點',
+    }];
+    state.data.recurringRules = [{
+      id: 'rule-account', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'rule-account-created',
+      name: '早餐', type: 'expense', amount: 100,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    }];
+
+    const next = putAccountWithDependents(state, {
+      ...account,
+      name: '日常錢包',
+      version: account.version + 1,
+      updatedAt: '2026-08-27T01:00:00.000Z',
+      lastOperationId: 'account-renamed',
+    }, new Date('2026-08-27T01:00:00.000Z'), () => 'rule-account-renamed');
+
+    expect(next.data.transactions[0].accountName).toBe(account.name);
+    expect(next.data.adjustments).toEqual(state.data.adjustments);
+    expect(next.data.recurringRules[0].accountName).toBe('日常錢包');
+  });
+
+  it('reorders one category without leaving duplicate sort positions', () => {
+    const state = createInitialState('guest');
+    const expenses = state.data.categories.filter((item) => item.kind === 'expense');
+    const target = expenses.at(-1)!;
+    const next = putCategoryWithDependents(state, {
+      ...target,
+      sortOrder: 0,
+      version: target.version + 1,
+      updatedAt: '2026-08-27T01:00:00.000Z',
+      lastOperationId: 'category-reordered',
+    }, new Date('2026-08-27T01:00:00.000Z'), () => 'sibling-reordered');
+    const orders = next.data.categories
+      .filter((item) => item.kind === 'expense' && !item.deletedAt)
+      .map((item) => item.sortOrder)
+      .sort((left, right) => left - right);
+
+    expect(next.data.categories.find((item) => item.id === target.id)?.sortOrder).toBe(0);
+    expect(orders).toEqual(orders.map((_, index) => index));
+  });
+
+  it('gives tombstones a conflict-clock operation id that wins same-version legacy edits', () => {
+    const record = createInitialState('guest').data.categories[0];
+    const meta = tombstoneRecordMeta(record, new Date('2026-08-27T00:00:00.000Z'), () => 'fixed');
+
+    expect(meta).toEqual({
+      version: record.version + 1,
+      updatedAt: '2026-08-27T00:00:00.000Z',
+      lastOperationId: 'tombstone:fixed',
+      deletedAt: '2026-08-27T00:00:00.000Z',
+    });
+    expect(meta.lastOperationId > 'ffffffff-ffff-ffff-ffff-ffffffffffff').toBe(true);
+  });
+
+  it('orders active updates below legacy UUID deletes across a preflight/apply race', () => {
+    const active = activeOperationId('ffffffff-ffff-4fff-8fff-ffffffffffff');
+
+    expect(active).toBe('00000000-0000-0000-0000-000000000000:active:ffffffff-ffff-4fff-8fff-ffffffffffff');
+    expect(active < '00000000-0000-4000-8000-000000000000').toBe(true);
+  });
+
   it('pulls an existing authenticated cloud graph before any synthetic default write', async () => {
     const initial = loadFinanceStateWithRecovery('user-a', memoryStorage()).state;
     const cloudAccount = {
@@ -108,7 +352,7 @@ describe('owner-scoped local state', () => {
     }, () => '2026-08-24T10:01:00.000Z');
 
     expect(calls[0]).toBe('pull');
-    expect(calls.filter((call) => call === 'pull')).toHaveLength(2);
+    expect(calls.filter((call) => call === 'pull')).toHaveLength(3);
     expect(calls.filter((call) => call.startsWith('apply:'))).toHaveLength(15);
     expect(result.state.data.accounts).toHaveLength(1);
     expect(result.state.data.categories).toHaveLength(14);
@@ -251,7 +495,7 @@ describe('owner-scoped local state', () => {
       },
     }, () => '2026-08-24T10:06:00.000Z');
 
-    expect(calls).toEqual(['pull', `apply:${genuineAccount.lastOperationId}`, 'pull']);
+    expect(calls).toEqual(['pull', 'pull', `apply:${genuineAccount.lastOperationId}`, 'pull']);
     expect(result.state.data.accounts).toEqual(expect.arrayContaining([cloudAccount, genuineAccount]));
     expect(result.state.outbox).toEqual([]);
     expect(result.state.initialBootstrap).toBeUndefined();
@@ -281,14 +525,14 @@ describe('owner-scoped local state', () => {
       expect.objectContaining({
         id: 'same-tick-wallet',
         deletedAt: '2026-08-23T12:00:00.000Z',
-        lastOperationId: 'same-tick-restore',
+        lastOperationId: 'tombstone:same-tick-restore',
       }),
     ]));
     expect(restored.outbox).toEqual(expect.arrayContaining([
       expect.objectContaining({
         entity: 'accounts',
         recordId: 'same-tick-wallet',
-        id: 'same-tick-restore',
+        id: 'tombstone:same-tick-restore',
       }),
     ]));
   });
@@ -449,6 +693,20 @@ describe('owner-scoped local state', () => {
     expect(imported.transactions[0].accountId).toBe(imported.accounts[0].id);
     expect(imported.transactions[0].categoryId).toBe(imported.categories.find((item) => item.kind === 'expense')!.id);
     expect(imported.transactions[0].ownerId).toBe('user-a');
+  });
+
+  it('keeps imported guest tombstones above legacy active operation ids', () => {
+    const guest = createInitialState('guest').data;
+    guest.categories[0] = {
+      ...guest.categories[0],
+      isActive: false,
+      deletedAt: '2026-08-20T00:00:00.000Z',
+    };
+
+    const imported = remapOwner(guest, 'user-a');
+
+    expect(imported.categories[0].lastOperationId).toMatch(/^tombstone:/);
+    expect(imported.categories[1].lastOperationId).toMatch(/^00000000-0000-0000-0000-000000000000:active:/);
   });
 
   it('fails an explicit guest re-import atomically when an earlier imported record changed', () => {
@@ -702,11 +960,35 @@ describe('owner-scoped local state', () => {
     );
 
     expect(result.data.accounts[0]).toMatchObject({
-      name: '備份舊值', version: 10, lastOperationId: 'op-restore-10',
+      name: '備份舊值', version: 10, lastOperationId: '00000000-0000-0000-0000-000000000000:active:op-restore-10',
     });
     expect(result.outbox).toEqual([
-      expect.objectContaining({ id: 'op-restore-10', entity: 'accounts', recordId: cloudCurrent.id }),
+      expect.objectContaining({ id: '00000000-0000-0000-0000-000000000000:active:op-restore-10', entity: 'accounts', recordId: cloudCurrent.id }),
     ]);
+  });
+
+  it('preserves tombstone conflict priority when rebasing an authenticated restore', () => {
+    const current = readyAuthenticatedState();
+    const restored = structuredClone(current.data);
+    restored.accounts[0] = {
+      ...restored.accounts[0],
+      isActive: false,
+      deletedAt: '2026-08-20T00:00:00.000Z',
+    };
+
+    const result = applyRestoredData(
+      current,
+      restored,
+      new Date('2026-08-27T00:00:00.000Z'),
+      () => 'restore-delete',
+    );
+
+    expect(result.data.accounts[0]).toMatchObject({
+      isActive: false,
+      deletedAt: '2026-08-20T00:00:00.000Z',
+      lastOperationId: 'tombstone:restore-delete',
+    });
+    expect(result.outbox[0]).toMatchObject({ id: 'tombstone:restore-delete' });
   });
 
   it('preserves supported legacy precision through authenticated restore and outbox enqueue', () => {
@@ -725,7 +1007,7 @@ describe('owner-scoped local state', () => {
     expect(result.data.accounts[0].openingBalance).toBe(1.234567);
     expect(result.outbox).toEqual([
       expect.objectContaining({
-        id: 'op-legacy-precision-restore',
+        id: '00000000-0000-0000-0000-000000000000:active:op-legacy-precision-restore',
         entity: 'accounts',
         recordId: current.data.accounts[0].id,
         record: expect.objectContaining({ openingBalance: 1.234567 }),

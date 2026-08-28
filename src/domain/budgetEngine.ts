@@ -1,5 +1,6 @@
 import { getPeriodRange, isWithinRange } from './dateRange';
-import type { FinanceData } from './model';
+import type { Budget, FinanceData } from './model';
+import { stableLegacyId } from './legacyMigration';
 import { subtractMoney, sumMoney } from './money';
 import { isFinancialTransaction } from './tutorialRecord';
 
@@ -23,6 +24,58 @@ export function normalizeBudgetScope(budget: FinanceData['budgets'][number]): Fi
   delete normalized.categoryId;
   delete normalized.categoryName;
   return normalized;
+}
+
+export function budgetSemanticId(
+  ownerId: string,
+  scope: Budget['scope'],
+  period: Budget['period'],
+  categoryId?: string,
+): string {
+  return stableLegacyId(
+    'budget',
+    ownerId,
+    'semantic-v1',
+    scope,
+    period,
+    scope === 'category' ? (categoryId ?? 'missing-category') : 'overall',
+  );
+}
+
+export function hasSameBudgetSemantics(left: Budget, right: Budget): boolean {
+  return left.ownerId === right.ownerId
+    && left.scope === right.scope
+    && left.period === right.period
+    && (left.scope === 'overall' || left.categoryId === right.categoryId);
+}
+
+export function findBudgetSemanticMatch(
+  budgets: readonly Budget[],
+  candidate: Budget,
+): Budget | undefined {
+  return budgets.find((budget) => (
+    budget.id !== candidate.id && !budget.deletedAt && hasSameBudgetSemantics(budget, candidate)
+  ));
+}
+
+export function findBudgetCreationCollision(
+  budgets: readonly Budget[],
+  candidate: Budget,
+): Budget | undefined {
+  return budgets.find((budget) => budget.id === candidate.id)
+    ?? findBudgetSemanticMatch(budgets, candidate);
+}
+
+/** Find the active record that would conflict with saving or restoring this budget. */
+export function findActiveBudgetConflict(
+  budgets: readonly Budget[],
+  candidate: Budget,
+): Budget | undefined {
+  if (!candidate.isActive || candidate.deletedAt) return undefined;
+  return findBudgetSemanticMatch(
+    budgets.filter((budget) => budget.isActive),
+    candidate,
+  );
 }
 
 export function calculateBudgetUsage(data: FinanceData, reference: Date): BudgetUsage[] {

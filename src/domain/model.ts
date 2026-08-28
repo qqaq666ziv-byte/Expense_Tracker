@@ -135,6 +135,13 @@ export interface PendingOperation {
   record: FinanceData[FinanceEntityName][number];
   attempts: number;
   queuedAt: string;
+  /** Links records created by one atomic local lifecycle mutation. */
+  batchId?: string;
+  /**
+   * Local value immediately before this batch member. `null` means the batch
+   * created the record. Used only for conflict-safe remote compensation.
+   */
+  batchBeforeRecord?: FinanceData[FinanceEntityName][number] | null;
   lastError?: string;
 }
 
@@ -155,6 +162,8 @@ export interface PersistedFinanceState {
   ownerId: OwnerId;
   data: FinanceData;
   outbox: PendingOperation[];
+  /** Record keys blocked after unresolved sync conflicts until the user explicitly accepts cloud data. */
+  unresolvedSyncRecordKeys?: string[];
   lastSyncedAt?: string;
   lastSyncError?: string;
   migratedFromLegacy?: boolean;

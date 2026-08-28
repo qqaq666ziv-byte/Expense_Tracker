@@ -1,13 +1,63 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../app/state';
+import { resolveExplicitSelection } from '../app/explicitSelection';
 import { MAX_BACKUP_BYTES, parseFinanceBackup } from '../domain/backup';
 import { MAX_RECURRING_CATCH_UP_OCCURRENCES } from '../domain/recurrence';
 import {
   isFullBackupFileWithinLimit,
+  getRecurringResumeBlock,
+  includeCurrentInactiveOption,
+  isRecurringEditStale,
   prepareFullBackupDownload,
   RecurringPanel,
+  SettingsView,
 } from './SettingsView';
+
+describe('SettingsView category lifecycle', () => {
+  it('renders explicit edit, archive, delete and understandable status controls', () => {
+    const state = createInitialState('guest');
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const html = renderToStaticMarkup(
+      <SettingsView
+        data={state.data}
+        ownerId="guest"
+        putCategory={() => true}
+        putRecurring={() => true}
+        categoryLifecycle={() => true}
+        deleteRecurring={() => true}
+        restore={() => undefined}
+      />,
+    );
+
+    expect(html).toContain(`編輯 ${category.name}`);
+    expect(html).toContain(`封存 ${category.name}`);
+    expect(html).toContain(`刪除 ${category.name}`);
+    expect(html).toContain('未使用');
+    expect(html).toContain('分類顯示順序');
+    expect(html).not.toContain('新增資產帳戶');
+  });
+
+  it('disables category editing while a same-clock payload conflict is unresolved', () => {
+    const state = createInitialState('guest');
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    const html = renderToStaticMarkup(
+      <SettingsView
+        data={state.data}
+        ownerId="guest"
+        putCategory={() => true}
+        putRecurring={() => true}
+        categoryLifecycle={() => true}
+        deleteRecurring={() => true}
+        restore={() => undefined}
+        unresolvedSyncRecordKeys={new Set([`categories:${category.id}`])}
+      />,
+    );
+
+    expect(html).toMatch(new RegExp(`<button[^>]*aria-label="編輯 ${category.name}"[^>]*disabled=""`));
+    expect(html).toContain('此分類有未解同步衝突');
+  });
+});
 
 describe('SettingsView backup safety', () => {
   it('returns a visible Traditional Chinese error instead of throwing for an oversized full backup', () => {
@@ -79,6 +129,77 @@ describe('SettingsView backup safety', () => {
 });
 
 describe('SettingsView recurring safety', () => {
+  it('fails closed instead of retargeting recurring parents when the selected IDs become unavailable', () => {
+    const state = createInitialState('guest');
+    const categories = state.data.categories.filter((item) => item.kind === 'expense');
+    const [categoryA, categoryB] = categories;
+    const accountA = state.data.accounts[0];
+    const accountB = { ...accountA, id: 'account-b', name: '帳戶 B' };
+
+    expect(resolveExplicitSelection(categoryA.id, [categoryA, categoryB])).toBe(categoryA.id);
+    expect(resolveExplicitSelection(categoryA.id, [categoryB])).toBe('');
+    expect(resolveExplicitSelection(categoryB.id, [categoryB])).toBe(categoryB.id);
+    expect(resolveExplicitSelection(accountA.id, [accountA, accountB])).toBe(accountA.id);
+    expect(resolveExplicitSelection(accountA.id, [accountB])).toBe('');
+    expect(resolveExplicitSelection(accountB.id, [accountB])).toBe(accountB.id);
+    expect(resolveExplicitSelection(categoryA.id, [{ ...categoryA, isActive: false }])).toBe(categoryA.id);
+    expect(resolveExplicitSelection(accountA.id, [{ ...accountA, isActive: false }])).toBe(accountA.id);
+
+    const html = renderToStaticMarkup(
+      <RecurringPanel data={state.data} ownerId="guest" putRecurring={() => true} deleteRecurring={() => true} />,
+    );
+    expect(html).toContain('<option value="" disabled="" selected="">請選擇分類</option>');
+    expect(html).toContain('<option value="" disabled="" selected="">請選擇帳戶</option>');
+    expect(html.match(/<button class="primary-button flex-1"[^>]*>/)?.[0]).toContain('disabled=""');
+  });
+
+  it('preserves archived parents while editing and blocks resume until they are active', () => {
+    const state = createInitialState('guest');
+    const account = { ...state.data.accounts[0], isActive: false };
+    const category = { ...state.data.categories.find((item) => item.kind === 'expense')!, isActive: false };
+    state.data.accounts[0] = account;
+    state.data.categories = state.data.categories.map((item) => item.id === category.id ? category : item);
+    const rule = {
+      id: 'paused-rule', ownerId: 'guest', version: 2,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'paused-rule-op',
+      name: '已暫停規則', type: 'expense' as const, amount: 100,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly' as const, startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: false,
+    };
+
+    expect(includeCurrentInactiveOption([], category)).toEqual([category]);
+    expect(includeCurrentInactiveOption([], account)).toEqual([account]);
+    expect(getRecurringResumeBlock(state.data, rule)).toMatch(/先重新啟用/);
+    expect(isRecurringEditStale(rule, { ...rule, version: 3, lastOperationId: 'newer-rule-op' })).toBe(true);
+    expect(isRecurringEditStale(rule, { ...rule })).toBe(false);
+    expect(isRecurringEditStale(rule, { ...rule, deletedAt: '2026-08-27T02:00:00.000Z' })).toBe(true);
+    expect(isRecurringEditStale(rule, undefined)).toBe(true);
+    expect(isRecurringEditStale(rule, { ...rule }, true)).toBe(true);
+  });
+
+  it('shows an explicit recurring-rule edit action', () => {
+    const state = createInitialState('guest');
+    const account = state.data.accounts[0];
+    const category = state.data.categories.find((item) => item.kind === 'expense')!;
+    state.data.recurringRules = [{
+      id: 'monthly-rent', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z', lastOperationId: 'monthly-rent-created',
+      name: '房租', type: 'expense', amount: 12000,
+      categoryId: category.id, categoryName: category.name,
+      accountId: account.id, accountName: account.name,
+      frequency: 'monthly', startDate: '2026-08-01', nextOccurrenceDate: '2026-09-01',
+      isActive: true,
+    }];
+
+    const html = renderToStaticMarkup(
+      <RecurringPanel data={state.data} ownerId="guest" putRecurring={() => true} deleteRecurring={() => true} />,
+    );
+
+    expect(html).toContain('編輯 房租');
+  });
+
   it('shows a recovery path when an active rule exceeds the catch-up limit', () => {
     const state = createInitialState('guest');
     const account = state.data.accounts[0];

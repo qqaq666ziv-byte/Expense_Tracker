@@ -19,7 +19,12 @@ import {
 import { useTheme } from "./context/ThemeContext";
 import { useFinanceApp } from "./app/useFinanceApp";
 import { changedRecordMeta } from "./app/state";
-import type { FinanceData, LegacyAuthenticatedBootstrap } from "./domain/model";
+import type {
+  FinanceData,
+  FinanceEntityName,
+  LegacyAuthenticatedBootstrap,
+  SyncRecord,
+} from "./domain/model";
 import { exportFinanceBackup } from "./domain/backup";
 import { calculateFinancials } from "./domain/financeEngine";
 import { isFinancialTransaction } from "./domain/tutorialRecord";
@@ -98,6 +103,34 @@ function candidateRecordCount(data: FinanceData): number {
     data.budgets.length +
     data.recurringRules.length
   );
+}
+
+const syncEntityLabels: Record<FinanceEntityName, string> = {
+  accounts: "帳戶",
+  categories: "分類",
+  transactions: "交易",
+  adjustments: "餘額調整",
+  goals: "儲蓄目標",
+  allocations: "目標配置",
+  budgets: "預算",
+  recurringRules: "週期規則",
+};
+
+function describeSyncConflict(data: FinanceData, key: string): {
+  entity: FinanceEntityName;
+  recordId: string;
+  label: string;
+} | null {
+  const separator = key.indexOf(":");
+  if (separator <= 0) return null;
+  const entity = key.slice(0, separator) as FinanceEntityName;
+  const recordId = key.slice(separator + 1);
+  if (!(entity in syncEntityLabels) || !recordId) return null;
+  const record = (data[entity] as SyncRecord[]).find((candidate) => candidate.id === recordId) as
+    | (SyncRecord & { name?: string; categoryName?: string; occurredAt?: string })
+    | undefined;
+  const detail = record?.name ?? record?.categoryName ?? record?.occurredAt ?? recordId;
+  return { entity, recordId, label: `${syncEntityLabels[entity]}「${detail}」` };
 }
 
 export function LegacyBootstrapPanel({
@@ -387,47 +420,7 @@ export default function App() {
       )
     )
       return false;
-    for (const rule of recurring)
-      if (
-        !app.put("recurringRules", {
-          ...rule,
-          ...changedRecordMeta(rule),
-          isActive: false,
-        })
-      )
-        return false;
-    return app.put("accounts", {
-      ...record,
-      ...changedRecordMeta(record),
-      isActive: false,
-    });
-  };
-  const archiveCategory = (record: FinanceData["categories"][number]) => {
-    const recurring = data.recurringRules.filter(
-      (rule) =>
-        !rule.deletedAt && rule.isActive && rule.categoryId === record.id,
-    );
-    if (
-      recurring.length > 0 &&
-      !window.confirm(
-        `封存「${record.name}」也會暫停 ${recurring.length} 個週期收支；過去紀錄仍會保留。要繼續嗎？`,
-      )
-    )
-      return false;
-    for (const rule of recurring)
-      if (
-        !app.put("recurringRules", {
-          ...rule,
-          ...changedRecordMeta(rule),
-          isActive: false,
-        })
-      )
-        return false;
-    return app.put("categories", {
-      ...record,
-      ...changedRecordMeta(record),
-      isActive: false,
-    });
+    return app.archiveAccount(record);
   };
   const nav = [
     { key: "record" as const, label: "記帳", icon: BookOpenCheck },
@@ -440,13 +433,20 @@ export default function App() {
     <SettingsView
       data={data}
       ownerId={app.state.ownerId}
-      putAccount={(record) => app.put("accounts", record)}
       putCategory={(record) => app.put("categories", record)}
       putRecurring={(record) => app.put("recurringRules", record)}
-      archiveAccount={archiveAccount}
-      archiveCategory={archiveCategory}
+      categoryLifecycle={(record, action) => {
+        const recurringCount = data.recurringRules.filter((rule) => (
+          !rule.deletedAt && rule.isActive && rule.categoryId === record.id
+        )).length;
+        if (action === "archive" && recurringCount > 0 && !window.confirm(
+          `封存「${record.name}」也會暫停 ${recurringCount} 個週期收支；過去紀錄仍會保留。要繼續嗎？`,
+        )) return false;
+        return app.categoryLifecycle(record, action);
+      }}
       deleteRecurring={(record) => app.softDelete("recurringRules", record)}
       restore={app.setData}
+      unresolvedSyncRecordKeys={app.mutationLockedRecordKeys}
     />
   );
 
@@ -548,9 +548,46 @@ export default function App() {
           <div className="warning-banner" role="alert">
             <div>
               <strong>這次操作沒有執行</strong>
-              <p>請確認目前帳戶後再試一次。</p>
+              <p>{app.safetyNotice}</p>
             </div>
           </div>
+        )}
+        {app.unresolvedSyncRecordKeys.size > 0 && (
+          <section className="warning-banner" role="alert" aria-live="polite">
+            <div>
+              <strong>有 {app.unresolvedSyncRecordKeys.size} 筆資料需要選擇同步版本</strong>
+              <p>為避免覆蓋另一台裝置的內容，這些資料的修改與生命週期操作已暫停。</p>
+              <ul>
+                {[...app.unresolvedSyncRecordKeys].map((key) => {
+                  const conflict = describeSyncConflict(data, key);
+                  if (!conflict) return null;
+                  const impact = app.conflictResolutionImpact.get(key) ?? 1;
+                  return (
+                    <li key={key}>
+                      <span>{conflict.label}</span>{" "}
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={app.syncBusy || !online}
+                        title={impact > 1
+                          ? `此資料屬於同一次生命週期操作；將一併採用同批 ${impact} 筆雲端版本。`
+                          : undefined}
+                        onClick={() => {
+                          if (impact > 1 && !window.confirm(
+                            `這筆資料屬於同一次生命週期操作。繼續會一併採用同批 ${impact} 筆雲端版本；歷史交易不會被改寫。確定繼續？`,
+                          )) return;
+                          void app.acceptRemoteConflict(conflict.entity, conflict.recordId);
+                        }}
+                      >
+                        {impact > 1 ? `使用同批 ${impact} 筆雲端版本` : "使用雲端版本"}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              {!online && <p>回到線上後才能讀取並採用最新雲端版本。</p>}
+            </div>
+          </section>
         )}
         {legacyBootstrap && (
           <LegacyBootstrapPanel
@@ -637,6 +674,10 @@ export default function App() {
                 deleteTransaction={(record) =>
                   app.softDelete("transactions", record)
                 }
+                unresolvedSyncRecordKeys={app.mutationLockedRecordKeys}
+                acceptRemoteConflict={(recordId) => {
+                  void app.acceptRemoteConflict("transactions", recordId);
+                }}
                 tutorial={activeTutorial}
                 onTutorialEvent={handleTutorialEvent}
               />
@@ -651,6 +692,7 @@ export default function App() {
                 putAccount={(record) => app.put("accounts", record)}
                 putAdjustment={(record) => app.put("adjustments", record)}
                 archiveAccount={archiveAccount}
+                unresolvedSyncRecordKeys={app.mutationLockedRecordKeys}
               />
             )}
             {tab === "planning" && (
@@ -678,6 +720,8 @@ export default function App() {
                     isActive: false,
                   })
                 }
+                releaseGoalAllocations={app.releaseGoalAllocations}
+                unresolvedSyncRecordKeys={app.mutationLockedRecordKeys}
               />
             )}
           </Suspense>

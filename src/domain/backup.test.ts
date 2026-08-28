@@ -311,7 +311,7 @@ describe('versioned finance backup', () => {
     expect(secondRestore.accounts).toHaveLength(1);
   });
 
-  it('compares equal-version update timestamps by instant rather than timestamp spelling', () => {
+  it('rejects equal-version divergent payloads that reuse one operation identity', () => {
     const current = structuredClone(fixture);
     current.transactions[0].updatedAt = '2026-08-21T10:00:00+08:00';
     current.transactions[0].note = '舊資料';
@@ -319,19 +319,18 @@ describe('versioned finance backup', () => {
     incoming.transactions[0].updatedAt = '2026-08-21T03:00:00Z';
     incoming.transactions[0].note = '新資料';
 
-    const restored = restoreFinanceBackup(current, createFinanceBackup(incoming), { ownerId: 'guest' });
-
-    expect(restored.transactions[0].note).toBe('新資料');
+    expect(() => restoreFinanceBackup(current, createFinanceBackup(incoming), { ownerId: 'guest' }))
+      .toThrow(/conflicting.*tx-breakfast/i);
   });
 
-  it('preserves sub-millisecond ordering and resolves exact timestamp ties deterministically', () => {
+  it('uses operation id after version regardless of timestamp ordering', () => {
     const older = structuredClone(fixture);
     older.transactions[0].updatedAt = '2026-08-21T03:00:00.000000001Z';
     older.transactions[0].lastOperationId = 'operation-a';
     older.transactions[0].note = '舊資料';
     const newer = structuredClone(fixture);
     newer.transactions[0].updatedAt = '2026-08-21T03:00:00.000000002Z';
-    newer.transactions[0].lastOperationId = 'operation-a';
+    newer.transactions[0].lastOperationId = 'operation-b';
     newer.transactions[0].note = '新資料';
 
     expect(restoreFinanceBackup(older, createFinanceBackup(newer), { ownerId: 'guest' })
@@ -343,6 +342,53 @@ describe('versioned finance backup', () => {
     const reverse = restoreFinanceBackup(newer, createFinanceBackup(older), { ownerId: 'guest' });
     expect(forward.transactions[0].lastOperationId).toBe('operation-z');
     expect(reverse.transactions[0].lastOperationId).toBe('operation-z');
+  });
+
+  it('round-trips a category tombstone while preserving its historical transaction reference', () => {
+    const data = structuredClone(fixture);
+    data.categories[0].version = 2;
+    data.categories[0].isActive = false;
+    data.categories[0].deletedAt = '2026-08-27T00:00:00.000Z';
+    data.categories[0].updatedAt = '2026-08-27T00:00:00.000Z';
+    data.categories[0].lastOperationId = 'tombstone:category-food';
+
+    expect(parseFinanceBackup(exportFinanceBackup(data)).data).toEqual(data);
+  });
+
+  it('keeps an equal-version legacy UUID tombstone ahead of an active backup edit', () => {
+    const active = structuredClone(fixture);
+    active.categories[0].version = 2;
+    active.categories[0].updatedAt = '2026-08-28T00:00:00.000Z';
+    active.categories[0].lastOperationId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    active.categories.push({
+      ...active.categories[0],
+      id: 'category-spare',
+      name: '交通',
+      version: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z',
+      lastOperationId: 'category-spare-created',
+    });
+    const deleted = structuredClone(active);
+    deleted.categories[0].lastOperationId = '00000000-0000-4000-8000-000000000000';
+    deleted.categories[0].updatedAt = '2026-08-27T00:00:00.000Z';
+    deleted.categories[0].deletedAt = '2026-08-27T00:00:00.000Z';
+    deleted.categories[0].isActive = false;
+
+    const forward = restoreFinanceBackup(active, createFinanceBackup(deleted), { ownerId: 'guest' });
+    const reverse = restoreFinanceBackup(deleted, createFinanceBackup(active), { ownerId: 'guest' });
+
+    expect(forward.categories[0].deletedAt).toBeDefined();
+    expect(reverse.categories[0].deletedAt).toBeDefined();
+  });
+
+  it('rejects a tombstone that reuses the exact active operation identity', () => {
+    const active = structuredClone(fixture);
+    const deleted = structuredClone(active);
+    deleted.categories[0].deletedAt = '2026-08-27T00:00:00.000Z';
+    deleted.categories[0].isActive = false;
+
+    expect(() => restoreFinanceBackup(active, createFinanceBackup(deleted), { ownerId: 'guest' }))
+      .toThrow(/conflicting.*category-food/i);
   });
 
   it('rejects divergent records that claim the exact same version and operation identity', () => {
@@ -380,11 +426,54 @@ describe('versioned finance backup', () => {
 
     expect(() => restoreFinanceBackup(fixture, backup, { mode: 'replace' }))
       .toThrow(/confirmReplace/i);
-    expect(restoreFinanceBackup(fixture, backup, {
+    expect(() => restoreFinanceBackup(fixture, backup, {
       mode: 'replace',
       confirmReplace: true,
       ownerId: 'guest',
-    })).toEqual(emptyData());
+    })).toThrow(/至少必須保留/);
+
+    const validReplacement = structuredClone(fixture);
+    validReplacement.transactions = [];
+    expect(restoreFinanceBackup(fixture, createFinanceBackup(validReplacement), {
+      mode: 'replace',
+      confirmReplace: true,
+      ownerId: 'guest',
+    })).toEqual(validReplacement);
+  });
+
+  it('rejects meaning/minimum replacement changes while preserving visible duplicates', () => {
+    const options = { mode: 'replace' as const, confirmReplace: true, ownerId: 'guest' as const };
+    const kindDrift = structuredClone(fixture);
+    kindDrift.categories[0].kind = 'income';
+    kindDrift.transactions[0].type = 'income';
+    kindDrift.recurringRules[0].type = 'income';
+    kindDrift.budgets = [];
+    expect(() => restoreFinanceBackup(fixture, createFinanceBackup(kindDrift), options))
+      .toThrow(/收支類型/);
+
+    const noExpense = structuredClone(fixture);
+    noExpense.categories[0].isActive = false;
+    expect(() => restoreFinanceBackup(fixture, createFinanceBackup(noExpense), options))
+      .toThrow(/至少必須保留/);
+
+    const duplicate = structuredClone(fixture);
+    duplicate.categories.push({
+      ...duplicate.categories[0],
+      id: 'category-duplicate',
+      name: '　餐飲 ',
+      lastOperationId: 'category-duplicate-created',
+    });
+    expect(restoreFinanceBackup(fixture, createFinanceBackup(duplicate), options).categories)
+      .toHaveLength(2);
+
+    const conflictingBudgets = structuredClone(fixture);
+    conflictingBudgets.budgets.push({
+      ...conflictingBudgets.budgets[0],
+      id: 'budget-conflict',
+      lastOperationId: 'budget-conflict-created',
+    });
+    expect(restoreFinanceBackup(fixture, createFinanceBackup(conflictingBudgets), options).budgets)
+      .toHaveLength(2);
   });
 });
 
