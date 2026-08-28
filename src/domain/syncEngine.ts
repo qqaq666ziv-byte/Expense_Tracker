@@ -276,7 +276,13 @@ export function confirmTransferDependencyConflict(
     || replacement.destinationAccountName !== destination.name) {
     throw new Error('帳戶選擇或名稱快照不是目前明確確認的版本。');
   }
-  for (const accountId of [source.id, destination.id]) {
+  const affectedAccountIds = new Set([
+    current.sourceAccountId,
+    current.destinationAccountId,
+    source.id,
+    destination.id,
+  ]);
+  for (const accountId of affectedAccountIds) {
     if (hasUnresolvedPayloadConflict(
       state.outbox,
       'accounts',

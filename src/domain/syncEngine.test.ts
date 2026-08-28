@@ -322,13 +322,25 @@ describe('offline sync engine', () => {
     expect(blocked.state.outbox[0].lastError).toMatch(/^transfer selected account changed before cloud write/);
     expect(blocked.state.unresolvedSyncRecordKeys).toContain('transfers:retarget-transfer');
 
-    const confirmed = confirmTransferDependencyConflict(blocked.state, {
+    const replacement = {
       ...localRetarget,
       destinationAccountName: remoteBroker.name,
       version: 3,
       updatedAt: '2026-08-28T03:01:00.000Z',
       lastOperationId: 'transfer-retarget-reconfirmed',
-    });
+    };
+    expect(() => confirmTransferDependencyConflict({
+      ...blocked.state,
+      unresolvedSyncRecordKeys: [
+        ...(blocked.state.unresolvedSyncRecordKeys ?? []),
+        'accounts:broker',
+      ],
+    }, {
+      ...replacement,
+      destinationAccountId: cash.id,
+      destinationAccountName: cash.name,
+    })).toThrow(/帳戶仍有未解同步衝突/);
+    const confirmed = confirmTransferDependencyConflict(blocked.state, replacement);
     const converged = await syncFinanceState(confirmed, 'user-a', remote);
     expect(converged.state.outbox).toEqual([]);
     expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
