@@ -91,8 +91,10 @@ declare
   source_account public.accounts%rowtype;
   destination_account public.accounts%rowtype;
   endpoints_unchanged boolean := false;
+  has_existing boolean := false;
 begin
   if tg_op = 'UPDATE' then
+    has_existing := true;
     historical_transfer := old;
     endpoints_unchanged := new.source_account_id = old.source_account_id
       and new.destination_account_id = old.destination_account_id;
@@ -101,10 +103,25 @@ begin
     from public.transfers
     where user_id = new.user_id and id = new.id;
     if found then
+      has_existing := true;
       historical_transfer := existing_transfer;
       endpoints_unchanged := new.source_account_id = existing_transfer.source_account_id
         and new.destination_account_id = existing_transfer.destination_account_id;
     end if;
+  end if;
+
+  -- Account validation runs before the generic conflict-clock trigger. Do not
+  -- let an unavailable historical endpoint turn a stale/idempotent UPSERT into
+  -- a new domain error; the later trigger will retain OLD or reject a divergent
+  -- equal-clock payload exactly as it does for every other sync entity.
+  if has_existing and (
+    historical_transfer.version > new.version
+    or (
+      historical_transfer.version = new.version
+      and historical_transfer.last_operation_id >= new.last_operation_id
+    )
+  ) then
+    return new;
   end if;
 
   if endpoints_unchanged then

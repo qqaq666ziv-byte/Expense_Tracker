@@ -2473,6 +2473,43 @@ async function verifyAtomicTransfers() {
       set note = '歷史端點仍可修改', version = 2, last_operation_id = 'transfer-4-edit-op'
       where user_id = $1 and id = 'excluded-to-excluded'
     `, [OWNER_A]);
+    const staleRetarget = await one(db, `
+      insert into public.transfers (
+        user_id, id, amount, source_account_id, source_account_name,
+        destination_account_id, destination_account_name, occurred_at, note,
+        version, updated_at, last_operation_id
+      ) values ($1, 'excluded-to-excluded', 999, 'included-a', '計入 A',
+        'excluded-b', '排除 B', '2026-08-28 10:00', '較舊重試', 1, now(), 'older-transfer-op')
+      on conflict (user_id, id) do update set
+        amount = excluded.amount,
+        source_account_id = excluded.source_account_id,
+        source_account_name = excluded.source_account_name,
+        destination_account_id = excluded.destination_account_id,
+        destination_account_name = excluded.destination_account_name,
+        occurred_at = excluded.occurred_at,
+        note = excluded.note,
+        version = excluded.version,
+        updated_at = excluded.updated_at,
+        last_operation_id = excluded.last_operation_id
+      returning source_account_id, destination_account_id, note, version, last_operation_id
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        source: staleRetarget.source_account_id,
+        destination: staleRetarget.destination_account_id,
+        note: staleRetarget.note,
+        version: numeric(staleRetarget.version),
+        operation: staleRetarget.last_operation_id,
+      },
+      {
+        source: 'excluded-a',
+        destination: 'excluded-b',
+        note: '歷史端點仍可修改',
+        version: 2,
+        operation: 'transfer-4-edit-op',
+      },
+      'A stale retarget retry must preserve the newer transfer before account availability checks',
+    );
     await assert.rejects(
       db.query(`
         insert into public.transfers (
