@@ -862,7 +862,7 @@ export function HomeView({
                       </small>
                       {hasDependencyConflict && (
                         <small role="status">
-                          帳戶已在首次雲端寫入前變更；請重新選擇並確認兩個帳戶。
+                          所選帳戶已在轉帳上傳前變更；請重新選擇並確認兩個帳戶。
                           <button
                             type="button"
                             className="secondary-button"

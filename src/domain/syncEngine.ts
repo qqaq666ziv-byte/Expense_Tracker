@@ -9,6 +9,7 @@ import type {
 import { validateFinanceData } from './backup';
 import { hasSameBudgetSemantics } from './budgetEngine';
 import { assertLifecycleTransition } from './lifecycle';
+import { assertFinanceRecordWithinWriteLimits } from './resourceLimits';
 
 export type SyncEntityRecord = FinanceData[FinanceEntityName][number];
 
@@ -25,7 +26,7 @@ export function activeOperationId(operationId: string = crypto.randomUUID()): st
 
 const BUDGET_CONFLICT_ROLLBACK_MARKER = 'budget-conflict-rollback:';
 export const UNRESOLVED_PAYLOAD_CONFLICT_PREFIX = 'unresolved same-clock payload conflict';
-export const TRANSFER_DEPENDENCY_CONFLICT_PREFIX = 'transfer account changed before first cloud write';
+export const TRANSFER_DEPENDENCY_CONFLICT_PREFIX = 'transfer selected account changed before cloud write';
 
 export function hasTransferDependencyConflict(
   operation: PendingOperation,
@@ -275,6 +276,17 @@ export function confirmTransferDependencyConflict(
     || replacement.destinationAccountName !== destination.name) {
     throw new Error('帳戶選擇或名稱快照不是目前明確確認的版本。');
   }
+  for (const accountId of [source.id, destination.id]) {
+    if (hasUnresolvedPayloadConflict(
+      state.outbox,
+      'accounts',
+      accountId,
+      state.unresolvedSyncRecordKeys,
+    )) {
+      throw new Error('來源或目的帳戶仍有未解同步衝突，轉帳帳戶確認未套用。');
+    }
+  }
+  assertFinanceRecordWithinWriteLimits('transfers', replacement);
 
   const data = replaceRecord(state.data, { entity: 'transfers', record: replacement });
   validateFinanceData(data, 'confirmed transfer account dependency');
@@ -1349,13 +1361,25 @@ export async function syncFinanceState(
       for (const [transferIndex, operation] of state.outbox.entries()) {
         if (operation.entity !== 'transfers' || operation.record.deletedAt) continue;
         const transferKey = recordKey('transfers', operation.recordId);
-        // Existing cloud transfers use the ordinary record conflict clock. This
-        // dependency gate is specifically for a local create whose account
-        // context changed before its first durable cloud write.
-        if (preflightByKey.has(transferKey)) continue;
         const transfer = operation.record as FinanceData['transfers'][number];
-        const changedEndpoint = [transfer.sourceAccountId, transfer.destinationAccountId]
-          .find((accountId) => {
+        const remoteTransferEntry = preflightByKey.get(transferKey);
+        const remoteTransfer = remoteTransferEntry?.entity === 'transfers'
+          ? remoteTransferEntry.record
+          : undefined;
+        if (remoteTransfer) {
+          const transferComparison = compareSyncRecords(transfer, remoteTransfer);
+          const divergentSameClock = transferComparison === 0
+            && differingSyncRecordFields('transfers', transfer, remoteTransfer).length > 0;
+          // Direct transfer conflicts retain the normal accept-cloud path.
+          if (transferComparison < 0 || divergentSameClock) continue;
+        }
+        const changedEndpoint = [
+          [transfer.sourceAccountId, remoteTransfer?.sourceAccountId],
+          [transfer.destinationAccountId, remoteTransfer?.destinationAccountId],
+        ].find(([accountId, historicalAccountId]) => {
+            // Unchanged endpoints intentionally retain their historical
+            // snapshots, including accounts archived after the transfer.
+            if (historicalAccountId === accountId) return false;
             const accountKey = recordKey('accounts', accountId);
             const localAccount = state.data.accounts.find((account) => account.id === accountId);
             const remoteAccount = preflightByKey.get(accountKey);
@@ -1379,7 +1403,7 @@ export async function syncFinanceState(
               && (!remoteAccount || compareSyncRecords(parentOperation.record, remoteAccount.record) > 0),
             );
             return !parentWillEstablishExactLocalState;
-          });
+          })?.[0];
         if (!changedEndpoint) continue;
         const reason = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: account/${changedEndpoint}; `
           + '請重新開啟轉帳並明確確認來源與目的帳戶。';
