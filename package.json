@@ -29,6 +29,7 @@
     "@testing-library/user-event": "14.6.6",
     "@types/node": "24.13.3",
     "@vitejs/plugin-react": "6.1.0",
+    "fake-indexeddb": "6.2.5",
     "jsdom": "30.0.1",
     "tailwindcss": "4.3.3",
     "typescript": "5.9.3",

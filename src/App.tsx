@@ -1,4 +1,12 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   BarChart3,
   BookOpenCheck,
@@ -68,10 +76,14 @@ const SettingsView = lazy(() =>
 
 type Tab = "record" | "insights" | "assets" | "planning";
 
-function initialTutorialProgress(): TutorialProgress | null {
+function tutorialStorageKey(ownerId: string): string {
+  return `${TUTORIAL_STORAGE_KEY}:${ownerId === "guest" ? "guest" : `user:${ownerId}`}`;
+}
+
+function initialTutorialProgress(ownerId: string): TutorialProgress | null {
   try {
     const saved = parseTutorialProgress(
-      localStorage.getItem(TUTORIAL_STORAGE_KEY),
+      localStorage.getItem(tutorialStorageKey(ownerId)),
     );
     if (saved) return saved;
     // People who completed the previous tour should not be interrupted again;
@@ -234,19 +246,23 @@ function downloadJson(name: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
+export function FinanceOwnerBoundary({
+  ownerId,
+  children,
+}: {
+  ownerId: string;
+  children: ReactNode;
+}) {
+  return <Fragment key={ownerId}>{children}</Fragment>;
+}
+
 export default function App() {
   const app = useFinanceApp();
-  const data = app.state.data;
   const { theme, toggleTheme } = useTheme();
   const [tab, setTab] = useState<Tab>("record");
   const [online, setOnline] = useState(navigator.onLine);
-  const [authMessage, setAuthMessage] = useState("");
   const [showSystem, setShowSystem] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [tutorial, setTutorial] = useState<TutorialProgress | null>(
-    initialTutorialProgress,
-  );
-  const tutorialResumeChecked = useRef(false);
 
   useEffect(() => {
     const update = () => setOnline(navigator.onLine);
@@ -258,14 +274,65 @@ export default function App() {
     };
   }, []);
 
+  return (
+    <FinanceOwnerBoundary ownerId={app.state.ownerId}>
+      <OwnerScopedApp
+        app={app}
+        theme={theme}
+        toggleTheme={toggleTheme}
+        tab={tab}
+        setTab={setTab}
+        online={online}
+        showSystem={showSystem}
+        setShowSystem={setShowSystem}
+        showSettings={showSettings}
+        setShowSettings={setShowSettings}
+      />
+    </FinanceOwnerBoundary>
+  );
+}
+
+function OwnerScopedApp({
+  app,
+  theme,
+  toggleTheme,
+  tab,
+  setTab,
+  online,
+  showSystem,
+  setShowSystem,
+  showSettings,
+  setShowSettings,
+}: {
+  app: ReturnType<typeof useFinanceApp>;
+  theme: ReturnType<typeof useTheme>["theme"];
+  toggleTheme: ReturnType<typeof useTheme>["toggleTheme"];
+  tab: Tab;
+  setTab(tab: Tab): void;
+  online: boolean;
+  showSystem: boolean;
+  setShowSystem(show: boolean): void;
+  showSettings: boolean;
+  setShowSettings(show: boolean): void;
+}) {
+  const data = app.state.data;
+  const [authMessage, setAuthMessage] = useState("");
+  const [tutorial, setTutorial] = useState<TutorialProgress | null>(
+    () => initialTutorialProgress(app.state.ownerId),
+  );
+  const tutorialResumeChecked = useRef(false);
+
   useEffect(() => {
     if (!tutorial) return;
     try {
-      localStorage.setItem(TUTORIAL_STORAGE_KEY, JSON.stringify(tutorial));
+      localStorage.setItem(
+        tutorialStorageKey(app.state.ownerId),
+        JSON.stringify(tutorial),
+      );
     } catch {
       /* UI preference only */
     }
-  }, [tutorial]);
+  }, [app.state.ownerId, tutorial]);
 
   const activeTutorial = tutorial?.status === "active" ? tutorial : null;
 
@@ -295,13 +362,17 @@ export default function App() {
       current ? transitionTutorial(current, event) : current,
     );
 
-  const cleanupTutorialRecords = (): boolean =>
-    data.transactions
-      .filter((record) => !record.deletedAt && isTutorialTransaction(record))
-      .every((record) => app.softDelete("transactions", record));
+  const cleanupTutorialRecords = async (): Promise<boolean> => {
+    for (const record of data.transactions.filter(
+      (candidate) => !candidate.deletedAt && isTutorialTransaction(candidate),
+    )) {
+      if (!await app.softDelete("transactions", record)) return false;
+    }
+    return true;
+  };
 
-  const startTutorialChapter = (chapter: TutorialChapter) => {
-    if (!cleanupTutorialRecords()) {
+  const startTutorialChapter = async (chapter: TutorialChapter) => {
+    if (!await cleanupTutorialRecords()) {
       setAuthMessage("教學紀錄尚未安全清除，請稍後再重新開始教學。");
       return;
     }
@@ -311,8 +382,8 @@ export default function App() {
   };
 
   const pauseTutorial = () => handleTutorialEvent({ type: "pause" });
-  const skipTutorial = () => {
-    if (!cleanupTutorialRecords()) {
+  const skipTutorial = async () => {
+    if (!await cleanupTutorialRecords()) {
       setAuthMessage("教學紀錄尚未安全清除，因此沒有結束教學。");
       return;
     }
@@ -930,7 +1001,7 @@ export default function App() {
                 <button
                   type="button"
                   className="secondary-button"
-                  onClick={() => startTutorialChapter("full")}
+                  onClick={() => { void startTutorialChapter("full"); }}
                 >
                   從頭跑完整教學
                 </button>
@@ -949,7 +1020,7 @@ export default function App() {
                   <button
                     type="button"
                     key={chapter}
-                    onClick={() => startTutorialChapter(chapter)}
+                    onClick={() => { void startTutorialChapter(chapter); }}
                   >
                     {label}
                   </button>

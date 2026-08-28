@@ -176,16 +176,18 @@ invalid, or conflicting before changing the guard.
 Do not bulk rewrite, delete, reassign, or merge real financial records without
 an explicit migration/recovery rule and appropriate authorization.
 
-The transfer release has one server artifact in addition to the additive
-migration: `supabase/functions/finance-import-historical-transfer-batch`. Its
-public handler verifies the Supabase user JWT and complete owner-scoped
-import/restore manifest, then uses the server-only service role to enter the
-single atomic database transaction. `anon` and ordinary `authenticated` roles
-must have no `EXECUTE` privilege on that RPC. On isolated staging, deploy and
-smoke the reviewed Edge Function together with the migration, verify the role
-grants and endpoint row locks, and only then enable the matching frontend.
-Production migration/function deployment remains a separately authorized
-operation; never copy a service-role credential into Vercel or browser code.
+The completed transfer release applied
+`20260824023801_finance_resource_abuse_guards.sql` and
+`20260828013341_finance_account_transfers.sql`, released the transfer-capable
+frontend, and released the server artifact
+`supabase/functions/finance-import-historical-transfer-batch`. Its public
+handler verifies the Supabase user JWT and complete owner-scoped import/restore
+manifest, then uses the server-only service role to enter the single atomic
+database transaction. `anon` and ordinary `authenticated` roles must have no
+`EXECUTE` privilege on that RPC. Future migration/function releases still
+require isolated staging verification, a fresh independent backup/PITR point,
+and explicit authorization; never copy a service-role credential into Vercel
+or browser code.
 
 ---
 
@@ -193,22 +195,15 @@ operation; never copy a service-role credential into Vercel or browser code.
 
 Frontend rollback and database rollback are separate operations.
 
-A frontend regression may be mitigated by restoring a previously verified
-Vercel deployment while leaving additive database schema changes intact, but
-the safe target changes permanently after first-class transfer data exists:
+Use one operational rule for a code-only frontend rollback: **if any
+Production `public.transfers` row may exist, deploy a transfer-aware frontend.**
+Unless an authoritative, current aggregate check proves the table is empty,
+treat transfer rows as potentially present. Do not restore a frontend that
+cannot pull, validate, display, and calculate transfers; a clean device can
+appear healthy while its account balances and total assets omit cloud transfers.
 
-- Before the first Production `public.transfers` row exists, a schema-v3
-  frontend may be considered only after confirming the table is empty and
-  preserving every schema-v4 local raw recovery payload. An upgraded browser
-  can still enter recovery protection.
-- After the first Production transfer row exists, never deploy a frontend that
-  does not pull, validate, display, and calculate transfer rows. In particular,
-  pre-transfer commit `d2510646961ff51f725b2e9a3c91bf9fb740516b` is not an
-  operationally safe rollback target: a clean device can appear healthy while
-  omitting cloud transfers from account balances and total assets.
-
-The repository contains a tested transfer-aware emergency frontend mode. From
-the reviewed transfer-capable release commit, run:
+The primary emergency path is the repository's tested transfer-aware build
+mode. From the reviewed transfer-capable release commit, run:
 
 ```powershell
 npm.cmd ci
@@ -225,6 +220,12 @@ and writes continue normally. For a hosted emergency build, configure the
 deployment build command as `npm.cmd run build:transfer-read-only`, or set
 `VITE_TRANSFER_MUTATIONS_ENABLED=false` for the build. Verify the served bundle
 and canonical deployment before routing users to it.
+
+A schema-v3/pre-transfer frontend is historical and conditionally safe only
+when authoritative current evidence proves `public.transfers` is empty and all
+schema-v4 local raw recovery payloads have been preserved. In particular,
+pre-transfer commit `d2510646961ff51f725b2e9a3c91bf9fb740516b` is never an
+operationally safe rollback target while a transfer row may exist.
 
 Do not clear browser storage or drop/hide the transfer table or tombstones to
 make an older client start. Preserve a raw recovery export and every cloud
@@ -264,17 +265,20 @@ Do not stack speculative fixes across multiple layers at once.
 
 ---
 
-## Release record
+## Historical release record — 2026-08-24
+
+This is historical topology and release evidence, not the current or latest
+Production-state record after the completed transfer release.
 
 Canonical Vercel project ID:
 
 `prj_PDwYdTxA52vgkfRek2AzNofUJCHW`
 
-Latest known-good production commit:
+Recorded production commit:
 
 `3b36bc0d63a635ef66fe2aadb8eb52a610ffd0dd`
 
-Latest known-good production deployment:
+Recorded production deployment:
 
 `dpl_14dFNW7J6LfgwLtuMtEuQufxi3KC`
 
@@ -300,9 +304,11 @@ Verified production topology and evidence:
   a newer project deployment was ready while the canonical alias still resolved
   to an older deployment. The canonical alias was explicitly assigned to the
   recorded deployment and then verified by hostname.
-- No production database migration or bulk financial-data mutation was part of
-  this release. In particular,
-  `20260824023801_finance_resource_abuse_guards.sql` was not deployed.
+- This historical release did not include a production database migration or
+  bulk financial-data mutation. In particular,
+  `20260824023801_finance_resource_abuse_guards.sql` was not deployed as part
+  of this 2026-08-24 release; it was applied later as part of the completed
+  transfer release.
 - Source restore point:
   `checkpoint/20260824-194448-before-auth-production-sync-incident` at
   `ba2e4f282817d1056d38dcce389e5804c0c09ae1`.

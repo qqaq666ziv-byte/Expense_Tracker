@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialState } from '../app/state';
+import { TUTORIAL_RECORD_NOTE, startTutorial } from '../app/tutorial';
 import type { AssetAccount, FinanceData, Transaction, Transfer } from '../domain/model';
 import { HomeView } from './HomeView';
 
@@ -298,7 +299,274 @@ describe('HomeView transfer interactions', () => {
   });
 });
 
+describe('HomeView durable mutation feedback', () => {
+  it('keeps the financial form intact and never reports success when durable persistence fails', async () => {
+    const user = userEvent.setup();
+    const data = createInitialState('guest').data;
+    const put = vi.fn(() => Promise.resolve(false));
+    render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+    const amount = screen.getByRole('textbox', { name: '金額' });
+    const note = screen.getByRole('textbox', { name: '備註' });
+    await user.type(amount, '88');
+    await user.type(note, 'durability failure draft');
+    await user.click(screen.getByRole('button', { name: '餐飲' }));
+    await user.click(screen.getByRole('button', { name: '現金' }));
+
+    await user.click(screen.getByRole('button', { name: '記下這筆支出' }));
+
+    expect(await screen.findByText(/操作未執行/)).toBeInTheDocument();
+    expect(amount).toHaveValue('88');
+    expect(note).toHaveValue('durability failure draft');
+    expect(screen.queryByText(/已記下.*88/)).not.toBeInTheDocument();
+  });
+});
+
 describe('HomeView smart quick entry interactions', () => {
+  it('rejects a transaction edit when background sync advances its version and preserves the form', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    data.transactions = [data.transactions[0]];
+    const put = vi.fn(() => true);
+    const view = render(
+      <HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />,
+    );
+
+    await user.click(screen.getAllByRole('button', { name: '編輯 餐飲' })[0]);
+    const amount = screen.getByRole('textbox', { name: '金額' });
+    await user.clear(amount);
+    await user.type(amount, '77');
+
+    const backgroundVersion = {
+      ...data.transactions[0],
+      amount: 65,
+      version: 2,
+      updatedAt: '2026-08-28T13:00:00.000Z',
+      lastOperationId: 'meal-1-background-update',
+    };
+    view.rerender(
+      <HomeView
+        data={{ ...data, transactions: [backgroundVersion] }}
+        ownerId="guest"
+        put={put}
+        deleteTransaction={() => true}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('這筆交易已在背景更新');
+    expect(amount).toHaveValue('77');
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('rejects a same-clock transaction whose current payload changed after the editor opened', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    data.transactions = [data.transactions[0]];
+    const put = vi.fn(() => true);
+    const view = render(
+      <HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '編輯 餐飲' }));
+    const note = screen.getByRole('textbox', { name: '備註' });
+    await user.clear(note);
+    await user.type(note, '只想修改備註');
+    view.rerender(
+      <HomeView
+        data={{
+          ...data,
+          transactions: [{ ...data.transactions[0], amount: 65 }],
+        }}
+        ownerId="guest"
+        put={put}
+        deleteTransaction={() => true}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('這筆交易已在背景更新');
+    expect(note).toHaveValue('只想修改備註');
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('rejects a transaction edit when background sync removes the current record', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    data.transactions = [data.transactions[0]];
+    const put = vi.fn(() => true);
+    const view = render(
+      <HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '編輯 餐飲' }));
+    const note = screen.getByRole('textbox', { name: '備註' });
+    await user.clear(note);
+    await user.type(note, '使用者尚未儲存的內容');
+    view.rerender(
+      <HomeView
+        data={{ ...data, transactions: [] }}
+        ownerId="guest"
+        put={put}
+        deleteTransaction={() => true}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('這筆交易已在背景更新、刪除');
+    expect(note).toHaveValue('使用者尚未儲存的內容');
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('rejects a transaction edit when background sync tombstones the record', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    data.transactions = [data.transactions[0]];
+    const put = vi.fn(() => true);
+    const view = render(
+      <HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '編輯 餐飲' }));
+    const amount = screen.getByRole('textbox', { name: '金額' });
+    await user.clear(amount);
+    await user.type(amount, '91');
+    view.rerender(
+      <HomeView
+        data={{
+          ...data,
+          transactions: [{
+            ...data.transactions[0],
+            version: 2,
+            deletedAt: '2026-08-28T13:15:00.000Z',
+            updatedAt: '2026-08-28T13:15:00.000Z',
+            lastOperationId: 'meal-1-background-delete',
+          }],
+        }}
+        ownerId="guest"
+        put={put}
+        deleteTransaction={() => true}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('這筆交易已在背景更新、刪除');
+    expect(amount).toHaveValue('91');
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('rejects a transaction editor that gains an unresolved conflict after opening', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    data.transactions = [data.transactions[0]];
+    const put = vi.fn(() => true);
+    const view = render(
+      <HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '編輯 餐飲' }));
+    const note = screen.getByRole('textbox', { name: '備註' });
+    await user.clear(note);
+    await user.type(note, '衝突期間保留的輸入');
+    view.rerender(
+      <HomeView
+        data={data}
+        ownerId="guest"
+        put={put}
+        deleteTransaction={() => true}
+        unresolvedSyncRecordKeys={new Set([`transactions:${data.transactions[0].id}`])}
+      />,
+    );
+    fireEvent.submit(screen.getByRole('button', { name: '儲存修改' }).closest('form')!);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('發生同步衝突');
+    expect(note).toHaveValue('衝突期間保留的輸入');
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('updates an unchanged transaction from the current record clock', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    data.transactions = [{
+      ...data.transactions[0],
+      version: 4,
+      lastOperationId: 'meal-1-current-clock',
+    }];
+    const put = vi.fn(() => true);
+    const view = render(
+      <HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '編輯 餐飲' }));
+    const amount = screen.getByRole('textbox', { name: '金額' });
+    await user.clear(amount);
+    await user.type(amount, '88');
+    view.rerender(
+      <HomeView
+        data={{ ...data, transactions: [{ ...data.transactions[0] }] }}
+        ownerId="guest"
+        put={put}
+        deleteTransaction={() => true}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(put).toHaveBeenCalledWith('transactions', expect.objectContaining({
+      id: data.transactions[0].id,
+      ownerId: 'guest',
+      amount: 88,
+      version: 5,
+    }));
+  });
+
+  it('preserves tutorial transaction markers and events for a valid unchanged edit', async () => {
+    const user = userEvent.setup();
+    const data = createInitialState('guest').data;
+    const category = data.categories.find((item) => item.kind === 'expense')!;
+    const tutorialRecord: Transaction = {
+      id: 'tutorial-record',
+      ownerId: 'guest',
+      version: 1,
+      updatedAt: '2026-08-28T14:00:00.000Z',
+      lastOperationId: 'tutorial-record-create',
+      amount: 100,
+      type: 'expense',
+      categoryId: category.id,
+      categoryName: category.name,
+      accountId: data.accounts[0].id,
+      accountName: data.accounts[0].name,
+      occurredAt: '2026-08-28T14:00:00.000',
+      note: TUTORIAL_RECORD_NOTE,
+    };
+    data.transactions = [tutorialRecord];
+    const put = vi.fn(() => true);
+    const onTutorialEvent = vi.fn();
+    render(
+      <HomeView
+        data={data}
+        ownerId="guest"
+        put={put}
+        deleteTransaction={() => true}
+        tutorial={{ ...startTutorial('first-record'), step: 'locate', recordId: tutorialRecord.id }}
+        onTutorialEvent={onTutorialEvent}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '編輯 餐飲' }));
+    const amount = screen.getByRole('textbox', { name: '金額' });
+    await user.clear(amount);
+    await user.type(amount, '120');
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(put).toHaveBeenCalledWith('transactions', expect.objectContaining({
+      id: tutorialRecord.id,
+      amount: 120,
+      note: TUTORIAL_RECORD_NOTE,
+      version: 2,
+    }));
+    expect(onTutorialEvent).toHaveBeenCalledWith({ type: 'edit-opened' });
+    expect(onTutorialEvent).toHaveBeenCalledWith({ type: 'transaction-updated' });
+  });
+
   it('discards every owner-derived entry state before another owner can observe or save it', async () => {
     const user = userEvent.setup();
     const ownerAData = dataWithQuickHistoryForOwner('owner-a');

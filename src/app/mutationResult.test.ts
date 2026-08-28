@@ -29,4 +29,16 @@ describe('applied mutation UI contract', () => {
     expect(reset).toHaveBeenCalledOnce();
     expect(reject).not.toHaveBeenCalled();
   });
+
+  it('waits for durable persistence before running success cleanup', async () => {
+    const reset = vi.fn();
+    const reject = vi.fn();
+
+    const pending = completeAppliedMutation(Promise.resolve(false), reset, reject);
+
+    expect(reset).not.toHaveBeenCalled();
+    expect(await pending).toBe(false);
+    expect(reset).not.toHaveBeenCalled();
+    expect(reject).toHaveBeenCalledWith(MUTATION_NOT_APPLIED_MESSAGE);
+  });
 });

@@ -20,7 +20,10 @@ import {
   shortDate,
   toLocalInput,
 } from "../app/format";
-import { completeAppliedMutation } from "../app/mutationResult";
+import {
+  completeAppliedMutation,
+  type MutationApplication,
+} from "../app/mutationResult";
 import { resolveExplicitSelection } from "../app/explicitSelection";
 import {
   TUTORIAL_RECORD_NOTE,
@@ -30,7 +33,7 @@ import {
 } from "../app/tutorial";
 import { FinanceIcon } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
-import { syncRecordKey } from "../domain/syncEngine";
+import { differingSyncRecordFields, syncRecordKey } from "../domain/syncEngine";
 import { buildTransferRecord } from "../domain/transfer";
 import { isEditorSnapshotStale } from "../domain/staleEditor";
 import {
@@ -45,17 +48,17 @@ import {
 interface HomeViewProps {
   data: FinanceData;
   ownerId: string;
-  put(entity: "transactions", record: Transaction): boolean;
-  put(entity: "transfers", record: Transfer): boolean;
-  deleteTransaction(record: Transaction): boolean;
-  deleteTransfer?(record: Transfer): boolean;
+  put(entity: "transactions", record: Transaction): MutationApplication;
+  put(entity: "transfers", record: Transfer): MutationApplication;
+  deleteTransaction(record: Transaction): MutationApplication;
+  deleteTransfer?(record: Transfer): MutationApplication;
   tutorial?: TutorialProgress | null;
   onTutorialEvent?(event: TutorialEvent): void;
   unresolvedSyncRecordKeys?: ReadonlySet<string>;
   acceptRemoteConflict?(recordId: string): void;
   acceptRemoteTransferConflict?(recordId: string): void;
   transferDependencyConflictIds?: ReadonlySet<string>;
-  confirmTransferAccounts?(record: Transfer): boolean;
+  confirmTransferAccounts?(record: Transfer): MutationApplication;
   transferMutationsEnabled?: boolean;
 }
 
@@ -403,7 +406,7 @@ function OwnerScopedHomeView({
         }, metadata, editingTransfer ?? undefined);
         completeAppliedMutation(
           resolvingTransferDependency
-            ? Boolean(confirmTransferAccounts?.(record))
+            ? confirmTransferAccounts?.(record) ?? false
             : put("transfers", record),
           () => {
             setSuccess(`${resolvingTransferDependency ? "已重新確認" : editingTransfer ? "已更新" : "已記下"}轉帳 ${displayMoney(numericAmount)}`);
@@ -416,8 +419,23 @@ function OwnerScopedHomeView({
       }
       return;
     }
-    if (editing && unresolvedSyncRecordKeys.has(syncRecordKey("transactions", editing.id))) {
-      setError("這筆交易有未解同步衝突；請先選擇雲端版本，本次修改未執行。");
+    const currentTransaction = editing
+      ? data.transactions.find((record) => record.id === editing.id)
+      : undefined;
+    const transactionPayloadChanged = Boolean(
+      editing
+      && currentTransaction
+      && differingSyncRecordFields("transactions", editing, currentTransaction).length > 0,
+    );
+    if (editing && (
+      transactionPayloadChanged
+      || isEditorSnapshotStale(editing, currentTransaction, {
+        hasUnresolvedConflict: unresolvedSyncRecordKeys.has(
+          syncRecordKey("transactions", editing.id),
+        ),
+      })
+    )) {
+      setError("這筆交易已在背景更新、刪除或發生同步衝突；請重新開啟編輯。");
       return;
     }
     if (quickReentryParents) {
@@ -470,10 +488,10 @@ function OwnerScopedHomeView({
     const creatingTutorial = tutorial?.step === "create" && !editing;
     const tutorialNote = editingTutorial || creatingTutorial;
 
-    const record: Transaction = editing
+    const record: Transaction = editing && currentTransaction
       ? {
-          ...editing,
-          ...changedRecordMeta(editing),
+          ...currentTransaction,
+          ...changedRecordMeta(currentTransaction),
           amount: numericAmount,
           type,
           categoryId: category.id,
@@ -1176,7 +1194,11 @@ function OwnerScopedHomeView({
                           : mutationBlocked ? "此轉帳或其帳戶有未解同步衝突，請先完成處理。" : undefined}
                         onClick={() => {
                           if (window.confirm("刪除這筆轉帳？兩個帳戶的餘額都會一併回復。")) {
-                            deleteTransfer(transfer);
+                            completeAppliedMutation(
+                              deleteTransfer(transfer),
+                              () => undefined,
+                              setError,
+                            );
                           }
                         }}
                       >
@@ -1278,9 +1300,13 @@ function OwnerScopedHomeView({
                         if (
                           window.confirm("刪除這筆紀錄？它不會再出現在帳本中。")
                         ) {
-                          const deleted = deleteTransaction(transaction);
-                          if (deleted && tutorialRow)
-                            onTutorialEvent?.({ type: "transaction-deleted" });
+                          completeAppliedMutation(
+                            deleteTransaction(transaction),
+                            () => {
+                              if (tutorialRow) onTutorialEvent?.({ type: "transaction-deleted" });
+                            },
+                            setError,
+                          );
                         }
                       }}
                     >
