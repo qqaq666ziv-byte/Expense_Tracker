@@ -14,6 +14,7 @@ import type {
 import type { RemoteAdapter, RemoteRecord } from './syncEngine';
 import {
   acceptRemoteConflictRecord,
+  confirmTransferDependencyConflict,
   compareSyncRecords,
   enqueueSyncRecord,
   syncFinanceState,
@@ -216,10 +217,63 @@ class InMemoryRemote implements RemoteAdapter {
 }
 
 describe('offline sync engine', () => {
+  it('holds a first transfer write when an endpoint changed remotely until the user explicitly reconfirms it', async () => {
+    const localBank = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const remoteBank = {
+      ...localBank,
+      name: '主要銀行',
+      includeInTotalAssets: false,
+      version: 2,
+      updatedAt: '2026-08-28T02:00:00.000Z',
+      lastOperationId: 'bank-remote-edit',
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const pendingTransfer = transfer('pending-transfer', 'user-a', 1, 'transfer-create');
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: remoteBank },
+      { entity: 'accounts', record: cash },
+    ]);
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [localBank, cash], []),
+      data: { ...emptyData(), accounts: [localBank, cash], transfers: [pendingTransfer] },
+      outbox: [transferOperation(pendingTransfer)],
+    };
+
+    const blocked = await syncFinanceState(initial, 'user-a', remote);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers')).toEqual([]);
+    expect(blocked.state.data.accounts.find((item) => item.id === 'bank')).toEqual(remoteBank);
+    expect(blocked.state.outbox[0].lastError).toMatch(/^transfer account changed before first cloud write/);
+    expect(blocked.state.unresolvedSyncRecordKeys).toContain('transfers:pending-transfer');
+
+    const refreshed = {
+      ...pendingTransfer,
+      sourceAccountName: remoteBank.name,
+      version: 2,
+      updatedAt: '2026-08-28T02:01:00.000Z',
+      lastOperationId: 'transfer-reconfirmed',
+    };
+    const confirmed = confirmTransferDependencyConflict(blocked.state, refreshed);
+    expect(confirmed.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(confirmed.outbox).toEqual([expect.objectContaining({
+      id: 'transfer-reconfirmed',
+      record: refreshed,
+      attempts: 0,
+      lastError: undefined,
+    })]);
+
+    const converged = await syncFinanceState(confirmed, 'user-a', remote);
+    expect(converged.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers'))
+      .toEqual([{ entity: 'transfers', record: refreshed }]);
+  });
+
   it('retries one atomic transfer row and converges create, edit, and tombstone without duplicates', async () => {
-    const remote = new InMemoryRemote();
     const bank = account('bank', 'user-a', 1, 'bank-create');
     const cash = account('cash', 'user-a', 1, 'cash-create');
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bank },
+      { entity: 'accounts', record: cash },
+    ]);
     const created = transfer('move-250', 'user-a', 1, 'transfer-create');
     remote.failAfterApplyOnce.add(created.lastOperationId);
     const createdState: PersistedFinanceState = {

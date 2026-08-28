@@ -685,6 +685,8 @@ export default function App() {
                   app.softDelete("transfers", record)
                 }
                 unresolvedSyncRecordKeys={app.mutationLockedRecordKeys}
+                transferDependencyConflictIds={app.transferDependencyConflictIds}
+                confirmTransferAccounts={app.confirmTransferAccounts}
                 acceptRemoteConflict={(recordId) => {
                   void app.acceptRemoteConflict("transactions", recordId);
                 }}

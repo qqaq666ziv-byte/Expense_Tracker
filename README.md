@@ -69,6 +69,7 @@
 - 訪客資料保存在瀏覽器 localStorage；清除網站資料可能移除它，請定期下載 JSON 備份。
 - Google 登入後使用 Supabase 同步；訪客資料不會自動混入登入帳本，必須明確選擇匯入或保持分開。
 - 每位使用者有獨立快照、原子待同步佇列、刪除防復活、衝突偵測與 owner isolation。
+- 離線新轉帳若在首次上雲前偵測到任一端帳戶已被其他裝置更新，會保留原始選擇並停止上傳；使用者必須重新開啟並明確確認兩端帳戶，才會刷新名稱快照與同步版本。
 - 本機快照驗證失敗時進入復原保護，停止修改與同步並保留原始內容供下載。
 - 轉帳以單一原子事件保存；完整 JSON 備份使用 schema version 2，仍可讀取沒有轉帳集合的 version 1 備份。交易 CSV 契約維持不變，轉帳另行匯出。
 - 完整安全語義、migration 與回復流程見 [CODEX_BUILD_SPEC.md](CODEX_BUILD_SPEC.md)、[QUALITY_REPORT.md](QUALITY_REPORT.md) 與 [supabase/ROLLBACK.md](supabase/ROLLBACK.md)。

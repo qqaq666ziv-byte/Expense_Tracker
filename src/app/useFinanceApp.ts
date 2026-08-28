@@ -16,7 +16,9 @@ import { catchUpRecurringTransactions } from '../domain/recurrence';
 import { recurringRuleParentIssue } from '../domain/recurringSafety';
 import {
   acceptRemoteConflictRecord,
+  confirmTransferDependencyConflict,
   hasUnresolvedPayloadConflict,
+  hasTransferDependencyConflict,
   syncRecordKey,
   unresolvedPayloadConflictKeys,
   type SyncReport,
@@ -58,6 +60,7 @@ export interface FinanceAppController {
   syncReport: SyncReport | null;
   unresolvedSyncRecordKeys: ReadonlySet<string>;
   mutationLockedRecordKeys: ReadonlySet<string>;
+  transferDependencyConflictIds: ReadonlySet<string>;
   conflictResolutionImpact: ReadonlyMap<string, number>;
   storageError?: string;
   storageRecovery?: LocalStateRecovery;
@@ -75,6 +78,7 @@ export interface FinanceAppController {
   archiveAccount(record: AssetAccount): boolean;
   releaseGoalAllocations(goal: SavingsGoal): boolean;
   softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
+  confirmTransferAccounts(record: Transfer): boolean;
   acceptRemoteConflict(entity: FinanceEntityName, recordId: string): Promise<boolean>;
   syncNow(): Promise<void>;
   signIn(): Promise<void>;
@@ -599,6 +603,25 @@ export function useFinanceApp(): FinanceAppController {
     }
   }, [assertRenderedOwnerContext, commitState]);
 
+  const confirmTransferAccounts = useCallback((record: Transfer): boolean => {
+    try {
+      assertRenderedOwnerContext();
+      assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      if (stateRef.current.legacyBootstrap?.status === 'pending' || stateRef.current.initialBootstrap) {
+        throw new Error('雲端帳本尚在安全讀取；完成前無法重新確認轉帳帳戶。');
+      }
+      if (storageRecoveryRef.current) {
+        throw new Error('本機快照仍在復原保護中；無法重新確認轉帳帳戶。');
+      }
+      commitState((current) => confirmTransferDependencyConflict(current, record));
+      setSafetyNotice(undefined);
+      return true;
+    } catch (error) {
+      setSafetyNotice(`轉帳帳戶未重新確認：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }, [assertRenderedOwnerContext, commitState]);
+
   const categoryLifecycle = useCallback((record: Category, action: CategoryAction) => {
     try {
       assertRenderedOwnerContext();
@@ -1042,6 +1065,11 @@ export function useFinanceApp(): FinanceAppController {
     }
     return keys;
   }, [exposedState.outbox, unresolvedSyncRecordKeys]);
+  const transferDependencyConflictIds = useMemo(() => new Set(
+    exposedState.outbox
+      .filter(hasTransferDependencyConflict)
+      .map((operation) => operation.recordId),
+  ), [exposedState.outbox]);
 
   return {
     state: exposedState,
@@ -1052,6 +1080,7 @@ export function useFinanceApp(): FinanceAppController {
     syncReport,
     unresolvedSyncRecordKeys,
     mutationLockedRecordKeys,
+    transferDependencyConflictIds,
     conflictResolutionImpact,
     storageError,
     storageRecovery,
@@ -1069,6 +1098,7 @@ export function useFinanceApp(): FinanceAppController {
     archiveAccount,
     releaseGoalAllocations: releaseGoalAllocationRecords,
     softDelete,
+    confirmTransferAccounts,
     acceptRemoteConflict,
     syncNow,
     signIn,

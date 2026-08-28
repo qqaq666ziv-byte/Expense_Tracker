@@ -44,6 +44,8 @@ interface HomeViewProps {
   unresolvedSyncRecordKeys?: ReadonlySet<string>;
   acceptRemoteConflict?(recordId: string): void;
   acceptRemoteTransferConflict?(recordId: string): void;
+  transferDependencyConflictIds?: ReadonlySet<string>;
+  confirmTransferAccounts?(record: Transfer): boolean;
 }
 
 const ledgerPageSize = 30;
@@ -59,6 +61,8 @@ export function HomeView({
   unresolvedSyncRecordKeys = new Set(),
   acceptRemoteConflict,
   acceptRemoteTransferConflict,
+  transferDependencyConflictIds = new Set(),
+  confirmTransferAccounts,
 }: HomeViewProps) {
   const amountRef = useRef<HTMLInputElement>(null);
   const [type, setType] = useState<"expense" | "income">("expense");
@@ -218,6 +222,8 @@ export function HomeView({
     setType(next);
     setEditingTransfer(null);
     setOpenedTransferAccounts({});
+    setSourceAccountId("");
+    setDestinationAccountId("");
     setCategoryId("");
     setError("");
     setSuccess("");
@@ -264,8 +270,11 @@ export function HomeView({
       const currentTransfer = editingTransfer
         ? data.transfers.find((record) => record.id === editingTransfer.id)
         : undefined;
+      const resolvingTransferDependency = Boolean(
+        editingTransfer && transferDependencyConflictIds.has(editingTransfer.id),
+      );
       if (editingTransfer && isEditorSnapshotStale(editingTransfer, currentTransfer, {
-        hasUnresolvedConflict: unresolvedSyncRecordKeys.has(
+        hasUnresolvedConflict: !resolvingTransferDependency && unresolvedSyncRecordKeys.has(
           syncRecordKey("transfers", editingTransfer.id),
         ),
       })) {
@@ -303,11 +312,13 @@ export function HomeView({
           destinationAccountId: resolvedDestinationAccountId,
           occurredAt,
           note: note.trim() || undefined,
-        }, metadata, editingTransfer ?? undefined);
+        }, metadata, resolvingTransferDependency ? undefined : editingTransfer ?? undefined);
         completeAppliedMutation(
-          put("transfers", record),
+          resolvingTransferDependency
+            ? Boolean(confirmTransferAccounts?.(record))
+            : put("transfers", record),
           () => {
-            setSuccess(`${editingTransfer ? "已更新" : "已記下"}轉帳 ${displayMoney(numericAmount)}`);
+            setSuccess(`${resolvingTransferDependency ? "已重新確認" : editingTransfer ? "已更新" : "已記下"}轉帳 ${displayMoney(numericAmount)}`);
             resetForm();
           },
           setError,
@@ -402,6 +413,8 @@ export function HomeView({
     setEditing(transaction);
     setEditingTransfer(null);
     setOpenedTransferAccounts({});
+    setSourceAccountId("");
+    setDestinationAccountId("");
     setType(transaction.type);
     setAmount(String(transaction.amount));
     setCategoryId(transaction.categoryId);
@@ -703,7 +716,9 @@ export function HomeView({
               data-tutorial="create"
               disabled={mode === "transfer"
                 ? Boolean(
-                    (editingTransfer && unresolvedSyncRecordKeys.has(
+                    (editingTransfer
+                      && !transferDependencyConflictIds.has(editingTransfer.id)
+                      && unresolvedSyncRecordKeys.has(
                       syncRecordKey("transfers", editingTransfer.id),
                     ))
                     || !resolvedSourceAccountId
@@ -823,12 +838,14 @@ export function HomeView({
                 const hasUnresolvedConflict = unresolvedSyncRecordKeys.has(
                   syncRecordKey("transfers", transfer.id),
                 );
+                const hasDependencyConflict = transferDependencyConflictIds.has(transfer.id);
                 const hasParentConflict = unresolvedSyncRecordKeys.has(
                   syncRecordKey("accounts", transfer.sourceAccountId),
                 ) || unresolvedSyncRecordKeys.has(
                   syncRecordKey("accounts", transfer.destinationAccountId),
                 );
-                const mutationBlocked = hasUnresolvedConflict || hasParentConflict;
+                const mutationBlocked = (hasUnresolvedConflict && !hasDependencyConflict)
+                  || hasParentConflict;
                 const transferLabel = `${source?.name ?? transfer.sourceAccountName} 轉至 ${destination?.name ?? transfer.destinationAccountName}`;
                 return (
                   <article
@@ -843,7 +860,19 @@ export function HomeView({
                         {shortDate(transfer.occurredAt)}
                         {transfer.note ? ` · ${transfer.note}` : ""}
                       </small>
-                      {hasUnresolvedConflict && (
+                      {hasDependencyConflict && (
+                        <small role="status">
+                          帳戶已在首次雲端寫入前變更；請重新選擇並確認兩個帳戶。
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => beginEditTransfer(transfer)}
+                          >
+                            重新選擇並確認
+                          </button>
+                        </small>
+                      )}
+                      {hasUnresolvedConflict && !hasDependencyConflict && (
                         <small role="status">
                           同步衝突：編輯與刪除已暫停。
                           {acceptRemoteTransferConflict && (

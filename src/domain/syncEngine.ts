@@ -25,6 +25,14 @@ export function activeOperationId(operationId: string = crypto.randomUUID()): st
 
 const BUDGET_CONFLICT_ROLLBACK_MARKER = 'budget-conflict-rollback:';
 export const UNRESOLVED_PAYLOAD_CONFLICT_PREFIX = 'unresolved same-clock payload conflict';
+export const TRANSFER_DEPENDENCY_CONFLICT_PREFIX = 'transfer account changed before first cloud write';
+
+export function hasTransferDependencyConflict(
+  operation: PendingOperation,
+): boolean {
+  return operation.entity === 'transfers'
+    && operation.lastError?.startsWith(TRANSFER_DEPENDENCY_CONFLICT_PREFIX) === true;
+}
 
 function budgetConflictRollbackOperationId(): string {
   return activeOperationId(`${BUDGET_CONFLICT_ROLLBACK_MARKER}${crypto.randomUUID()}`);
@@ -226,6 +234,77 @@ export interface SyncResult {
 
 export function syncRecordKey(entity: FinanceEntityName, recordId: string): string {
   return `${entity}:${recordId}`;
+}
+
+/**
+ * Complete the explicit user-confirmation path for a transfer that was held
+ * back because one of its account dependencies changed before its first cloud
+ * write. The caller must rebuild the record from the current, explicitly
+ * selected accounts so both denormalized names and the conflict clock advance.
+ */
+export function confirmTransferDependencyConflict(
+  state: PersistedFinanceState,
+  replacement: FinanceData['transfers'][number],
+): PersistedFinanceState {
+  const key = syncRecordKey('transfers', replacement.id);
+  const pending = state.outbox.find((operation) => (
+    operation.entity === 'transfers' && operation.recordId === replacement.id
+  ));
+  const current = state.data.transfers.find((transfer) => transfer.id === replacement.id);
+  if (!pending || !hasTransferDependencyConflict(pending)
+    || !state.unresolvedSyncRecordKeys?.includes(key)) {
+    throw new Error('這筆轉帳目前沒有待重新確認的帳戶變更。');
+  }
+  if (!current || current.ownerId !== state.ownerId || replacement.ownerId !== state.ownerId) {
+    throw new Error('轉帳不屬於目前帳本，帳戶確認未套用。');
+  }
+  if (replacement.version <= current.version
+    || replacement.lastOperationId === current.lastOperationId) {
+    throw new Error('重新確認必須建立較新的轉帳版本。');
+  }
+  const source = state.data.accounts.find((account) => account.id === replacement.sourceAccountId);
+  const destination = state.data.accounts.find(
+    (account) => account.id === replacement.destinationAccountId,
+  );
+  if (!source || !destination || source.ownerId !== state.ownerId || destination.ownerId !== state.ownerId
+    || source.deletedAt || destination.deletedAt || !source.isActive || !destination.isActive) {
+    throw new Error('請重新選擇兩個目前可用的帳戶。');
+  }
+  if (source.id === destination.id
+    || replacement.sourceAccountName !== source.name
+    || replacement.destinationAccountName !== destination.name) {
+    throw new Error('帳戶選擇或名稱快照不是目前明確確認的版本。');
+  }
+
+  const data = replaceRecord(state.data, { entity: 'transfers', record: replacement });
+  validateFinanceData(data, 'confirmed transfer account dependency');
+  const outbox = state.outbox.map((operation) => (
+    operation === pending
+      ? {
+          ...operation,
+          id: replacement.lastOperationId,
+          record: replacement,
+          attempts: 0,
+          queuedAt: replacement.updatedAt,
+          lastError: undefined,
+        }
+      : operation
+  ));
+  const unresolvedSyncRecordKeys = state.unresolvedSyncRecordKeys.filter(
+    (candidate) => candidate !== key,
+  );
+  const remainingErrors = outbox.flatMap((operation) => (
+    operation.lastError ? [operation.lastError] : []
+  ));
+  return {
+    ...state,
+    data,
+    outbox,
+    unresolvedSyncRecordKeys: unresolvedSyncRecordKeys.length > 0
+      ? unresolvedSyncRecordKeys
+      : undefined,
+    lastSyncError: remainingErrors.length > 0 ? [...new Set(remainingErrors)].join('; ') : undefined,
+  };
 }
 
 export function hasUnresolvedPayloadConflict(
@@ -1267,6 +1346,46 @@ export async function syncFinanceState(
       const preflightByKey = new Map(preflight.records
         .filter((entry) => entry.record.ownerId === authenticatedOwnerId)
         .map((entry) => [recordKey(entry.entity, entry.record.id), entry]));
+      for (const [transferIndex, operation] of state.outbox.entries()) {
+        if (operation.entity !== 'transfers' || operation.record.deletedAt) continue;
+        const transferKey = recordKey('transfers', operation.recordId);
+        // Existing cloud transfers use the ordinary record conflict clock. This
+        // dependency gate is specifically for a local create whose account
+        // context changed before its first durable cloud write.
+        if (preflightByKey.has(transferKey)) continue;
+        const transfer = operation.record as FinanceData['transfers'][number];
+        const changedEndpoint = [transfer.sourceAccountId, transfer.destinationAccountId]
+          .find((accountId) => {
+            const accountKey = recordKey('accounts', accountId);
+            const localAccount = state.data.accounts.find((account) => account.id === accountId);
+            const remoteAccount = preflightByKey.get(accountKey);
+            if (localAccount && remoteAccount?.entity === 'accounts'
+              && differingSyncRecordFields('accounts', localAccount, remoteAccount.record).length === 0) {
+              return false;
+            }
+            const parentOperationIndex = state.outbox.findIndex((candidate) => (
+              candidate.entity === 'accounts' && candidate.recordId === accountId
+            ));
+            const parentOperation = parentOperationIndex >= 0
+              ? state.outbox[parentOperationIndex]
+              : undefined;
+            const parentWillEstablishExactLocalState = Boolean(
+              localAccount
+              && parentOperation
+              && parentOperationIndex < transferIndex
+              && !unresolvedKeys.has(accountKey)
+              && !preflightBlockedKeys.has(accountKey)
+              && differingSyncRecordFields('accounts', parentOperation.record, localAccount).length === 0
+              && (!remoteAccount || compareSyncRecords(parentOperation.record, remoteAccount.record) > 0),
+            );
+            return !parentWillEstablishExactLocalState;
+          });
+        if (!changedEndpoint) continue;
+        const reason = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: account/${changedEndpoint}; `
+          + '請重新開啟轉帳並明確確認來源與目的帳戶。';
+        preflightBlockedKeys.add(transferKey);
+        preflightBlockedReasons.set(transferKey, reason);
+      }
       for (const operation of state.outbox.filter((candidate) => candidate.batchId)) {
         const key = recordKey(operation.entity, operation.recordId);
         const remoteRecord = preflightByKey.get(key);
@@ -1896,6 +2015,9 @@ export async function syncFinanceState(
   // the user intended to keep. Persist the lock until the explicit
   // accept-remote resolution path clears it.
   for (const key of currentUnresolvedKeys) unresolvedSyncRecordKeys.add(key);
+  for (const operation of finalRemaining.filter(hasTransferDependencyConflict)) {
+    unresolvedSyncRecordKeys.add(recordKey(operation.entity, operation.recordId));
+  }
   const nextState: PersistedFinanceState = {
     ...state,
     data,
