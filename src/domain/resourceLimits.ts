@@ -16,6 +16,7 @@ export const FINANCE_WRITE_LIMITS = {
 
 export const FINANCE_OWNER_ROW_LIMITS: Readonly<Record<FinanceEntityName, number>> = {
   transactions: 25_000,
+  transfers: 25_000,
   accounts: 250,
   categories: 500,
   adjustments: 5_000,
@@ -90,6 +91,17 @@ export function assertFinanceRecordWithinWriteLimits<E extends FinanceEntityName
       assertTextLimit('transactions.note', transaction.note, FINANCE_WRITE_LIMITS.longText);
       assertTextLimit('transactions.recurringRuleId', transaction.recurringRuleId, FINANCE_WRITE_LIMITS.identifier);
       assertMoneyWriteLimit('transactions.amount', transaction.amount);
+      break;
+    }
+    case 'transfers': {
+      const transfer = record as FinanceData['transfers'][number];
+      assertTextLimit('transfers.sourceAccountId', transfer.sourceAccountId, FINANCE_WRITE_LIMITS.identifier);
+      assertTextLimit('transfers.sourceAccountName', transfer.sourceAccountName, FINANCE_WRITE_LIMITS.displayText);
+      assertTextLimit('transfers.destinationAccountId', transfer.destinationAccountId, FINANCE_WRITE_LIMITS.identifier);
+      assertTextLimit('transfers.destinationAccountName', transfer.destinationAccountName, FINANCE_WRITE_LIMITS.displayText);
+      assertTextLimit('transfers.occurredAt', transfer.occurredAt, FINANCE_WRITE_LIMITS.dateText);
+      assertTextLimit('transfers.note', transfer.note, FINANCE_WRITE_LIMITS.longText);
+      assertMoneyWriteLimit('transfers.amount', transfer.amount);
       break;
     }
     case 'adjustments': {

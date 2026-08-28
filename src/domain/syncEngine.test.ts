@@ -9,10 +9,14 @@ import type {
   SavingsAllocation,
   SavingsGoal,
   Transaction,
+  Transfer,
 } from './model';
 import type { RemoteAdapter, RemoteRecord } from './syncEngine';
+import { createFinanceBackup, restoreFinanceBackup } from './backup';
+import { applyRestoredData, planGuestImport, remapOwner } from '../app/state';
 import {
   acceptRemoteConflictRecord,
+  confirmTransferDependencyConflict,
   compareSyncRecords,
   enqueueSyncRecord,
   syncFinanceState,
@@ -26,6 +30,7 @@ function emptyData(): FinanceData {
     accounts: [],
     categories: [],
     transactions: [],
+    transfers: [],
     adjustments: [],
     goals: [],
     allocations: [],
@@ -91,13 +96,47 @@ function budgetOperation(record: Budget): PendingOperation {
   };
 }
 
+function transfer(
+  id: string,
+  ownerId: string,
+  version: number,
+  lastOperationId: string,
+  deletedAt?: string,
+): Transfer {
+  return {
+    id,
+    ownerId,
+    amount: 250,
+    sourceAccountId: 'bank',
+    sourceAccountName: '銀行',
+    destinationAccountId: 'cash',
+    destinationAccountName: '現金',
+    occurredAt: '2026-08-28 10:00',
+    version,
+    updatedAt: NOW,
+    lastOperationId,
+    deletedAt,
+  };
+}
+
+function transferOperation(record: Transfer): PendingOperation {
+  return {
+    id: record.lastOperationId,
+    entity: 'transfers',
+    recordId: record.id,
+    record,
+    attempts: 0,
+    queuedAt: NOW,
+  };
+}
+
 function state(
   ownerId: string,
   records: AssetAccount[],
   outbox: PendingOperation[],
 ): PersistedFinanceState {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     ownerId,
     data: { ...emptyData(), accounts: records },
     outbox,
@@ -109,9 +148,15 @@ class InMemoryRemote implements RemoteAdapter {
   private readonly acceptedOperationIds = new Set<string>();
   readonly failBeforeApplyOnce = new Set<string>();
   readonly failAfterApplyOnce = new Set<string>();
+  readonly applyCalls: string[] = [];
+  readonly historicalImportCalls: string[] = [];
   failAfterCompareAndSwapOnce = false;
+  failAfterHistoricalImportOnce = false;
 
-  constructor(records: RemoteRecord[] = []) {
+  constructor(
+    records: RemoteRecord[] = [],
+    private readonly strictTransferAccounts = false,
+  ) {
     for (const record of records) {
       this.records.set(this.key(record), record);
     }
@@ -124,6 +169,20 @@ class InMemoryRemote implements RemoteAdapter {
   async apply(ownerId: string, pending: PendingOperation): Promise<void> {
     if (pending.record.ownerId !== ownerId) {
       throw new Error('owner mismatch');
+    }
+    this.applyCalls.push(`${pending.entity}:${pending.recordId}`);
+
+    if (this.strictTransferAccounts && pending.entity === 'transfers' && !pending.record.deletedAt) {
+      const candidate = pending.record as Transfer;
+      const existing = this.records.get(`transfers:${candidate.id}`);
+      if (!existing) {
+        for (const accountId of [candidate.sourceAccountId, candidate.destinationAccountId]) {
+          const endpoint = this.records.get(`accounts:${accountId}`)?.record as AssetAccount | undefined;
+          if (!endpoint || !endpoint.isActive || endpoint.deletedAt) {
+            throw new Error('transfer endpoint must be active');
+          }
+        }
+      }
     }
 
     if (this.failBeforeApplyOnce.delete(pending.id)) {
@@ -148,6 +207,52 @@ class InMemoryRemote implements RemoteAdapter {
 
     if (this.failAfterApplyOnce.delete(pending.id)) {
       throw new Error('connection dropped after apply');
+    }
+  }
+
+  async applyHistoricalImportBatch(
+    ownerId: string,
+    batch: {
+      id: string;
+      operations: readonly PendingOperation[];
+      endpointAccounts: readonly AssetAccount[];
+    },
+  ): Promise<void> {
+    if (batch.operations.some((operation) => operation.record.ownerId !== ownerId)
+      || batch.endpointAccounts.some((accountRecord) => accountRecord.ownerId !== ownerId)) {
+      throw new Error('owner mismatch');
+    }
+    const snapshot = new Map(this.records);
+    try {
+      for (const operation of batch.operations.filter((candidate) => candidate.entity === 'accounts')) {
+        this.records.set(`accounts:${operation.recordId}`, {
+          entity: 'accounts',
+          record: structuredClone(operation.record),
+        } as RemoteRecord);
+      }
+      for (const operation of batch.operations.filter((candidate) => candidate.entity === 'transfers')) {
+        const candidate = operation.record as Transfer;
+        if (candidate.sourceAccountId === candidate.destinationAccountId) {
+          throw new Error('transfer endpoints must differ');
+        }
+        if (!batch.endpointAccounts.some((endpoint) => endpoint.id === candidate.sourceAccountId)
+          || !batch.endpointAccounts.some((endpoint) => endpoint.id === candidate.destinationAccountId)) {
+          throw new Error('historical import endpoint manifest is incomplete');
+        }
+        this.records.set(`transfers:${operation.recordId}`, {
+          entity: 'transfers',
+          record: structuredClone(operation.record),
+        } as RemoteRecord);
+      }
+      this.historicalImportCalls.push(batch.id);
+    } catch (error) {
+      this.records.clear();
+      for (const [key, value] of snapshot) this.records.set(key, value);
+      throw error;
+    }
+    if (this.failAfterHistoricalImportOnce) {
+      this.failAfterHistoricalImportOnce = false;
+      throw new Error('connection dropped after historical import commit');
     }
   }
 
@@ -180,6 +285,568 @@ class InMemoryRemote implements RemoteAdapter {
 }
 
 describe('offline sync engine', () => {
+  function historicalImportData(
+    ownerId: string,
+    endpointState: 'archived' | 'deleted' = 'archived',
+  ): FinanceData {
+    const source = {
+      ...account('history-source', ownerId, 2, 'history-source-final'),
+      name: '目前銀行名',
+      isActive: false,
+      ...(endpointState === 'deleted' ? { deletedAt: '2026-08-27T01:00:00.000Z' } : {}),
+    };
+    const destination = {
+      ...account('history-destination', ownerId, 1, 'history-destination-final'),
+      name: '現金',
+    };
+    return {
+      ...emptyData(),
+      accounts: [source, destination],
+      transfers: [{
+        ...transfer('history-transfer', ownerId, 1, 'history-transfer-create'),
+        sourceAccountId: source.id,
+        sourceAccountName: '舊銀行名',
+        destinationAccountId: destination.id,
+        destinationAccountName: destination.name,
+      }],
+    };
+  }
+
+  it('converges an explicit guest import with a soft-deleted historical endpoint and retries idempotently', async () => {
+    const mapped = remapOwner(historicalImportData('guest', 'deleted'), 'user-a');
+    const base: PersistedFinanceState = {
+      schemaVersion: 4,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+    };
+    const imported = planGuestImport(base, mapped).state;
+    const remote = new InMemoryRemote([], true);
+
+    const first = await syncFinanceState(imported, 'user-a', remote);
+    const repeated = await syncFinanceState(first.state, 'user-a', remote);
+    const cloud = await remote.pull('user-a');
+    const cloudSource = cloud.find((entry) => (
+      entry.entity === 'accounts' && entry.record.id === mapped.accounts[0].id
+    ));
+    const cloudTransfer = cloud.find((entry) => entry.entity === 'transfers');
+
+    expect(first.state.outbox).toEqual([]);
+    expect(repeated.state.outbox).toEqual([]);
+    expect(cloudSource).toEqual({ entity: 'accounts', record: mapped.accounts[0] });
+    expect(cloudTransfer).toEqual({ entity: 'transfers', record: mapped.transfers[0] });
+    expect((cloudTransfer?.record as Transfer).sourceAccountName).toBe('舊銀行名');
+    expect(cloud.filter((entry) => entry.entity === 'transfers')).toHaveLength(1);
+  });
+
+  it.each(['merge', 'replace'] as const)(
+    'converges an authenticated %s restore with an archived historical endpoint',
+    async (mode) => {
+      const base: PersistedFinanceState = {
+        schemaVersion: 4,
+        ownerId: 'user-a',
+        data: emptyData(),
+        outbox: [],
+      };
+      const backup = createFinanceBackup(historicalImportData('user-a'));
+      const restoredData = restoreFinanceBackup(base.data, backup, {
+        mode,
+        ownerId: 'user-a',
+        confirmReplace: mode === 'replace',
+      });
+      const restored = applyRestoredData(
+        base,
+        restoredData,
+        new Date('2026-08-28T05:00:00.000Z'),
+        (() => {
+          let sequence = 0;
+          return () => `restore-${mode}-${sequence += 1}`;
+        })(),
+      );
+      const remote = new InMemoryRemote([], true);
+
+      const first = await syncFinanceState(restored, 'user-a', remote);
+      const repeated = await syncFinanceState(first.state, 'user-a', remote);
+      const cloud = await remote.pull('user-a');
+      const cloudSource = cloud.find((entry) => (
+        entry.entity === 'accounts' && entry.record.id === 'history-source'
+      ));
+      const cloudTransfer = cloud.find((entry) => entry.entity === 'transfers');
+
+      expect(first.state.outbox).toEqual([]);
+      expect(repeated.state.outbox).toEqual([]);
+      expect(cloudSource?.record).toMatchObject({ isActive: false });
+      expect(cloudSource?.record).not.toHaveProperty('deletedAt');
+      expect(cloudTransfer?.record).toMatchObject({
+        sourceAccountId: 'history-source',
+        sourceAccountName: '舊銀行名',
+      });
+      expect(cloud.filter((entry) => entry.entity === 'transfers')).toHaveLength(1);
+    },
+  );
+
+  it('retries the whole historical import manifest after the commit response is lost', async () => {
+    const data = historicalImportData('user-a');
+    const base: PersistedFinanceState = {
+      schemaVersion: 4,
+      ownerId: 'user-a',
+      data: emptyData(),
+      outbox: [],
+    };
+    const restored = applyRestoredData(
+      base,
+      data,
+      new Date('2026-08-28T05:30:00.000Z'),
+      () => 'lost-response-operation',
+    );
+    const remote = new InMemoryRemote([], true);
+    remote.failAfterHistoricalImportOnce = true;
+
+    const uncertain = await syncFinanceState(restored, 'user-a', remote);
+    expect(uncertain.state.outbox).toHaveLength(3);
+    expect(uncertain.state.outbox.every((operation) => operation.attempts === 1)).toBe(true);
+    expect((await remote.pull('user-a')).filter((entry) => entry.entity === 'transfers')).toHaveLength(1);
+
+    const recovered = await syncFinanceState(uncertain.state, 'user-a', remote);
+    expect(recovered.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).filter((entry) => entry.entity === 'transfers')).toHaveLength(1);
+  });
+
+  it('atomically imports a historical transfer while retaining its archived endpoint', async () => {
+    const archivedBank = {
+      ...account('bank', 'user-a', 1, 'bank-import'),
+      name: '主要銀行',
+      isActive: false,
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-import'), name: '現金' };
+    const historical = {
+      ...transfer('historical-import', 'user-a', 1, 'transfer-import'),
+      sourceAccountName: '舊銀行名',
+    };
+    const batchId = 'historical-import:guest:1';
+    const withBatch = (pending: PendingOperation) => ({
+      ...pending,
+      historicalImportBatchId: batchId,
+    }) as PendingOperation & { historicalImportBatchId: string };
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [archivedBank, cash], []),
+      data: { ...emptyData(), accounts: [archivedBank, cash], transfers: [historical] },
+      outbox: [
+        withBatch(operation(archivedBank)),
+        withBatch(operation(cash)),
+        withBatch(transferOperation(historical)),
+      ],
+    };
+    const remote = new InMemoryRemote([], true);
+
+    const first = await syncFinanceState(initial, 'user-a', remote);
+    const second = await syncFinanceState(first.state, 'user-a', remote);
+    const cloud = await remote.pull('user-a');
+
+    expect(first.state.outbox).toEqual([]);
+    expect(second.state.outbox).toEqual([]);
+    expect(remote.historicalImportCalls).toEqual([batchId]);
+    expect(cloud.find((entry) => entry.entity === 'accounts' && entry.record.id === 'bank'))
+      .toEqual({ entity: 'accounts', record: archivedBank });
+    expect(cloud.find((entry) => entry.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: historical });
+  });
+
+  it('creates a transfer before a later local account rename without retroactive reconfirmation', async () => {
+    const bankV1 = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const bankV2 = {
+      ...bankV1,
+      name: '主要銀行',
+      version: 2,
+      updatedAt: '2026-08-28T04:01:00.000Z',
+      lastOperationId: 'bank-local-rename',
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const created = transfer('chronology-rename', 'user-a', 1, 'transfer-before-rename');
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bankV1 },
+      { entity: 'accounts', record: cash },
+    ]);
+    const withTransfer = enqueueSyncRecord({
+      ...state('user-a', [bankV1, cash], []),
+      data: { ...emptyData(), accounts: [bankV1, cash] },
+    }, 'transfers', created);
+    const initial = enqueueSyncRecord(
+      withTransfer,
+      'accounts',
+      bankV2,
+      bankV2.updatedAt,
+      'rename-after-transfer',
+    );
+
+    const result = await syncFinanceState(initial, 'user-a', remote);
+
+    expect(result.state.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(result.state.outbox).toEqual([]);
+    expect(remote.applyCalls).toEqual(['transfers:chronology-rename', 'accounts:bank']);
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: created });
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'accounts' && item.record.id === 'bank'))
+      .toEqual({ entity: 'accounts', record: bankV2 });
+  });
+
+  it('creates a transfer before a later local account archive while the cloud endpoint is still active', async () => {
+    const bankV1 = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const archivedBank = {
+      ...bankV1,
+      isActive: false,
+      version: 2,
+      updatedAt: '2026-08-28T04:02:00.000Z',
+      lastOperationId: 'bank-local-archive',
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const created = transfer('chronology-archive', 'user-a', 1, 'transfer-before-archive');
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bankV1 },
+      { entity: 'accounts', record: cash },
+    ]);
+    const withTransfer = enqueueSyncRecord({
+      ...state('user-a', [bankV1, cash], []),
+      data: { ...emptyData(), accounts: [bankV1, cash] },
+    }, 'transfers', created);
+    const initial = enqueueSyncRecord(
+      withTransfer,
+      'accounts',
+      archivedBank,
+      archivedBank.updatedAt,
+      'archive-after-transfer',
+    );
+
+    const result = await syncFinanceState(initial, 'user-a', remote);
+
+    expect(result.state.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(result.state.outbox).toEqual([]);
+    expect(remote.applyCalls).toEqual(['transfers:chronology-archive', 'accounts:bank']);
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: created });
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'accounts' && item.record.id === 'bank'))
+      .toEqual({ entity: 'accounts', record: archivedBank });
+  });
+
+  it('applies a local account mutation queued before a transfer before creating that transfer', async () => {
+    const bankV1 = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const bankV2 = {
+      ...bankV1,
+      name: '主要銀行',
+      version: 2,
+      updatedAt: '2026-08-28T04:03:00.000Z',
+      lastOperationId: 'bank-rename-before-transfer',
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const created = {
+      ...transfer('chronology-parent-first', 'user-a', 1, 'transfer-after-rename'),
+      sourceAccountName: bankV2.name,
+    };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bankV1 },
+      { entity: 'accounts', record: cash },
+    ]);
+    const withRenamedAccount = enqueueSyncRecord(
+      {
+        ...state('user-a', [bankV1, cash], []),
+        data: { ...emptyData(), accounts: [bankV1, cash] },
+      },
+      'accounts',
+      bankV2,
+      bankV2.updatedAt,
+      'rename-before-transfer',
+    );
+    const initial = enqueueSyncRecord(withRenamedAccount, 'transfers', created);
+
+    const result = await syncFinanceState(initial, 'user-a', remote);
+
+    expect(result.state.outbox).toEqual([]);
+    expect(remote.applyCalls).toEqual(['accounts:bank', 'transfers:chronology-parent-first']);
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: created });
+  });
+
+  it('holds a first transfer write when an endpoint changed remotely until the user explicitly reconfirms it', async () => {
+    const localBank = { ...account('bank', 'user-a', 1, 'bank-create'), name: '銀行' };
+    const remoteBank = {
+      ...localBank,
+      name: '主要銀行',
+      includeInTotalAssets: false,
+      version: 2,
+      updatedAt: '2026-08-28T02:00:00.000Z',
+      lastOperationId: 'bank-remote-edit',
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const pendingTransfer = transfer('pending-transfer', 'user-a', 1, 'transfer-create');
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: remoteBank },
+      { entity: 'accounts', record: cash },
+    ]);
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [localBank, cash], []),
+      data: { ...emptyData(), accounts: [localBank, cash], transfers: [pendingTransfer] },
+      outbox: [transferOperation(pendingTransfer)],
+    };
+
+    const blocked = await syncFinanceState(initial, 'user-a', remote);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers')).toEqual([]);
+    expect(blocked.state.data.accounts.find((item) => item.id === 'bank')).toEqual(remoteBank);
+    expect(blocked.state.outbox[0].lastError).toMatch(/^transfer selected account changed before cloud write/);
+    expect(blocked.state.unresolvedSyncRecordKeys).toContain('transfers:pending-transfer');
+
+    const remoteCash = {
+      ...cash,
+      name: '日常零用金',
+      version: 2,
+      updatedAt: '2026-08-28T02:00:30.000Z',
+      lastOperationId: 'cash-remote-rename',
+    };
+    await remote.apply('user-a', operation(remoteCash));
+    const reloaded = JSON.parse(JSON.stringify(blocked.state)) as PersistedFinanceState;
+    const retried = await syncFinanceState(reloaded, 'user-a', remote);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers')).toEqual([]);
+    expect(retried.state.outbox[0].lastError).toMatch(/^transfer selected account changed before cloud write/);
+    expect(retried.state.unresolvedSyncRecordKeys).toContain('transfers:pending-transfer');
+
+    const refreshed = {
+      ...pendingTransfer,
+      sourceAccountName: remoteBank.name,
+      destinationAccountName: remoteCash.name,
+      version: 2,
+      updatedAt: '2026-08-28T02:01:00.000Z',
+      lastOperationId: 'transfer-reconfirmed',
+    };
+    expect(() => confirmTransferDependencyConflict({
+      ...retried.state,
+      unresolvedSyncRecordKeys: [
+        ...(retried.state.unresolvedSyncRecordKeys ?? []),
+        'accounts:bank',
+      ],
+    }, refreshed)).toThrow(/帳戶仍有未解同步衝突/);
+    expect(() => confirmTransferDependencyConflict(retried.state, {
+      ...refreshed,
+      note: '字'.repeat(4_097),
+    })).toThrow(/transfers.note exceeds 4096 UTF-8 bytes/);
+    const confirmed = confirmTransferDependencyConflict(retried.state, refreshed);
+    expect(confirmed.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(confirmed.outbox).toEqual([expect.objectContaining({
+      id: 'transfer-reconfirmed',
+      record: refreshed,
+      attempts: 0,
+      lastError: undefined,
+    })]);
+
+    const converged = await syncFinanceState(confirmed, 'user-a', remote);
+    expect(converged.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers'))
+      .toEqual([{ entity: 'transfers', record: refreshed }]);
+  });
+
+  it('holds an offline retarget when the newly selected endpoint changed remotely', async () => {
+    const bank = { ...account('bank', 'user-a', 2, 'bank-renamed'), name: '主要銀行' };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const localBroker = { ...account('broker', 'user-a', 1, 'broker-create'), name: '券商舊名' };
+    const remoteBroker = {
+      ...localBroker,
+      name: '投資帳戶',
+      version: 2,
+      updatedAt: '2026-08-28T03:00:00.000Z',
+      lastOperationId: 'broker-remote-rename',
+    };
+    const cloudTransfer = {
+      ...transfer('retarget-transfer', 'user-a', 1, 'transfer-cloud-create'),
+      sourceAccountName: '銀行舊名',
+    };
+    const localRetarget = {
+      ...cloudTransfer,
+      destinationAccountId: localBroker.id,
+      destinationAccountName: localBroker.name,
+      version: 2,
+      updatedAt: '2026-08-28T02:59:00.000Z',
+      lastOperationId: 'transfer-local-retarget',
+    };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bank },
+      { entity: 'accounts', record: cash },
+      { entity: 'accounts', record: remoteBroker },
+      { entity: 'transfers', record: cloudTransfer },
+    ]);
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [bank, cash, localBroker], []),
+      data: { ...emptyData(), accounts: [bank, cash, localBroker], transfers: [localRetarget] },
+      outbox: [transferOperation(localRetarget)],
+    };
+
+    const blocked = await syncFinanceState(initial, 'user-a', remote);
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: cloudTransfer });
+    expect(blocked.state.outbox[0].lastError).toMatch(/^transfer selected account changed before cloud write/);
+    expect(blocked.state.unresolvedSyncRecordKeys).toContain('transfers:retarget-transfer');
+
+    const replacement = {
+      ...localRetarget,
+      // Home rebuilds both names from current selections. The domain resolver
+      // must restore the unchanged cloud endpoint's immutable historical name.
+      sourceAccountName: bank.name,
+      destinationAccountName: remoteBroker.name,
+      version: 3,
+      updatedAt: '2026-08-28T03:01:00.000Z',
+      lastOperationId: 'transfer-retarget-reconfirmed',
+    };
+    expect(() => confirmTransferDependencyConflict({
+      ...blocked.state,
+      unresolvedSyncRecordKeys: [
+        ...(blocked.state.unresolvedSyncRecordKeys ?? []),
+        'accounts:broker',
+      ],
+    }, {
+      ...replacement,
+      destinationAccountId: cash.id,
+      destinationAccountName: cash.name,
+    })).toThrow(/帳戶仍有未解同步衝突/);
+    const confirmed = confirmTransferDependencyConflict(blocked.state, replacement);
+    expect(confirmed.data.transfers[0].sourceAccountName).toBe('銀行舊名');
+    expect(confirmed.data.transfers[0].destinationAccountName).toBe(remoteBroker.name);
+    const converged = await syncFinanceState(confirmed, 'user-a', remote);
+    expect(converged.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).find((item) => item.entity === 'transfers'))
+      .toEqual({ entity: 'transfers', record: confirmed.data.transfers[0] });
+  });
+
+  it('reconfirms a changed destination while preserving an archived historical source', async () => {
+    const archivedBank = {
+      ...account('bank', 'user-a', 2, 'bank-archived'),
+      name: '主要銀行',
+      isActive: false,
+    };
+    const cash = { ...account('cash', 'user-a', 1, 'cash-create'), name: '現金' };
+    const localBroker = { ...account('broker', 'user-a', 1, 'broker-create'), name: '券商舊名' };
+    const remoteBroker = {
+      ...localBroker,
+      name: '投資帳戶',
+      version: 2,
+      updatedAt: '2026-08-28T03:00:00.000Z',
+      lastOperationId: 'broker-remote-rename',
+    };
+    const cloudTransfer = {
+      ...transfer('archived-source-retarget', 'user-a', 1, 'transfer-cloud-create'),
+      sourceAccountName: '銀行原名',
+    };
+    const localRetarget = {
+      ...cloudTransfer,
+      destinationAccountId: localBroker.id,
+      destinationAccountName: localBroker.name,
+      version: 2,
+      updatedAt: '2026-08-28T02:59:00.000Z',
+      lastOperationId: 'transfer-local-retarget',
+    };
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: archivedBank },
+      { entity: 'accounts', record: cash },
+      { entity: 'accounts', record: remoteBroker },
+      { entity: 'transfers', record: cloudTransfer },
+    ]);
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [archivedBank, cash, localBroker], []),
+      data: {
+        ...emptyData(),
+        accounts: [archivedBank, cash, localBroker],
+        transfers: [localRetarget],
+      },
+      outbox: [transferOperation(localRetarget)],
+    };
+
+    const blocked = await syncFinanceState(initial, 'user-a', remote);
+    expect(blocked.state.outbox[0].lastError)
+      .toMatch(/^transfer selected account changed before cloud write/);
+
+    const confirmed = confirmTransferDependencyConflict(blocked.state, {
+      ...localRetarget,
+      sourceAccountName: cloudTransfer.sourceAccountName,
+      destinationAccountName: remoteBroker.name,
+      version: 3,
+      updatedAt: '2026-08-28T03:01:00.000Z',
+      lastOperationId: 'transfer-retarget-reconfirmed',
+    });
+    expect(confirmed.data.transfers[0]).toEqual(expect.objectContaining({
+      sourceAccountId: archivedBank.id,
+      sourceAccountName: cloudTransfer.sourceAccountName,
+      destinationAccountId: remoteBroker.id,
+      destinationAccountName: remoteBroker.name,
+    }));
+
+    const converged = await syncFinanceState(confirmed, 'user-a', remote);
+    expect(converged.state.outbox).toEqual([]);
+  });
+
+  it('retries one atomic transfer row and converges create, edit, and tombstone without duplicates', async () => {
+    const bank = account('bank', 'user-a', 1, 'bank-create');
+    const cash = account('cash', 'user-a', 1, 'cash-create');
+    const remote = new InMemoryRemote([
+      { entity: 'accounts', record: bank },
+      { entity: 'accounts', record: cash },
+    ]);
+    const created = transfer('move-250', 'user-a', 1, 'transfer-create');
+    remote.failAfterApplyOnce.add(created.lastOperationId);
+    const createdState: PersistedFinanceState = {
+      ...state('user-a', [bank, cash], []),
+      data: { ...emptyData(), accounts: [bank, cash], transfers: [created] },
+      outbox: [transferOperation(created)],
+    };
+
+    const uncertain = await syncFinanceState(createdState, 'user-a', remote);
+    expect(uncertain.state.outbox).toHaveLength(1);
+    const createdRetry = await syncFinanceState(uncertain.state, 'user-a', remote);
+    expect(createdRetry.state.outbox).toEqual([]);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers'))
+      .toEqual([{ entity: 'transfers', record: created }]);
+
+    const edited = { ...created, amount: 300, version: 2, lastOperationId: 'transfer-edit' };
+    const editedState = enqueueSyncRecord(createdRetry.state, 'transfers', edited);
+    const editedResult = await syncFinanceState(editedState, 'user-a', remote);
+    expect(editedResult.state.data.transfers).toEqual([edited]);
+
+    const tombstone = {
+      ...edited,
+      version: 3,
+      lastOperationId: 'tombstone:transfer-delete',
+      deletedAt: NOW,
+    };
+    const deletedResult = await syncFinanceState(
+      enqueueSyncRecord(editedResult.state, 'transfers', tombstone),
+      'user-a',
+      remote,
+    );
+    expect(deletedResult.state.outbox).toEqual([]);
+    expect(deletedResult.state.data.transfers).toEqual([tombstone]);
+    expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers'))
+      .toEqual([{ entity: 'transfers', record: tombstone }]);
+  });
+
+  it('keeps a divergent same-clock transfer locked until the cloud record is explicitly accepted', async () => {
+    const local = { ...transfer('conflicted-transfer', 'user-a', 2, 'same-clock'), note: '本機' };
+    const cloud = { ...local, note: '雲端' };
+    const bank = account('bank', 'user-a', 1, 'bank-create');
+    const cash = account('cash', 'user-a', 1, 'cash-create');
+    const remote = new InMemoryRemote([{ entity: 'transfers', record: cloud }]);
+    const initial: PersistedFinanceState = {
+      ...state('user-a', [bank, cash], []),
+      data: { ...emptyData(), accounts: [bank, cash], transfers: [local] },
+      outbox: [transferOperation(local)],
+    };
+
+    const conflicted = await syncFinanceState(initial, 'user-a', remote);
+    expect(conflicted.state.unresolvedSyncRecordKeys).toContain('transfers:conflicted-transfer');
+    expect(conflicted.state.outbox).toHaveLength(1);
+
+    const accepted = acceptRemoteConflictRecord(conflicted.state, {
+      entity: 'transfers',
+      record: cloud,
+    });
+    expect(accepted.outbox).toEqual([]);
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(accepted.data.transfers).toEqual([cloud]);
+  });
   it('preserves the original batch manifest across a later offline edit', () => {
     const before = account('offline-batch-edit', 'user-a', 1, 'create');
     const first = { ...before, version: 2, lastOperationId: 'first-batch-edit', name: '第一次' };
@@ -259,7 +926,7 @@ describe('offline sync engine', () => {
       transactions: [staleCachedTransaction],
     };
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -293,7 +960,7 @@ describe('offline sync engine', () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const candidate: FinanceData = { ...emptyData(), accounts: [legacyAccount] };
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -332,7 +999,7 @@ describe('offline sync engine', () => {
   it('does not allow a local operation to enter a pending authenticated legacy bootstrap', () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -353,7 +1020,7 @@ describe('offline sync engine', () => {
   it('keeps the candidate and pending gate when the authenticated legacy pull fails', async () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -385,7 +1052,7 @@ describe('offline sync engine', () => {
   it('keeps the bootstrap gated when a nominally successful pull has an invalid graph', async () => {
     const legacyAccount = account('legacy-cash', 'user-a', 1, 'op-legacy-cash');
     const bootstrap: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: emptyData(),
       outbox: [],
@@ -745,7 +1412,7 @@ describe('offline sync engine', () => {
       deletedAt: '2026-08-21T10:01:00.000Z',
     };
     const releaseState = (record: SavingsAllocation): PersistedFinanceState => ({
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), goals: [goal], allocations: [record] },
       outbox: [allocationOperation(record)],
@@ -816,7 +1483,7 @@ describe('offline sync engine', () => {
     const localAccount = { ...remoteAccount, version: 2, lastOperationId: 'local-stale', name: '本機' };
     const unrelated = account('unrelated-pending', 'user-a', 1, 'unrelated-create');
     const conflicted: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [localAccount, unrelated] },
       outbox: [{
@@ -963,7 +1630,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -1029,7 +1696,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -1078,7 +1745,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -1148,7 +1815,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -1186,7 +1853,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteReactivation }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [staleRollback] },
       outbox: [budgetOperation(staleRollback)],
@@ -1238,7 +1905,7 @@ describe('offline sync engine', () => {
       { entity: 'budgets', record: oldSemanticBudget },
     ]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),
@@ -1285,7 +1952,7 @@ describe('offline sync engine', () => {
       isActive: false,
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),
@@ -1353,7 +2020,7 @@ describe('offline sync engine', () => {
       lastOperationId: 'rule-account-mirror',
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(), accounts: [localAccount], categories: [category], recurringRules: [batchedRule],
@@ -1572,7 +2239,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), goals: [goal], allocations: [releasedA, releasedB] },
       outbox: [{
@@ -1631,7 +2298,7 @@ describe('offline sync engine', () => {
     ]);
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1699,7 +2366,7 @@ describe('offline sync engine', () => {
       },
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1728,7 +2395,7 @@ describe('offline sync engine', () => {
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     remote.failAfterCompareAndSwapOnce = true;
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1759,7 +2426,7 @@ describe('offline sync engine', () => {
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     remote.failAfterCompareAndSwapOnce = true;
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [createdA, desiredB] },
       outbox: [{
@@ -1801,7 +2468,7 @@ describe('offline sync engine', () => {
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     remote.failAfterCompareAndSwapOnce = true;
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1843,7 +2510,7 @@ describe('offline sync engine', () => {
     ]);
     remote.failBeforeApplyOnce.add(desiredB.lastOperationId);
     const foreignState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [foreignA, desiredB] },
       outbox: [{
@@ -1858,7 +2525,7 @@ describe('offline sync engine', () => {
     ));
 
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [desiredA, desiredB] },
       outbox: [{
@@ -1898,7 +2565,7 @@ describe('offline sync engine', () => {
     const apply = vi.fn(async () => undefined);
     const remote: RemoteAdapter = { apply, pull: async () => [] };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),
@@ -1944,7 +2611,7 @@ describe('offline sync engine', () => {
       { entity: 'accounts', record: beforeB },
     ]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), accounts: [localA, localB] },
       outbox: [{
@@ -1989,7 +2656,7 @@ describe('offline sync engine', () => {
       isActive: true,
     };
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),
@@ -2044,7 +2711,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -2065,7 +2732,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: inactive }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [inactive] },
       outbox: [budgetOperation(inactive)],
@@ -2087,7 +2754,7 @@ describe('offline sync engine', () => {
     const remoteBudget: Budget = { ...localBudget, amount: 5_000 };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -2122,7 +2789,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteBudget }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localBudget] },
       outbox: [budgetOperation(localBudget)],
@@ -2149,7 +2816,7 @@ describe('offline sync engine', () => {
     };
     const remote = new InMemoryRemote([{ entity: 'budgets', record: remoteReactivation }]);
     const localState: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: { ...emptyData(), budgets: [localArchive] },
       outbox: [budgetOperation(localArchive)],
@@ -2375,7 +3042,7 @@ describe('offline sync engine', () => {
       occurredAt: '2026-08-21 09:30',
     };
     const original: PersistedFinanceState = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       ownerId: 'user-a',
       data: {
         ...emptyData(),

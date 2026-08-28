@@ -6,6 +6,35 @@ import { TUTORIAL_RECORD_NOTE, startTutorial } from '../app/tutorial';
 import { HomeView } from './HomeView';
 
 describe('HomeView ledger access', () => {
+  it('renders a transfer as one neutral directional ledger record searchable by account context', () => {
+    const state = createInitialState('guest');
+    const source = state.data.accounts[0];
+    const destination = {
+      ...source, id: 'account-bank', name: '銀行', sortOrder: 1,
+      lastOperationId: 'account-bank-create',
+    };
+    state.data.accounts.push(destination);
+    state.data.transfers = [{
+      id: 'transfer-ledger', ownerId: 'guest', amount: 500,
+      sourceAccountId: source.id, sourceAccountName: source.name,
+      destinationAccountId: destination.id, destinationAccountName: destination.name,
+      occurredAt: '2026-08-28 09:30', note: '領現', version: 1,
+      updatedAt: '2026-08-28T01:30:00.000Z', lastOperationId: 'transfer-ledger-create',
+    }];
+
+    const html = renderToStaticMarkup(
+      <HomeView data={state.data} ownerId="guest" put={() => true} deleteTransaction={() => true} />,
+    );
+
+    expect(html.match(/data-testid="transfer-row"/g)).toHaveLength(1);
+    expect(html).toContain(`${source.name} 轉至 ${destination.name}`);
+    expect(html).toContain('aria-label="搜尋帳本"');
+    expect(html).toContain(`aria-label="編輯轉帳 ${source.name} 轉至 ${destination.name}"`);
+    expect(html).toContain(`aria-label="刪除轉帳 ${source.name} 轉至 ${destination.name}"`);
+    expect(html).not.toContain('+NT$500');
+    expect(html).not.toContain('−NT$500');
+  });
+
   it('fails closed instead of retargeting a transaction when its selected parents become unavailable', () => {
     const state = createInitialState('guest');
     const categories = state.data.categories.filter((item) => item.kind === 'expense');

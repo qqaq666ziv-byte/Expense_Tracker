@@ -97,6 +97,7 @@ function candidateRecordCount(data: FinanceData): number {
     data.accounts.length +
     data.categories.length +
     data.transactions.length +
+    data.transfers.length +
     data.adjustments.length +
     data.goals.length +
     data.allocations.length +
@@ -109,6 +110,7 @@ const syncEntityLabels: Record<FinanceEntityName, string> = {
   accounts: "帳戶",
   categories: "分類",
   transactions: "交易",
+  transfers: "轉帳",
   adjustments: "餘額調整",
   goals: "儲蓄目標",
   allocations: "目標配置",
@@ -410,13 +412,18 @@ export default function App() {
     const transactionCount = data.transactions.filter(
       (item) => isFinancialTransaction(item) && item.accountId === record.id,
     ).length;
+    const transferCount = data.transfers.filter(
+      (item) => !item.deletedAt && (
+        item.sourceAccountId === record.id || item.destinationAccountId === record.id
+      ),
+    ).length;
     const recurring = data.recurringRules.filter(
       (rule) =>
         !rule.deletedAt && rule.isActive && rule.accountId === record.id,
     );
     if (
       !window.confirm(
-        `封存「${record.name}」後，${record.includeInTotalAssets ? `總資產會少計 ${displayMoney(balance)}；` : ""}${transactionCount} 筆過去紀錄仍會保留${recurring.length ? `，並暫停 ${recurring.length} 個週期收支` : ""}。確定繼續？`,
+        `封存「${record.name}」後，${record.includeInTotalAssets ? `總資產會少計 ${displayMoney(balance)}；` : ""}${transactionCount} 筆收支與 ${transferCount} 筆轉帳仍會保留${recurring.length ? `，並暫停 ${recurring.length} 個週期收支` : ""}。確定繼續？`,
       )
     )
       return false;
@@ -670,13 +677,22 @@ export default function App() {
               <HomeView
                 data={data}
                 ownerId={app.state.ownerId}
-                put={(_entity, record) => app.put("transactions", record)}
+                put={app.put}
                 deleteTransaction={(record) =>
                   app.softDelete("transactions", record)
                 }
+                deleteTransfer={(record) =>
+                  app.softDelete("transfers", record)
+                }
                 unresolvedSyncRecordKeys={app.mutationLockedRecordKeys}
+                transferDependencyConflictIds={app.transferDependencyConflictIds}
+                transferMutationsEnabled={app.transferMutationsEnabled}
+                confirmTransferAccounts={app.confirmTransferAccounts}
                 acceptRemoteConflict={(recordId) => {
                   void app.acceptRemoteConflict("transactions", recordId);
+                }}
+                acceptRemoteTransferConflict={(recordId) => {
+                  void app.acceptRemoteConflict("transfers", recordId);
                 }}
                 tutorial={activeTutorial}
                 onTutorialEvent={handleTutorialEvent}
@@ -956,7 +972,7 @@ export default function App() {
                   <strong>資料在哪裡？</strong>
                   <small>
                     訪客資料只在這台裝置；登入才會同步。JSON
-                    備份可以完整還原，CSV 適合自行整理交易。
+                    備份可以完整還原；收支與轉帳各有獨立 CSV。
                   </small>
                 </span>
               </div>
@@ -975,6 +991,12 @@ export default function App() {
                 </p>
               </details>
               <details>
+                <summary>帳戶之間移動錢要怎麼記？</summary>
+                <p>
+                  在記帳頁選「記轉帳」，再指定來源與目的帳戶。轉帳不會算成收入或支出；銀行或 ATM 手續費請另外記成一筆支出，不會自動從轉帳金額扣除。
+                </p>
+              </details>
+              <details>
                 <summary>離線時可以記帳嗎？</summary>
                 <p>
                   可以。紀錄會先安全保存在這台裝置；已登入時，恢復連線後再同步。右上角帳戶選單會告訴你是否還有資料等待同步。
@@ -989,7 +1011,7 @@ export default function App() {
               <details>
                 <summary>怎麼備份或換裝置？</summary>
                 <p>
-                  使用下方「資料備份」下載完整 JSON；它可以安全合併或還原。交易
+                  使用下方「資料備份」下載完整 JSON；它可以安全合併或還原。交易與轉帳
                   CSV 適合試算表整理，但不能用來完整還原設定。
                 </p>
               </details>

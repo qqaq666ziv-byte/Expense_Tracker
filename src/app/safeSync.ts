@@ -23,6 +23,7 @@ export function restoreFinanceStateAndClearRecovery(
       accounts: [],
       categories: [],
       transactions: [],
+      transfers: [],
       adjustments: [],
       goals: [],
       allocations: [],

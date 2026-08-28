@@ -8,7 +8,8 @@ import {
   moneyLexemeDecimalPlaces,
 } from './money';
 
-export const FINANCE_BACKUP_SCHEMA_VERSION = 1 as const;
+export const FINANCE_BACKUP_SCHEMA_VERSION = 2 as const;
+const LEGACY_FINANCE_BACKUP_SCHEMA_VERSION = 1 as const;
 export const MAX_BACKUP_BYTES = 5_000_000;
 const MAX_COLLECTION_RECORDS = 50_000;
 const MAX_BACKUP_STRING_LENGTH = 20_000;
@@ -132,6 +133,30 @@ export function exportTransactionsCsv(data: FinanceData): string {
   return `${TRANSACTION_CSV_HEADERS.join(',')}\r\n${rows.join('\r\n')}${rows.length > 0 ? '\r\n' : ''}`;
 }
 
+const TRANSFER_CSV_HEADERS = [
+  'id', 'owner_id', 'amount', 'occurred_at', 'source_account_id',
+  'source_account_name', 'destination_account_id', 'destination_account_name',
+  'note', 'deleted_at',
+] as const;
+
+/** Separate export preserves the established transaction CSV contract. */
+export function exportTransfersCsv(data: FinanceData): string {
+  validateFinanceData(data, 'data');
+  const rows = data.transfers.map((transfer) => [
+    csvCell(transfer.id),
+    csvCell(transfer.ownerId),
+    csvCell(transfer.amount, false),
+    csvCell(transfer.occurredAt),
+    csvCell(transfer.sourceAccountId),
+    csvCell(transfer.sourceAccountName),
+    csvCell(transfer.destinationAccountId),
+    csvCell(transfer.destinationAccountName),
+    csvCell(transfer.note),
+    csvCell(transfer.deletedAt),
+  ].join(','));
+  return `${TRANSFER_CSV_HEADERS.join(',')}\r\n${rows.join('\r\n')}${rows.length > 0 ? '\r\n' : ''}`;
+}
+
 export function parseFinanceBackup(input: string | unknown): FinanceBackup {
   if (typeof input === 'string'
     && (input.length > MAX_BACKUP_BYTES || utf8ByteLength(input) > MAX_BACKUP_BYTES)) {
@@ -148,15 +173,28 @@ export function parseFinanceBackup(input: string | unknown): FinanceBackup {
   if (!isRecord(parsed)) {
     throw new BackupValidationError('Backup must be a JSON object.');
   }
-  if (parsed.schemaVersion !== FINANCE_BACKUP_SCHEMA_VERSION) {
+  if (parsed.schemaVersion !== FINANCE_BACKUP_SCHEMA_VERSION
+    && parsed.schemaVersion !== LEGACY_FINANCE_BACKUP_SCHEMA_VERSION) {
     throw new BackupValidationError(
-      `Unsupported schemaVersion; expected ${FINANCE_BACKUP_SCHEMA_VERSION}.`,
+      `Unsupported schemaVersion; expected ${LEGACY_FINANCE_BACKUP_SCHEMA_VERSION} or ${FINANCE_BACKUP_SCHEMA_VERSION}.`,
     );
   }
-  assertDateTime(parsed.exportedAt, 'exportedAt');
-  validateFinanceData(parsed.data, 'data');
+  if (parsed.schemaVersion === LEGACY_FINANCE_BACKUP_SCHEMA_VERSION
+    && isRecord(parsed.data)
+    && Object.hasOwn(parsed.data, 'transfers')) {
+    throw new BackupValidationError('Legacy schemaVersion 1 must not contain a transfers collection.');
+  }
+  const normalized = parsed.schemaVersion === LEGACY_FINANCE_BACKUP_SCHEMA_VERSION
+    ? {
+        ...parsed,
+        schemaVersion: FINANCE_BACKUP_SCHEMA_VERSION,
+        data: isRecord(parsed.data) ? { ...parsed.data, transfers: [] } : parsed.data,
+      }
+    : parsed;
+  assertDateTime(normalized.exportedAt, 'exportedAt');
+  validateFinanceData(normalized.data, 'data');
 
-  return clone(parsed) as unknown as FinanceBackup;
+  return clone(normalized) as unknown as FinanceBackup;
 }
 
 const MONEY_JSON_KEYS = new Set(['amount', 'amountDelta', 'openingBalance', 'targetAmount']);
@@ -360,13 +398,16 @@ export function validateFinanceData(value: unknown, path: string): asserts value
   const accounts = collectionRecords(value.accounts, `${path}.accounts`);
   const categories = collectionRecords(value.categories, `${path}.categories`);
   const transactions = collectionRecords(value.transactions, `${path}.transactions`);
+  const transfers = collectionRecords(value.transfers, `${path}.transfers`);
   const adjustments = collectionRecords(value.adjustments, `${path}.adjustments`);
   const goals = collectionRecords(value.goals, `${path}.goals`);
   const allocations = collectionRecords(value.allocations, `${path}.allocations`);
   const budgets = collectionRecords(value.budgets, `${path}.budgets`);
   const recurringRules = collectionRecords(value.recurringRules, `${path}.recurringRules`);
 
-  const collections = { accounts, categories, transactions, adjustments, goals, allocations, budgets, recurringRules };
+  const collections = {
+    accounts, categories, transactions, transfers, adjustments, goals, allocations, budgets, recurringRules,
+  };
   for (const [name, records] of Object.entries(collections)) {
     assertUniqueIds(records, `${path}.${name}`);
     records.forEach((record, index) => validateSyncRecord(record, `${path}.${name}[${index}]`));
@@ -419,6 +460,25 @@ export function validateFinanceData(value: unknown, path: string): asserts value
     assertOptionalDateOnly(transaction.occurrenceDate, `${itemPath}.occurrenceDate`);
     const category = categoryById.get(transaction.categoryId as string);
     if (category?.kind !== transaction.type) fail(`${itemPath}.categoryId`, 'has the wrong category kind');
+  });
+
+  transfers.forEach((transfer, index) => {
+    const itemPath = `${path}.transfers[${index}]`;
+    assertPositiveAmount(transfer.amount, `${itemPath}.amount`);
+    assertReference(transfer.sourceAccountId, accountIds, `${itemPath}.sourceAccountId`, 'account');
+    assertString(transfer.sourceAccountName, `${itemPath}.sourceAccountName`);
+    assertReference(
+      transfer.destinationAccountId,
+      accountIds,
+      `${itemPath}.destinationAccountId`,
+      'account',
+    );
+    assertString(transfer.destinationAccountName, `${itemPath}.destinationAccountName`);
+    if (transfer.sourceAccountId === transfer.destinationAccountId) {
+      fail(itemPath, 'must use different source and destination accounts');
+    }
+    assertDate(transfer.occurredAt, `${itemPath}.occurredAt`);
+    assertOptionalString(transfer.note, `${itemPath}.note`);
   });
 
   adjustments.forEach((adjustment, index) => {
@@ -507,6 +567,12 @@ export function validateFinanceData(value: unknown, path: string): asserts value
       fail(`${path}.transactions[${index}]`, 'must reference records owned by the same owner');
     }
   });
+  transfers.forEach((transfer, index) => {
+    if (byIdOwner(accountById.get(transfer.sourceAccountId as string)) !== transfer.ownerId
+      || byIdOwner(accountById.get(transfer.destinationAccountId as string)) !== transfer.ownerId) {
+      fail(`${path}.transfers[${index}]`, 'must reference accounts owned by the same owner');
+    }
+  });
   adjustments.forEach((adjustment, index) => {
     if (byIdOwner(accountById.get(adjustment.accountId as string)) !== adjustment.ownerId) {
       fail(`${path}.adjustments[${index}]`, 'must reference an account owned by the same owner');
@@ -552,6 +618,7 @@ export function restoreFinanceBackup(
     accounts: mergeById(current.accounts, incoming.accounts),
     categories: mergeById(current.categories, incoming.categories),
     transactions: mergeById(current.transactions, incoming.transactions),
+    transfers: mergeById(current.transfers, incoming.transfers),
     adjustments: mergeById(current.adjustments, incoming.adjustments),
     goals: mergeById(current.goals, incoming.goals),
     allocations: mergeById(current.allocations, incoming.allocations),
@@ -637,6 +704,7 @@ function ownerIds(data: FinanceData): Set<string> {
     ...data.accounts,
     ...data.categories,
     ...data.transactions,
+    ...data.transfers,
     ...data.adjustments,
     ...data.goals,
     ...data.allocations,

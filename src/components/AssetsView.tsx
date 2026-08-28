@@ -401,12 +401,19 @@ export function AssetsView({
               financials.accountBalances.find(
                 (item) => item.accountId === account.id,
               )?.balance ?? 0;
-            const related = data.transactions
-              .filter(
-                (item) =>
-                  isFinancialTransaction(item) && item.accountId === account.id,
-              )
-              .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+            const related = [
+              ...data.transactions
+                .filter(
+                  (item) =>
+                    isFinancialTransaction(item) && item.accountId === account.id,
+                )
+                .map((record) => ({ kind: "transaction" as const, record })),
+              ...data.transfers
+                .filter((item) => !item.deletedAt && (
+                  item.sourceAccountId === account.id || item.destinationAccountId === account.id
+                ))
+                .map((record) => ({ kind: "transfer" as const, record })),
+            ].sort((a, b) => b.record.occurredAt.localeCompare(a.record.occurredAt));
             const conflictBlocked = unresolvedSyncRecordKeys.has(
               syncRecordKey("accounts", account.id),
             );
@@ -515,20 +522,40 @@ export function AssetsView({
                     <div className="account-recent">
                       <h3>最近紀錄</h3>
                       {related.length === 0 ? (
-                        <p>這個帳戶還沒有收支紀錄。</p>
+                        <p>這個帳戶還沒有收支或轉帳紀錄。</p>
                       ) : (
-                        related.slice(0, 5).map((transaction) => (
-                          <div key={transaction.id}>
-                            <span>
-                              {transaction.categoryName}
-                              <small>{shortDate(transaction.occurredAt)}</small>
-                            </span>
-                            <b className={transaction.type}>
-                              {transaction.type === "income" ? "+" : "−"}
-                              {displayMoney(transaction.amount)}
-                            </b>
-                          </div>
-                        ))
+                        related.slice(0, 5).map((entry) => {
+                          if (entry.kind === "transfer") {
+                            const outgoing = entry.record.sourceAccountId === account.id;
+                            const counterpart = outgoing
+                              ? entry.record.destinationAccountName
+                              : entry.record.sourceAccountName;
+                            return (
+                              <div key={`transfer:${entry.record.id}`}>
+                                <span>
+                                  {outgoing ? `轉至 ${counterpart}` : `轉自 ${counterpart}`}
+                                  <small>{shortDate(entry.record.occurredAt)}</small>
+                                </span>
+                                <b className="transfer">
+                                  {outgoing ? "−" : "+"}{displayMoney(entry.record.amount)}
+                                </b>
+                              </div>
+                            );
+                          }
+                          const transaction = entry.record;
+                          return (
+                            <div key={`transaction:${transaction.id}`}>
+                              <span>
+                                {transaction.categoryName}
+                                <small>{shortDate(transaction.occurredAt)}</small>
+                              </span>
+                              <b className={transaction.type}>
+                                {transaction.type === "income" ? "+" : "−"}
+                                {displayMoney(transaction.amount)}
+                              </b>
+                            </div>
+                          );
+                        })
                       )}
                     </div>
                   </div>

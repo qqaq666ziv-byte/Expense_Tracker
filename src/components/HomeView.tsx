@@ -5,9 +5,10 @@ import {
   ChevronDown,
   Pencil,
   Search,
+  ArrowLeftRight,
   Trash2,
 } from "lucide-react";
-import type { FinanceData, Transaction } from "../domain/model";
+import type { AssetAccount, FinanceData, Transaction, Transfer } from "../domain/model";
 import { buildLedgerHistory, calculateInsights } from "../domain/financeEngine";
 import { sortByDisplayOrder } from "../domain/displayOrder";
 import { changedRecordMeta, newRecordMeta } from "../app/state";
@@ -28,16 +29,24 @@ import {
 import { FinanceIcon } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
 import { syncRecordKey } from "../domain/syncEngine";
+import { buildTransferRecord } from "../domain/transfer";
+import { isEditorSnapshotStale } from "../domain/staleEditor";
 
 interface HomeViewProps {
   data: FinanceData;
   ownerId: string;
   put(entity: "transactions", record: Transaction): boolean;
+  put(entity: "transfers", record: Transfer): boolean;
   deleteTransaction(record: Transaction): boolean;
+  deleteTransfer?(record: Transfer): boolean;
   tutorial?: TutorialProgress | null;
   onTutorialEvent?(event: TutorialEvent): void;
   unresolvedSyncRecordKeys?: ReadonlySet<string>;
   acceptRemoteConflict?(recordId: string): void;
+  acceptRemoteTransferConflict?(recordId: string): void;
+  transferDependencyConflictIds?: ReadonlySet<string>;
+  confirmTransferAccounts?(record: Transfer): boolean;
+  transferMutationsEnabled?: boolean;
 }
 
 const ledgerPageSize = 30;
@@ -47,13 +56,19 @@ export function HomeView({
   ownerId,
   put,
   deleteTransaction,
+  deleteTransfer = () => false,
   tutorial,
   onTutorialEvent,
   unresolvedSyncRecordKeys = new Set(),
   acceptRemoteConflict,
+  acceptRemoteTransferConflict,
+  transferDependencyConflictIds = new Set(),
+  confirmTransferAccounts,
+  transferMutationsEnabled = true,
 }: HomeViewProps) {
   const amountRef = useRef<HTMLInputElement>(null);
   const [type, setType] = useState<"expense" | "income">("expense");
+  const [mode, setMode] = useState<"expense" | "income" | "transfer">("expense");
   const [amount, setAmount] = useState("");
   const [categoryId, setCategoryId] = useState("");
   const [accountId, setAccountId] = useState("");
@@ -62,6 +77,13 @@ export function HomeView({
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [editing, setEditing] = useState<Transaction | null>(null);
+  const [editingTransfer, setEditingTransfer] = useState<Transfer | null>(null);
+  const [sourceAccountId, setSourceAccountId] = useState("");
+  const [destinationAccountId, setDestinationAccountId] = useState("");
+  const [openedTransferAccounts, setOpenedTransferAccounts] = useState<{
+    source?: AssetAccount;
+    destination?: AssetAccount;
+  }>({});
   const [historyLimit, setHistoryLimit] = useState(ledgerPageSize);
   const [query, setQuery] = useState("");
 
@@ -89,6 +111,31 @@ export function HomeView({
   const resolvedAccountId = resolveExplicitSelection(accountId, selectableAccounts);
   const selectedCategoryUnavailable = Boolean(categoryId && !resolvedCategoryId);
   const selectedAccountUnavailable = Boolean(accountId && !resolvedAccountId);
+  const transferAccounts = sortByDisplayOrder(data.accounts.filter((item) => (
+    (!item.deletedAt && item.isActive)
+    || editingTransfer?.sourceAccountId === item.id
+    || editingTransfer?.destinationAccountId === item.id
+  )));
+  const selectableTransferAccounts = transferAccounts.filter((item) => (
+    !unresolvedSyncRecordKeys.has(syncRecordKey("accounts", item.id))
+    && (item.isActive
+      || editingTransfer?.sourceAccountId === item.id
+      || editingTransfer?.destinationAccountId === item.id)
+  ));
+  const resolvedSourceAccountId = resolveExplicitSelection(sourceAccountId, selectableTransferAccounts);
+  const resolvedDestinationAccountId = resolveExplicitSelection(
+    destinationAccountId,
+    selectableTransferAccounts,
+  );
+  const selectedTransferAccountUnavailable = Boolean(
+    (sourceAccountId && !resolvedSourceAccountId)
+    || (destinationAccountId && !resolvedDestinationAccountId),
+  );
+  const usableTransferAccounts = data.accounts.filter((item) => (
+    !item.deletedAt
+    && item.isActive
+    && !unresolvedSyncRecordKeys.has(syncRecordKey("accounts", item.id))
+  ));
 
   useEffect(() => {
     try {
@@ -140,6 +187,13 @@ export function HomeView({
         .toLocaleLowerCase("zh-TW")
         .includes(normalizedQuery);
     }
+    if (entry.kind === "transfer") {
+      const source = data.accounts.find((item) => item.id === entry.record.sourceAccountId);
+      const destination = data.accounts.find((item) => item.id === entry.record.destinationAccountId);
+      return `${source?.name ?? ""} ${entry.record.sourceAccountName} ${destination?.name ?? ""} ${entry.record.destinationAccountName} ${entry.record.note ?? ""}`
+        .toLocaleLowerCase("zh-TW")
+        .includes(normalizedQuery);
+    }
     const category = data.categories.find(
       (item) => item.id === entry.record.categoryId,
     );
@@ -156,12 +210,31 @@ export function HomeView({
     setNote("");
     setOccurredAt(toLocalInput());
     setEditing(null);
+    setEditingTransfer(null);
+    setOpenedTransferAccounts({
+      source: data.accounts.find((account) => account.id === sourceAccountId),
+      destination: data.accounts.find((account) => account.id === destinationAccountId),
+    });
     setError("");
     requestAnimationFrame(() => amountRef.current?.focus());
   };
 
   const switchType = (next: "expense" | "income") => {
+    setMode(next);
     setType(next);
+    setEditingTransfer(null);
+    setOpenedTransferAccounts({});
+    setSourceAccountId("");
+    setDestinationAccountId("");
+    setCategoryId("");
+    setError("");
+    setSuccess("");
+    requestAnimationFrame(() => amountRef.current?.focus());
+  };
+
+  const switchToTransfer = () => {
+    setMode("transfer");
+    setEditing(null);
     setCategoryId("");
     setError("");
     setSuccess("");
@@ -170,6 +243,98 @@ export function HomeView({
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
+    if (mode === "transfer") {
+      const numericAmount = parseRequiredNumberInput(amount);
+      if (numericAmount === null || numericAmount <= 0) {
+        setError("請輸入大於 0、最多兩位小數的轉帳金額");
+        return;
+      }
+      if (usableTransferAccounts.length < 2 && !editingTransfer) {
+        setError("至少需要兩個可用的資產帳戶才能轉帳");
+        return;
+      }
+      if (selectedTransferAccountUnavailable) {
+        setError("原先選取的來源或目的帳戶目前不可用；請明確選擇可用帳戶。");
+        return;
+      }
+      if (!resolvedSourceAccountId || !resolvedDestinationAccountId) {
+        setError("請明確選擇來源帳戶與目的帳戶");
+        return;
+      }
+      if (resolvedSourceAccountId === resolvedDestinationAccountId) {
+        setError("來源帳戶與目的帳戶必須不同");
+        return;
+      }
+      if (!occurredAt) {
+        setError("請選擇轉帳時間");
+        return;
+      }
+      const currentTransfer = editingTransfer
+        ? data.transfers.find((record) => record.id === editingTransfer.id)
+        : undefined;
+      const resolvingTransferDependency = Boolean(
+        editingTransfer && transferDependencyConflictIds.has(editingTransfer.id),
+      );
+      if (editingTransfer && isEditorSnapshotStale(editingTransfer, currentTransfer, {
+        hasUnresolvedConflict: !resolvingTransferDependency && unresolvedSyncRecordKeys.has(
+          syncRecordKey("transfers", editingTransfer.id),
+        ),
+      })) {
+        setError("這筆轉帳已在背景更新、刪除或發生同步衝突；請重新開啟編輯。");
+        return;
+      }
+      for (const [label, openedAccount] of [
+        ["來源帳戶", openedTransferAccounts.source],
+        ["目的帳戶", openedTransferAccounts.destination],
+      ] as const) {
+        if (!openedAccount) continue;
+        const currentAccount = data.accounts.find((account) => account.id === openedAccount.id);
+        if (isEditorSnapshotStale(openedAccount, currentAccount, {
+          requireActive: openedAccount.isActive,
+          allowDeleted: resolvingTransferDependency && Boolean(
+            editingTransfer
+            && (openedAccount.id === editingTransfer.sourceAccountId
+              || openedAccount.id === editingTransfer.destinationAccountId),
+          ),
+          hasUnresolvedConflict: unresolvedSyncRecordKeys.has(
+            syncRecordKey("accounts", openedAccount.id),
+          ),
+        })) {
+          setError(`${label}已在背景更新、封存、刪除或發生同步衝突；請重新開啟編輯。`);
+          return;
+        }
+      }
+
+      try {
+        const metadata = editingTransfer
+          ? {
+              id: editingTransfer.id,
+              ownerId: editingTransfer.ownerId,
+              ...changedRecordMeta(editingTransfer),
+            }
+          : newRecordMeta(ownerId);
+        const record = buildTransferRecord(data, {
+          amount: numericAmount,
+          sourceAccountId: resolvedSourceAccountId,
+          destinationAccountId: resolvedDestinationAccountId,
+          occurredAt,
+          note: note.trim() || undefined,
+        }, metadata, editingTransfer ?? undefined);
+        completeAppliedMutation(
+          resolvingTransferDependency
+            ? Boolean(confirmTransferAccounts?.(record))
+            : put("transfers", record),
+          () => {
+            setSuccess(`${resolvingTransferDependency ? "已重新確認" : editingTransfer ? "已更新" : "已記下"}轉帳 ${displayMoney(numericAmount)}`);
+            resetForm();
+          },
+          setError,
+        );
+      } catch (transferError) {
+        setError(transferError instanceof Error ? transferError.message : String(transferError));
+      }
+      return;
+    }
     if (editing && unresolvedSyncRecordKeys.has(syncRecordKey("transactions", editing.id))) {
       setError("這筆交易有未解同步衝突；請先選擇雲端版本，本次修改未執行。");
       return;
@@ -251,7 +416,12 @@ export function HomeView({
   };
 
   const beginEdit = (transaction: Transaction) => {
+    setMode(transaction.type);
     setEditing(transaction);
+    setEditingTransfer(null);
+    setOpenedTransferAccounts({});
+    setSourceAccountId("");
+    setDestinationAccountId("");
     setType(transaction.type);
     setAmount(String(transaction.amount));
     setCategoryId(transaction.categoryId);
@@ -264,6 +434,24 @@ export function HomeView({
       onTutorialEvent?.({ type: "edit-opened" });
   };
 
+  const beginEditTransfer = (transfer: Transfer) => {
+    setMode("transfer");
+    setEditing(null);
+    setEditingTransfer(transfer);
+    setAmount(String(transfer.amount));
+    setSourceAccountId(transfer.sourceAccountId);
+    setDestinationAccountId(transfer.destinationAccountId);
+    setOccurredAt(transfer.occurredAt.slice(0, 16).replace(" ", "T"));
+    setNote(transfer.note ?? "");
+    setOpenedTransferAccounts({
+      source: data.accounts.find((account) => account.id === transfer.sourceAccountId),
+      destination: data.accounts.find((account) => account.id === transfer.destinationAccountId),
+    });
+    setSuccess("");
+    setError("");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
   return (
     <div className="quick-layout">
       <section className="quick-book" aria-labelledby="quick-entry-title">
@@ -271,7 +459,7 @@ export function HomeView({
           <div>
             <p className="section-kicker">剛剛花了多少？</p>
             <h1 id="quick-entry-title">
-              {editing ? "修改這筆紀錄" : "極速記帳"}
+              {editing || editingTransfer ? "修改這筆紀錄" : "極速記帳"}
             </h1>
           </div>
           <div
@@ -285,27 +473,41 @@ export function HomeView({
         </div>
 
         <form onSubmit={submit}>
-          <div className="entry-type-switch" role="group" aria-label="收支類型">
+          <div className="entry-type-switch" role="group" aria-label="紀錄類型">
             <button
               type="button"
-              className={type === "expense" ? "active expense" : ""}
-              aria-pressed={type === "expense"}
+              className={mode === "expense" ? "active expense" : ""}
+              aria-pressed={mode === "expense"}
               onClick={() => switchType("expense")}
             >
               記支出
             </button>
             <button
               type="button"
-              className={type === "income" ? "active income" : ""}
-              aria-pressed={type === "income"}
+              className={mode === "income" ? "active income" : ""}
+              aria-pressed={mode === "income"}
               onClick={() => switchType("income")}
             >
               記收入
             </button>
+            <button
+              type="button"
+              className={mode === "transfer" ? "active transfer" : ""}
+              aria-pressed={mode === "transfer"}
+              disabled={Boolean(tutorial) || !transferMutationsEnabled}
+              title={tutorial
+                ? "互動教學期間先完成支出流程"
+                : !transferMutationsEnabled
+                  ? "緊急唯讀模式：仍會顯示與計算轉帳，但已停用轉帳寫入。"
+                  : undefined}
+              onClick={switchToTransfer}
+            >
+              記轉帳
+            </button>
           </div>
 
-          <label className={`amount-stage ${type}`} data-tutorial="amount">
-            <span>{type === "expense" ? "支出金額" : "收入金額"}</span>
+          <label className={`amount-stage ${mode}`} data-tutorial="amount">
+            <span>{mode === "transfer" ? "轉帳金額" : type === "expense" ? "支出金額" : "收入金額"}</span>
             <MoneyInput
               ref={amountRef}
               className="amount-input-wrap"
@@ -334,7 +536,7 @@ export function HomeView({
             />
           </label>
 
-          <fieldset className="choice-section" data-tutorial="category">
+          {mode !== "transfer" && <fieldset className="choice-section" data-tutorial="category">
             <legend>選擇分類</legend>
             <div className="category-grid">
               {categories.map((category) => (
@@ -359,9 +561,9 @@ export function HomeView({
                 </button>
               ))}
             </div>
-          </fieldset>
+          </fieldset>}
 
-          <fieldset
+          {mode !== "transfer" ? <fieldset
             className="choice-section account-choices"
             data-tutorial="account"
           >
@@ -389,15 +591,95 @@ export function HomeView({
                 </button>
               ))}
             </div>
-          </fieldset>
+          </fieldset> : (
+            <div className="transfer-accounts" aria-label="轉帳帳戶">
+              {usableTransferAccounts.length < 2 && !editingTransfer && (
+                <p className="error-message" role="status">
+                  至少需要兩個可用的資產帳戶才能建立轉帳。
+                </p>
+              )}
+              <fieldset className="choice-section account-choices">
+                <legend>從哪個資產帳戶轉出？</legend>
+                <div className="chip-row">
+                  {transferAccounts.map((account) => {
+                    const locked = unresolvedSyncRecordKeys.has(syncRecordKey("accounts", account.id));
+                    return (
+                      <button
+                        type="button"
+                        key={`source:${account.id}`}
+                        className={`account-chip ${resolvedSourceAccountId === account.id ? "selected" : ""}`}
+                        aria-pressed={resolvedSourceAccountId === account.id}
+                        disabled={locked || Boolean(account.deletedAt)}
+                        onClick={() => {
+                          setSourceAccountId(account.id);
+                          setOpenedTransferAccounts((current) => ({ ...current, source: account }));
+                          setError("");
+                        }}
+                      >
+                        <FinanceIcon icon={account.icon} />
+                        {account.name}{!account.isActive ? "（已封存）" : ""}
+                      </button>
+                    );
+                  })}
+                </div>
+              </fieldset>
+              <button
+                type="button"
+                className="secondary-button transfer-swap"
+                aria-label="交換來源與目的帳戶"
+                onClick={() => {
+                  setSourceAccountId(destinationAccountId);
+                  setDestinationAccountId(sourceAccountId);
+                  setOpenedTransferAccounts((current) => ({
+                    source: current.destination,
+                    destination: current.source,
+                  }));
+                  setError("");
+                }}
+              >
+                <ArrowLeftRight className="h-4 w-4" />
+                交換帳戶
+              </button>
+              <fieldset className="choice-section account-choices">
+                <legend>要轉入哪個資產帳戶？</legend>
+                <div className="chip-row">
+                  {transferAccounts.map((account) => {
+                    const locked = unresolvedSyncRecordKeys.has(syncRecordKey("accounts", account.id));
+                    return (
+                      <button
+                        type="button"
+                        key={`destination:${account.id}`}
+                        className={`account-chip ${resolvedDestinationAccountId === account.id ? "selected" : ""}`}
+                        aria-pressed={resolvedDestinationAccountId === account.id}
+                        disabled={locked || Boolean(account.deletedAt)}
+                        onClick={() => {
+                          setDestinationAccountId(account.id);
+                          setOpenedTransferAccounts((current) => ({ ...current, destination: account }));
+                          setError("");
+                        }}
+                      >
+                        <FinanceIcon icon={account.icon} />
+                        {account.name}{!account.isActive ? "（已封存）" : ""}
+                      </button>
+                    );
+                  })}
+                </div>
+              </fieldset>
+            </div>
+          )}
 
-          {(selectedCategoryUnavailable || selectedAccountUnavailable) && (
+          {mode !== "transfer" && (selectedCategoryUnavailable || selectedAccountUnavailable) && (
             <p className="error-message" role="alert">
               原先選取的{selectedCategoryUnavailable ? "分類" : "帳戶"}目前不可用，請明確選擇其他可用項目。
             </p>
           )}
+          {mode === "transfer" && selectedTransferAccountUnavailable && (
+            <p className="error-message" role="alert">
+              原先選取的來源或目的帳戶目前不可用，請明確選擇可用帳戶。
+            </p>
+          )}
 
-          <details className="optional-details" open={Boolean(editing)}>
+          <details className="optional-details" open={Boolean(editing || editingTransfer)}>
             <summary>
               <ChevronDown className="h-4 w-4" />
               補充時間或備註
@@ -405,9 +687,9 @@ export function HomeView({
             <div className="optional-grid">
               <label className="field-label">
                 <CalendarClock className="h-4 w-4" />
-                交易時間
+                {mode === "transfer" ? "轉帳時間" : "交易時間"}
                 <input
-                  aria-label="交易時間"
+                  aria-label={mode === "transfer" ? "轉帳時間" : "交易時間"}
                   type="datetime-local"
                   className="field mt-1"
                   value={occurredAt}
@@ -440,23 +722,49 @@ export function HomeView({
           )}
           <div className="entry-actions">
             <button
-              className={`save-entry ${type}`}
+              className={`save-entry ${mode}`}
               type="submit"
               data-tutorial="create"
-              disabled={Boolean(editing && unresolvedSyncRecordKeys.has(
-                syncRecordKey("transactions", editing.id),
-              )) || !resolvedCategoryId || !resolvedAccountId
-                || unresolvedSyncRecordKeys.has(syncRecordKey("categories", resolvedCategoryId))
-                || unresolvedSyncRecordKeys.has(syncRecordKey("accounts", resolvedAccountId))}
-              title={selectedCategoryUnavailable || selectedAccountUnavailable
-                ? "原先選取的帳戶或分類目前不可用，請明確選擇其他可用項目。"
-                : undefined}
+              disabled={mode === "transfer"
+                ? Boolean(
+                    (editingTransfer
+                      && !transferDependencyConflictIds.has(editingTransfer.id)
+                      && unresolvedSyncRecordKeys.has(
+                      syncRecordKey("transfers", editingTransfer.id),
+                    ))
+                    || !resolvedSourceAccountId
+                    || !resolvedDestinationAccountId
+                    || resolvedSourceAccountId === resolvedDestinationAccountId
+                    || (usableTransferAccounts.length < 2 && !editingTransfer)
+                    || unresolvedSyncRecordKeys.has(
+                      syncRecordKey("accounts", resolvedSourceAccountId),
+                    )
+                    || unresolvedSyncRecordKeys.has(
+                      syncRecordKey("accounts", resolvedDestinationAccountId),
+                    ),
+                  )
+                : Boolean(editing && unresolvedSyncRecordKeys.has(
+                    syncRecordKey("transactions", editing.id),
+                  )) || !resolvedCategoryId || !resolvedAccountId
+                    || unresolvedSyncRecordKeys.has(syncRecordKey("categories", resolvedCategoryId))
+                    || unresolvedSyncRecordKeys.has(syncRecordKey("accounts", resolvedAccountId))}
+              title={mode === "transfer"
+                ? selectedTransferAccountUnavailable
+                  ? "原先選取的來源或目的帳戶目前不可用，請明確選擇可用帳戶。"
+                  : undefined
+                : selectedCategoryUnavailable || selectedAccountUnavailable
+                  ? "原先選取的帳戶或分類目前不可用，請明確選擇其他可用項目。"
+                  : undefined}
             >
-              {editing
-                ? "儲存修改"
-                : `記下這筆${type === "expense" ? "支出" : "收入"}`}
+              {editingTransfer
+                ? "儲存轉帳修改"
+                : mode === "transfer"
+                  ? "記下這筆轉帳"
+                  : editing
+                    ? "儲存修改"
+                    : `記下這筆${type === "expense" ? "支出" : "收入"}`}
             </button>
-            {editing && (
+            {(editing || editingTransfer) && (
               <button
                 className="secondary-button"
                 type="button"
@@ -482,8 +790,8 @@ export function HomeView({
           <label className="ledger-search">
             <Search className="h-4 w-4" />
             <input
-              aria-label="搜尋交易"
-              placeholder="搜尋分類、帳戶、備註"
+              aria-label="搜尋帳本"
+              placeholder="搜尋分類、帳戶、轉帳、備註"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
@@ -527,6 +835,102 @@ export function HomeView({
                       {entry.record.amountDelta > 0 ? "+" : "−"}
                       {displayMoney(Math.abs(entry.record.amountDelta))}
                     </b>
+                  </article>
+                );
+              }
+              if (entry.kind === "transfer") {
+                const transfer = entry.record;
+                const source = data.accounts.find(
+                  (item) => item.id === transfer.sourceAccountId,
+                );
+                const destination = data.accounts.find(
+                  (item) => item.id === transfer.destinationAccountId,
+                );
+                const hasUnresolvedConflict = unresolvedSyncRecordKeys.has(
+                  syncRecordKey("transfers", transfer.id),
+                );
+                const hasDependencyConflict = transferDependencyConflictIds.has(transfer.id);
+                const hasParentConflict = unresolvedSyncRecordKeys.has(
+                  syncRecordKey("accounts", transfer.sourceAccountId),
+                ) || unresolvedSyncRecordKeys.has(
+                  syncRecordKey("accounts", transfer.destinationAccountId),
+                );
+                const mutationBlocked = (hasUnresolvedConflict && !hasDependencyConflict)
+                  || hasParentConflict;
+                const transferLabel = `${source?.name ?? transfer.sourceAccountName} 轉至 ${destination?.name ?? transfer.destinationAccountName}`;
+                return (
+                  <article
+                    className="ledger-row transfer-row"
+                    key={`transfer:${transfer.id}`}
+                    data-testid="transfer-row"
+                  >
+                    <span className="record-icon transfer"><ArrowLeftRight className="h-4 w-4" /></span>
+                    <div>
+                      <strong>{transferLabel}</strong>
+                      <small>
+                        {shortDate(transfer.occurredAt)}
+                        {transfer.note ? ` · ${transfer.note}` : ""}
+                      </small>
+                      {hasDependencyConflict && (
+                        <small role="status">
+                          所選帳戶已在轉帳上傳前變更；請重新選擇並確認兩個帳戶。
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={!transferMutationsEnabled}
+                            onClick={() => beginEditTransfer(transfer)}
+                          >
+                            重新選擇並確認
+                          </button>
+                        </small>
+                      )}
+                      {hasUnresolvedConflict && !hasDependencyConflict && (
+                        <small role="status">
+                          同步衝突：編輯與刪除已暫停。
+                          {acceptRemoteTransferConflict && (
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              onClick={() => acceptRemoteTransferConflict(transfer.id)}
+                            >
+                              使用雲端版本
+                            </button>
+                          )}
+                        </small>
+                      )}
+                      {!hasUnresolvedConflict && hasParentConflict && (
+                        <small role="status">來源或目的帳戶有同步衝突：編輯與刪除已暫停。</small>
+                      )}
+                    </div>
+                    <b className="transfer">{displayMoney(transfer.amount)}</b>
+                    <span className="row-actions">
+                      <button
+                        type="button"
+                        aria-label={`編輯轉帳 ${transferLabel}`}
+                        disabled={mutationBlocked || !transferMutationsEnabled}
+                        title={!transferMutationsEnabled
+                          ? "緊急唯讀模式已停用轉帳編輯。"
+                          : mutationBlocked ? "此轉帳或其帳戶有未解同步衝突，請先完成處理。" : undefined}
+                        onClick={() => beginEditTransfer(transfer)}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`刪除轉帳 ${transferLabel}`}
+                        disabled={mutationBlocked || !transferMutationsEnabled}
+                        title={!transferMutationsEnabled
+                          ? "緊急唯讀模式已停用轉帳刪除。"
+                          : mutationBlocked ? "此轉帳或其帳戶有未解同步衝突，請先完成處理。" : undefined}
+                        onClick={() => {
+                          if (window.confirm("刪除這筆轉帳？兩個帳戶的餘額都會一併回復。")) {
+                            deleteTransfer(transfer);
+                          }
+                        }}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </span>
                   </article>
                 );
               }

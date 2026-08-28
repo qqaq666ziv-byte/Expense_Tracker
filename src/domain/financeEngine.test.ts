@@ -29,6 +29,7 @@ const baseData: FinanceData = {
     },
   ],
   transactions: [],
+  transfers: [],
   adjustments: [],
   goals: [],
   allocations: [],
@@ -108,6 +109,90 @@ describe('finance engine', () => {
     expect(result.accountBalances.find((account) => account.accountId === 'jkopay')?.balance).toBe(500);
     expect(result.totalAssets).toBe(3_500);
     expect(result.allTime).toMatchObject({ income: 2_000, expense: 0, net: 2_000 });
+  });
+
+  it.each([
+    { sourceIncluded: true, destinationIncluded: true, expectedTotal: 1_500 },
+    { sourceIncluded: false, destinationIncluded: false, expectedTotal: 0 },
+    { sourceIncluded: true, destinationIncluded: false, expectedTotal: 900 },
+    { sourceIncluded: false, destinationIncluded: true, expectedTotal: 600 },
+  ])(
+    'moves one transfer atomically across account balances and total-assets boundaries',
+    ({ sourceIncluded, destinationIncluded, expectedTotal }) => {
+      const data: FinanceData = {
+        ...baseData,
+        accounts: [
+          { ...baseData.accounts[0], includeInTotalAssets: sourceIncluded },
+          { ...baseData.accounts[1], includeInTotalAssets: destinationIncluded },
+        ],
+        transfers: [{
+          id: 'transfer-cash-to-jko', ownerId: 'guest', amount: 100,
+          sourceAccountId: 'cash', sourceAccountName: '現金',
+          destinationAccountId: 'jkopay', destinationAccountName: '街口支付',
+          occurredAt: '2026-08-21 10:00', note: '補充電子錢包', version: 1,
+          updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'fixture-transfer',
+        }],
+      };
+
+      const financials = calculateFinancials(data);
+      const insights = calculateInsights(data, {
+        period: 'month', reference: new Date(2026, 7, 21, 12),
+      });
+
+      expect(financials.accountBalances.map(({ accountId, balance }) => ({ accountId, balance })))
+        .toEqual([
+          { accountId: 'cash', balance: 900 },
+          { accountId: 'jkopay', balance: 600 },
+        ]);
+      expect(financials.totalAssets).toBe(expectedTotal);
+      expect(financials.allTime).toMatchObject({ income: 0, expense: 0, net: 0, expenseByCategory: [] });
+      expect(insights.today).toMatchObject({ income: 0, expense: 0, net: 0 });
+      expect(calculateSpendingTrend(
+        data,
+        getPeriodRange('month', new Date(2026, 7, 21, 12)),
+      )).toEqual([]);
+      expect(buildLedgerHistory(data)).toMatchObject([
+        { kind: 'transfer', record: { id: 'transfer-cash-to-jko' } },
+      ]);
+    },
+  );
+
+  it('reverses the prior transfer effect exactly once on edit and tombstone deletion', () => {
+    const original = {
+      id: 'transfer-edit', ownerId: 'guest', amount: 100,
+      sourceAccountId: 'cash', sourceAccountName: '現金',
+      destinationAccountId: 'jkopay', destinationAccountName: '街口支付',
+      occurredAt: '2026-08-21 10:00', version: 1,
+      updatedAt: '2026-08-21T10:00:00.000Z', lastOperationId: 'create-transfer',
+    } satisfies FinanceData['transfers'][number];
+    const originalData = { ...baseData, transfers: [original] };
+    const edited = {
+      ...original,
+      amount: 250,
+      sourceAccountId: 'jkopay',
+      sourceAccountName: '街口支付',
+      destinationAccountId: 'cash',
+      destinationAccountName: '現金',
+      version: 2,
+      lastOperationId: 'edit-transfer',
+    };
+    const editedData = { ...baseData, transfers: [edited] };
+    const deletedData = {
+      ...baseData,
+      transfers: [{
+        ...edited,
+        version: 3,
+        lastOperationId: 'tombstone:delete-transfer',
+        deletedAt: '2026-08-21T11:00:00.000Z',
+      }],
+    };
+
+    expect(calculateFinancials(originalData).accountBalances.map(({ balance }) => balance))
+      .toEqual([900, 600]);
+    expect(calculateFinancials(editedData).accountBalances.map(({ balance }) => balance))
+      .toEqual([1_250, 250]);
+    expect(calculateFinancials(deletedData).accountBalances.map(({ balance }) => balance))
+      .toEqual([1_000, 500]);
   });
 
   it('uses deterministic display-order ties for account balances regardless of pull order', () => {

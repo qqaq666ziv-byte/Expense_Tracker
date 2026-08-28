@@ -11,8 +11,10 @@ import type {
   SavingsGoal,
   SyncRecord,
   Transaction,
+  Transfer,
 } from '../domain/model';
 import type {
+  HistoricalImportBatch,
   RemoteAdapter,
   RemotePullIssue,
   RemotePullResult,
@@ -35,6 +37,7 @@ const TABLE_BY_ENTITY: Record<FinanceEntityName, string> = {
   accounts: 'accounts',
   categories: 'categories',
   transactions: 'transactions',
+  transfers: 'transfers',
   adjustments: 'adjustments',
   goals: 'goals',
   allocations: 'savings_allocations',
@@ -47,6 +50,7 @@ const ENTITY_NAMES = Object.keys(TABLE_BY_ENTITY) as FinanceEntityName[];
 const MONEY_COLUMN_BY_ENTITY: Partial<Record<FinanceEntityName, string>> = {
   accounts: 'opening_balance',
   transactions: 'amount',
+  transfers: 'amount',
   adjustments: 'amount_delta',
   goals: 'target_amount',
   allocations: 'amount_delta',
@@ -414,6 +418,7 @@ function decodeRemoteRecord(entity: FinanceEntityName, row: DatabaseRow): Remote
     case 'accounts': return { entity, record: decodeAccount(row) };
     case 'categories': return { entity, record: decodeCategory(row) };
     case 'transactions': return { entity, record: decodeTransaction(row) };
+    case 'transfers': return { entity, record: decodeTransfer(row) };
     case 'adjustments': return { entity, record: decodeAdjustment(row) };
     case 'goals': return { entity, record: decodeGoal(row) };
     case 'allocations': return { entity, record: decodeAllocation(row) };
@@ -472,6 +477,19 @@ function encodeRecord(entity: FinanceEntityName, record: SyncEntityRecord): Data
         account: transaction.accountName,
         date: transaction.occurredAt,
         icon: 'SPARKLES',
+      };
+    }
+    case 'transfers': {
+      const transfer = record as Transfer;
+      return {
+        ...common,
+        amount: transfer.amount,
+        source_account_id: transfer.sourceAccountId,
+        source_account_name: transfer.sourceAccountName,
+        destination_account_id: transfer.destinationAccountId,
+        destination_account_name: transfer.destinationAccountName,
+        occurred_at: transfer.occurredAt,
+        note: transfer.note ?? null,
       };
     }
     case 'adjustments': {
@@ -679,6 +697,13 @@ function validateRemoteGraph(records: readonly RemoteRecord[]): RemotePullResult
         }
         break;
       }
+      case 'transfers':
+        if (!accountIds.has(entry.record.sourceAccountId)) reason = 'references a missing source account';
+        else if (!accountIds.has(entry.record.destinationAccountId)) reason = 'references a missing destination account';
+        else if (entry.record.sourceAccountId === entry.record.destinationAccountId) {
+          reason = 'uses the same source and destination account';
+        }
+        break;
       case 'adjustments':
         if (!accountIds.has(entry.record.accountId)) reason = 'references a missing account';
         break;
@@ -803,6 +828,90 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
       }
     },
 
+    async applyHistoricalImportBatch(ownerId, batch: HistoricalImportBatch) {
+      await assertAuthenticatedOwner(client, ownerId);
+      const intent = batch.id.startsWith('historical-import:guest:')
+        ? 'guest-import'
+        : batch.id.startsWith('historical-import:restore:')
+          ? 'backup-restore'
+          : undefined;
+      if (!intent || batch.operations.length === 0) {
+        throw new Error('Historical import batch requires an explicit non-empty import id');
+      }
+      const operationKeys = new Set<string>();
+      for (const operation of batch.operations) {
+        validateOperation(ownerId, operation);
+        if (operation.historicalImportBatchId !== batch.id
+          || (operation.entity !== 'accounts' && operation.entity !== 'transfers')) {
+          throw new Error('Historical import batch contains an ordinary or unrelated operation');
+        }
+        const key = `${operation.entity}:${operation.recordId}`;
+        if (operationKeys.has(key)) throw new Error('Historical import batch contains duplicate operations');
+        operationKeys.add(key);
+      }
+      const endpointById = new Map(batch.endpointAccounts.map((endpoint) => {
+        if (endpoint.ownerId !== ownerId) throw new Error('Historical import endpoint owner mismatch');
+        return [endpoint.id, endpoint] as const;
+      }));
+      for (const operation of batch.operations.filter((candidate) => candidate.entity === 'transfers')) {
+        const candidate = operation.record as Transfer;
+        if (!endpointById.has(candidate.sourceAccountId)
+          || !endpointById.has(candidate.destinationAccountId)) {
+          throw new Error('Historical import endpoint manifest is incomplete');
+        }
+      }
+
+      const accountOperations = batch.operations
+        .filter((operation) => operation.entity === 'accounts')
+        .map((operation) => encodeRecord('accounts', operation.record));
+      const transferOperations = batch.operations
+        .filter((operation) => operation.entity === 'transfers')
+        .map((operation) => encodeRecord('transfers', operation.record));
+      const endpointAccounts = [...endpointById.values()]
+        .map((endpoint) => encodeRecord('accounts', endpoint));
+      // The browser cannot execute the privileged database RPC. The verified
+      // Edge Function is the only public import/restore entry point and calls
+      // the service-role-only transaction after revalidating this manifest.
+      const { data, error } = await client.functions.invoke(
+        'finance-import-historical-transfer-batch',
+        {
+          body: {
+            intent,
+            batch_id: batch.id,
+            account_operations: accountOperations,
+            endpoint_accounts: endpointAccounts,
+            transfer_operations: transferOperations,
+          },
+        },
+      ) as unknown as {
+        data: unknown;
+        error: null | { code?: string; message?: string };
+      };
+      if (error) {
+        throw new Error(
+          `Unable to apply authorized historical transfer import batch: ${error.code ?? 'unknown'}: ${error.message ?? 'unknown error'}`,
+        );
+      }
+      if (!Array.isArray(data)) {
+        throw new Error('Supabase historical import service returned an invalid confirmation payload');
+      }
+      const confirmedKeys = new Set(data.map((value) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+        const row = value as Record<string, unknown>;
+        if (typeof row.entity !== 'string' || typeof row.id !== 'string'
+          || typeof row.version !== 'number' || typeof row.last_operation_id !== 'string') return '';
+        const expected = batch.operations.find((operation) => (
+          operation.entity === row.entity && operation.recordId === row.id
+        ));
+        if (!expected || expected.record.version !== row.version || expected.id !== row.last_operation_id) return '';
+        return `${row.entity}:${row.id}`;
+      }));
+      if (confirmedKeys.has('') || confirmedKeys.size !== batch.operations.length
+        || [...operationKeys].some((key) => !confirmedKeys.has(key))) {
+        throw new Error('Supabase historical import service did not confirm every requested conflict clock');
+      }
+    },
+
     async compareAndSwap(ownerId, expected, replacement) {
       await assertAuthenticatedOwner(client, ownerId);
       validateOperation(ownerId, replacement);
@@ -837,5 +946,24 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
       }
       return { entity: replacement.entity, record: persisted } as RemoteRecord;
     },
+  };
+}
+
+function decodeTransfer(row: DatabaseRow): Transfer {
+  const note = optionalString(row, 'note');
+  const sourceAccountId = requiredString(row, 'source_account_id');
+  const destinationAccountId = requiredString(row, 'destination_account_id');
+  if (sourceAccountId === destinationAccountId) {
+    throw new Error('Supabase transfer requires different source and destination accounts');
+  }
+  return {
+    ...commonRecord(row),
+    amount: requiredPositiveNumber(row, 'amount'),
+    sourceAccountId,
+    sourceAccountName: requiredString(row, 'source_account_name'),
+    destinationAccountId,
+    destinationAccountName: requiredString(row, 'destination_account_name'),
+    occurredAt: requiredDate(row, 'occurred_at'),
+    ...(note === undefined ? {} : { note }),
   };
 }

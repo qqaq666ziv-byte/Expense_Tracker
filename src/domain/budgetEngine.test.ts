@@ -89,6 +89,13 @@ describe('budget engine', () => {
           version: 1, updatedAt: '2026-08-21T02:00:00.000Z', lastOperationId: 'tutorial-create',
         },
       ],
+      transfers: [{
+        id: 'transfer', ownerId: 'guest', amount: 999,
+        sourceAccountId: 'cash', sourceAccountName: '現金',
+        destinationAccountId: 'bank', destinationAccountName: '銀行',
+        occurredAt: '2026-08-21 13:00', version: 1,
+        updatedAt: '2026-08-21T05:00:00.000Z', lastOperationId: 'transfer-fixture',
+      }],
       adjustments: [{
         id: 'adjust', ownerId: 'guest', accountId: 'cash', amountDelta: -10, occurredAt: '2026-08-21 14:00',
         version: 1, updatedAt: '2026-08-21T06:00:00.000Z', lastOperationId: 'fixture',
@@ -128,7 +135,7 @@ describe('budget engine', () => {
     };
     const normalized = normalizeBudgetScope(staleOverall);
     const data: FinanceData = {
-      accounts: [], categories: [], transactions: [], adjustments: [], goals: [], allocations: [],
+      accounts: [], categories: [], transactions: [], transfers: [], adjustments: [], goals: [], allocations: [],
       budgets: [normalized], recurringRules: [], settings: { currency: 'TWD', locale: 'zh-TW' },
     };
 
@@ -157,7 +164,7 @@ describe('budget engine', () => {
       isActive: true, version: 1, updatedAt: '2026-08-01T00:00:00.000Z', lastOperationId: 'fixture',
     };
     const data: FinanceData = {
-      accounts: [], categories: [], transactions, adjustments: [], goals: [], allocations: [],
+      accounts: [], categories: [], transactions, transfers: [], adjustments: [], goals: [], allocations: [],
       budgets: [budget], recurringRules: [], settings: { currency: 'TWD', locale: 'zh-TW' },
     };
 

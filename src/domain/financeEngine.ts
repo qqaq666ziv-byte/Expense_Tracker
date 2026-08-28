@@ -1,4 +1,4 @@
-import type { BalanceAdjustment, FinanceData, Transaction } from './model';
+import type { BalanceAdjustment, FinanceData, Transaction, Transfer } from './model';
 import type { CustomRangeInput, DateRange, PeriodKey } from './dateRange';
 import { sortByDisplayOrder } from './displayOrder';
 import { addMoney, compareMoney, subtractMoney, sumMoney } from './money';
@@ -75,6 +75,7 @@ export interface PeriodAnalytics extends CashFlowSummary {
 
 export type LedgerHistoryEntry =
   | { kind: 'transaction'; record: Transaction }
+  | { kind: 'transfer'; record: Transfer }
   | { kind: 'adjustment'; record: BalanceAdjustment };
 
 const isPresent = <T extends { deletedAt?: string }>(record: T): boolean => !record.deletedAt;
@@ -83,6 +84,7 @@ const isPresent = <T extends { deletedAt?: string }>(record: T): boolean => !rec
 export function buildLedgerHistory(data: FinanceData): LedgerHistoryEntry[] {
   return [
     ...data.transactions.filter(isFinancialTransaction).map((record) => ({ kind: 'transaction' as const, record })),
+    ...data.transfers.filter(isPresent).map((record) => ({ kind: 'transfer' as const, record })),
     ...data.adjustments.filter(isPresent).map((record) => ({ kind: 'adjustment' as const, record })),
   ].sort((left, right) => {
     const timeDelta = parseLocalDateTime(right.record.occurredAt).getTime()
@@ -115,6 +117,7 @@ export function calculateSpendingTrend(
 
 export function calculateFinancials(data: FinanceData): FinancialSummary {
   const transactions = data.transactions.filter(isFinancialTransaction);
+  const transfers = data.transfers.filter(isPresent);
   const adjustments = data.adjustments.filter(isPresent);
   const categoriesById = new Map(data.categories.filter(isPresent).map((category) => [category.id, category]));
 
@@ -126,10 +129,15 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
       const adjustmentDelta = sumMoney(adjustments
         .filter((adjustment) => adjustment.accountId === account.id)
         .map((adjustment) => adjustment.amountDelta));
+      const transferDelta = sumMoney(transfers.flatMap((transfer) => {
+        if (transfer.sourceAccountId === account.id) return [-transfer.amount];
+        if (transfer.destinationAccountId === account.id) return [transfer.amount];
+        return [];
+      }));
       return {
         accountId: account.id,
         name: account.name,
-        balance: sumMoney([account.openingBalance, transactionDelta, adjustmentDelta]),
+        balance: sumMoney([account.openingBalance, transactionDelta, adjustmentDelta, transferDelta]),
         isActive: account.isActive,
         includeInTotalAssets: account.includeInTotalAssets,
       };

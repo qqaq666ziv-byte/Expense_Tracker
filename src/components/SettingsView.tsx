@@ -22,6 +22,7 @@ import { syncRecordKey } from "../domain/syncEngine";
 import {
   BackupSizeLimitError,
   exportFinanceBackup,
+  exportTransfersCsv,
   exportTransactionsCsv,
   MAX_BACKUP_BYTES,
   restoreFinanceBackup,
@@ -974,6 +975,20 @@ function BackupPanel({ data, ownerId, restore }: SettingsViewProps) {
         >
           <Download className="h-4 w-4" />
           交易 CSV
+        </button>
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() =>
+            download(
+              `transfers-${localDate()}.csv`,
+              `\uFEFF${exportTransfersCsv(data)}`,
+              "text/csv;charset=utf-8",
+            )
+          }
+        >
+          <Download className="h-4 w-4" />
+          轉帳 CSV
         </button>
       </div>
       <div className="my-5 border-t border-amber-100 dark:border-zinc-800" />

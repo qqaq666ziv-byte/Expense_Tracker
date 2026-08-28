@@ -3,7 +3,7 @@ import type { PersistedFinanceState } from './model';
 import { createFinanceStore } from './financeStore';
 
 const initialState: PersistedFinanceState = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   ownerId: 'guest',
   outbox: [],
   data: {
@@ -12,7 +12,7 @@ const initialState: PersistedFinanceState = {
       openingBalance: 1_000, includeInTotalAssets: true, isActive: true, sortOrder: 0,
       version: 1, updatedAt: '2026-08-21T00:00:00.000Z', lastOperationId: 'fixture',
     }],
-    categories: [], transactions: [], adjustments: [], budgets: [], recurringRules: [],
+    categories: [], transactions: [], transfers: [], adjustments: [], budgets: [], recurringRules: [],
     goals: [{
       id: 'goal', ownerId: 'guest', name: '旅遊', targetAmount: 2_000, isActive: true,
       version: 1, updatedAt: '2026-08-21T00:00:00.000Z', lastOperationId: 'fixture',

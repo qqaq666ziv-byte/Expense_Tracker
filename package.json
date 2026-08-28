@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite --port=8888 --host=0.0.0.0",
     "build": "vite build",
+    "build:transfer-read-only": "vite build --mode transfer-read-only",
     "preview": "vite preview",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "lint": "tsc --noEmit",
@@ -23,8 +24,12 @@
   "devDependencies": {
     "@electric-sql/pglite": "0.3.14",
     "@tailwindcss/vite": "4.3.3",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.6",
     "@types/node": "24.13.3",
     "@vitejs/plugin-react": "6.1.0",
+    "jsdom": "30.0.1",
     "tailwindcss": "4.3.3",
     "typescript": "5.9.3",
     "vite": "8.2.2",

@@ -9,6 +9,7 @@ import type {
 import { validateFinanceData } from './backup';
 import { hasSameBudgetSemantics } from './budgetEngine';
 import { assertLifecycleTransition } from './lifecycle';
+import { assertFinanceRecordWithinWriteLimits } from './resourceLimits';
 
 export type SyncEntityRecord = FinanceData[FinanceEntityName][number];
 
@@ -25,6 +26,29 @@ export function activeOperationId(operationId: string = crypto.randomUUID()): st
 
 const BUDGET_CONFLICT_ROLLBACK_MARKER = 'budget-conflict-rollback:';
 export const UNRESOLVED_PAYLOAD_CONFLICT_PREFIX = 'unresolved same-clock payload conflict';
+export const TRANSFER_DEPENDENCY_CONFLICT_PREFIX = 'transfer selected account changed before cloud write';
+
+export function hasTransferDependencyConflict(
+  operation: PendingOperation,
+): boolean {
+  return operation.entity === 'transfers'
+    && operation.lastError?.startsWith(TRANSFER_DEPENDENCY_CONFLICT_PREFIX) === true;
+}
+
+function transferDependencyAccountIds(operation: PendingOperation): ReadonlySet<string> {
+  if (!hasTransferDependencyConflict(operation) || !operation.lastError) return new Set();
+  const marker = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: accounts=`;
+  if (!operation.lastError.startsWith(marker)) return new Set();
+  const serialized = operation.lastError.slice(marker.length).split(';', 1)[0];
+  try {
+    return new Set(serialized
+      .split(',')
+      .filter(Boolean)
+      .map((accountId) => decodeURIComponent(accountId)));
+  } catch {
+    return new Set();
+  }
+}
 
 function budgetConflictRollbackOperationId(): string {
   return activeOperationId(`${BUDGET_CONFLICT_ROLLBACK_MARKER}${crypto.randomUUID()}`);
@@ -169,6 +193,12 @@ export interface RemotePullResult {
 
 export type RemotePullResponse = readonly RemoteRecord[] | RemotePullResult;
 
+export interface HistoricalImportBatch {
+  id: string;
+  operations: readonly PendingOperation[];
+  endpointAccounts: readonly FinanceData['accounts'][number][];
+}
+
 /**
  * External persistence seam. `apply` must durably and idempotently apply by
  * `(ownerId, operation.id)` and must not overwrite a record with a higher conflict clock.
@@ -176,6 +206,14 @@ export type RemotePullResponse = readonly RemoteRecord[] | RemotePullResult;
 export interface RemoteAdapter {
   pull(ownerId: string): Promise<RemotePullResponse>;
   apply(ownerId: string, operation: PendingOperation): Promise<void>;
+  /**
+   * Atomically applies account final states and first-class historical
+   * transfers created only by an explicit import/restore workflow.
+   */
+  applyHistoricalImportBatch?(
+    ownerId: string,
+    batch: HistoricalImportBatch,
+  ): Promise<void>;
   /** Atomically replace `expected` only while its conflict clock is unchanged. */
   compareAndSwap?(
     ownerId: string,
@@ -226,6 +264,115 @@ export interface SyncResult {
 
 export function syncRecordKey(entity: FinanceEntityName, recordId: string): string {
   return `${entity}:${recordId}`;
+}
+
+/**
+ * Complete the explicit user-confirmation path for a transfer that was held
+ * back because one of its account dependencies changed before its first cloud
+ * write. The caller must rebuild the record from the current, explicitly
+ * selected accounts so both denormalized names and the conflict clock advance.
+ */
+export function confirmTransferDependencyConflict(
+  state: PersistedFinanceState,
+  replacement: FinanceData['transfers'][number],
+): PersistedFinanceState {
+  const key = syncRecordKey('transfers', replacement.id);
+  const pending = state.outbox.find((operation) => (
+    operation.entity === 'transfers' && operation.recordId === replacement.id
+  ));
+  const current = state.data.transfers.find((transfer) => transfer.id === replacement.id);
+  if (!pending || !hasTransferDependencyConflict(pending)
+    || !state.unresolvedSyncRecordKeys?.includes(key)) {
+    throw new Error('這筆轉帳目前沒有待重新確認的帳戶變更。');
+  }
+  if (!current || current.ownerId !== state.ownerId || replacement.ownerId !== state.ownerId) {
+    throw new Error('轉帳不屬於目前帳本，帳戶確認未套用。');
+  }
+  if (replacement.version <= current.version
+    || replacement.lastOperationId === current.lastOperationId) {
+    throw new Error('重新確認必須建立較新的轉帳版本。');
+  }
+  const source = state.data.accounts.find((account) => account.id === replacement.sourceAccountId);
+  const destination = state.data.accounts.find(
+    (account) => account.id === replacement.destinationAccountId,
+  );
+  if (!source || !destination
+    || source.ownerId !== state.ownerId || destination.ownerId !== state.ownerId) {
+    throw new Error('請重新選擇兩個目前可用的帳戶。');
+  }
+  if (source.id === destination.id) throw new Error('來源帳戶與目的帳戶必須不同。');
+  const dependencyAccountIds = transferDependencyAccountIds(pending);
+  const sourceRemainsHistorical = source.id === current.sourceAccountId
+    && !dependencyAccountIds.has(source.id);
+  const destinationRemainsHistorical = destination.id === current.destinationAccountId
+    && !dependencyAccountIds.has(destination.id);
+  if ((!sourceRemainsHistorical && (source.deletedAt || !source.isActive))
+    || (!destinationRemainsHistorical && (destination.deletedAt || !destination.isActive))) {
+    throw new Error('請重新選擇兩個目前可用的帳戶。');
+  }
+  const refreshSourceSnapshot = source.id !== current.sourceAccountId
+    || dependencyAccountIds.has(source.id);
+  const refreshDestinationSnapshot = destination.id !== current.destinationAccountId
+    || dependencyAccountIds.has(destination.id);
+  if ((source.id !== current.sourceAccountId && replacement.sourceAccountName !== source.name)
+    || (destination.id !== current.destinationAccountId
+      && replacement.destinationAccountName !== destination.name)) {
+    throw new Error('新選或已變更帳戶的名稱快照不是目前明確確認的版本。');
+  }
+  const confirmedReplacement = {
+    ...replacement,
+    sourceAccountName: refreshSourceSnapshot ? source.name : current.sourceAccountName,
+    destinationAccountName: refreshDestinationSnapshot
+      ? destination.name
+      : current.destinationAccountName,
+  };
+  const affectedAccountIds = new Set([
+    current.sourceAccountId,
+    current.destinationAccountId,
+    source.id,
+    destination.id,
+  ]);
+  for (const accountId of affectedAccountIds) {
+    if (hasUnresolvedPayloadConflict(
+      state.outbox,
+      'accounts',
+      accountId,
+      state.unresolvedSyncRecordKeys,
+    )) {
+      throw new Error('來源或目的帳戶仍有未解同步衝突，轉帳帳戶確認未套用。');
+    }
+  }
+  assertFinanceRecordWithinWriteLimits('transfers', confirmedReplacement);
+
+  const data = replaceRecord(state.data, { entity: 'transfers', record: confirmedReplacement });
+  validateFinanceData(data, 'confirmed transfer account dependency');
+  const outbox = state.outbox.map((operation) => (
+    operation === pending
+      ? {
+          ...operation,
+          id: confirmedReplacement.lastOperationId,
+          record: confirmedReplacement,
+          attempts: 0,
+          queuedAt: confirmedReplacement.updatedAt,
+          lastError: undefined,
+        }
+      : operation
+  ));
+  const unresolvedSyncRecordKeys = state.unresolvedSyncRecordKeys.filter(
+    (candidate) => candidate !== key,
+  );
+  const remainingErrors = outbox.flatMap((operation) => (
+    operation.lastError ? [operation.lastError] : []
+  ));
+  return {
+    ...state,
+    data,
+    outbox,
+    unresolvedSyncRecordKeys: unresolvedSyncRecordKeys.length > 0
+      ? unresolvedSyncRecordKeys
+      : undefined,
+    lastSyncError: remainingErrors.length > 0 ? [...new Set(remainingErrors)].join('; ') : undefined,
+  };
 }
 
 export function hasUnresolvedPayloadConflict(
@@ -476,6 +623,7 @@ const ENTITY_NAMES: readonly FinanceEntityName[] = [
   'accounts',
   'categories',
   'transactions',
+  'transfers',
   'adjustments',
   'goals',
   'allocations',
@@ -696,6 +844,7 @@ function emptyRemoteData(settings: FinanceData['settings']): FinanceData {
     accounts: [],
     categories: [],
     transactions: [],
+    transfers: [],
     adjustments: [],
     goals: [],
     allocations: [],
@@ -1131,6 +1280,7 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
   record: FinanceData[E][number],
   queuedAt: string = record.updatedAt,
   batchId?: string,
+  historicalImportBatchId?: string,
 ): PersistedFinanceState {
   if (state.ownerId === 'guest') {
     throw new Error('guest state is local-only and cannot enqueue remote sync operations');
@@ -1154,7 +1304,9 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
   const existingOperation = state.outbox.find((operation) => (
     operation.entity === entity && operation.recordId === syncRecord.id
   ));
-  const effectiveBatchId = existingOperation?.batchId ?? batchId;
+  const effectiveBatchId = historicalImportBatchId
+    ? undefined
+    : existingOperation?.batchId ?? batchId;
   const nextOperation: PendingOperation = {
     id: syncRecord.lastOperationId,
     entity,
@@ -1166,7 +1318,8 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
       batchId: effectiveBatchId,
       batchBeforeRecord: existingOperation?.batchBeforeRecord
         ?? (existingRecord ? structuredClone(existingRecord) : null),
-    } : {}),
+      } : {}),
+    ...(historicalImportBatchId ? { historicalImportBatchId } : {}),
   };
 
   return {
@@ -1265,6 +1418,95 @@ export async function syncFinanceState(
       const preflightByKey = new Map(preflight.records
         .filter((entry) => entry.record.ownerId === authenticatedOwnerId)
         .map((entry) => [recordKey(entry.entity, entry.record.id), entry]));
+      for (const [transferIndex, operation] of state.outbox.entries()) {
+        if (operation.entity !== 'transfers' || operation.record.deletedAt) continue;
+        if (operation.historicalImportBatchId) continue;
+        const transferKey = recordKey('transfers', operation.recordId);
+        const transfer = operation.record as FinanceData['transfers'][number];
+        const remoteTransferEntry = preflightByKey.get(transferKey);
+        const remoteTransfer = remoteTransferEntry?.entity === 'transfers'
+          ? remoteTransferEntry.record
+          : undefined;
+        if (remoteTransfer) {
+          const transferComparison = compareSyncRecords(transfer, remoteTransfer);
+          const divergentSameClock = transferComparison === 0
+            && differingSyncRecordFields('transfers', transfer, remoteTransfer).length > 0;
+          // Direct transfer conflicts retain the normal accept-cloud path.
+          if (transferComparison < 0 || divergentSameClock) continue;
+        }
+        const selectedEndpoints = [
+          [
+            transfer.sourceAccountId,
+            remoteTransfer?.sourceAccountId,
+            transfer.sourceAccountName,
+          ],
+          [
+            transfer.destinationAccountId,
+            remoteTransfer?.destinationAccountId,
+            transfer.destinationAccountName,
+          ],
+        ].filter(([accountId, historicalAccountId]) => historicalAccountId !== accountId);
+        const mismatchedEndpoints = selectedEndpoints.flatMap(([accountId, , accountName]) => {
+            const accountKey = recordKey('accounts', accountId);
+            const localAccount = state.data.accounts.find((account) => account.id === accountId);
+            const remoteAccount = preflightByKey.get(accountKey);
+            if (localAccount && remoteAccount?.entity === 'accounts'
+              && differingSyncRecordFields('accounts', localAccount, remoteAccount.record).length === 0) {
+              return [];
+            }
+            const parentOperationIndex = state.outbox.findIndex((candidate) => (
+              candidate.entity === 'accounts' && candidate.recordId === accountId
+            ));
+            const parentOperation = parentOperationIndex >= 0
+              ? state.outbox[parentOperationIndex]
+              : undefined;
+            const historicalAccount = parentOperation?.entity === 'accounts'
+              && parentOperation.batchBeforeRecord
+              ? parentOperation.batchBeforeRecord as FinanceData['accounts'][number]
+              : undefined;
+            const parentWillEstablishExactLocalState = Boolean(
+              localAccount
+              && parentOperation
+              && parentOperationIndex < transferIndex
+              && !unresolvedKeys.has(accountKey)
+              && !preflightBlockedKeys.has(accountKey)
+              && differingSyncRecordFields('accounts', parentOperation.record, localAccount).length === 0
+              && (!remoteAccount || compareSyncRecords(parentOperation.record, remoteAccount.record) > 0),
+            );
+            const laterParentPreservesHistoricalEndpoint = Boolean(
+              parentOperation
+              && parentOperationIndex > transferIndex
+              && historicalAccount
+              && remoteAccount?.entity === 'accounts'
+              && historicalAccount.id === accountId
+              && historicalAccount.ownerId === authenticatedOwnerId
+              && historicalAccount.isActive
+              && !historicalAccount.deletedAt
+              && historicalAccount.name === accountName
+              && !unresolvedKeys.has(accountKey)
+              && !preflightBlockedKeys.has(accountKey)
+              && differingSyncRecordFields(
+                'accounts',
+                historicalAccount,
+                remoteAccount.record,
+              ).length === 0,
+            );
+            return parentWillEstablishExactLocalState || laterParentPreservesHistoricalEndpoint
+              ? []
+              : [accountId];
+          });
+        if (mismatchedEndpoints.length === 0) continue;
+        // Once any selected dependency changes, remember every endpoint newly
+        // selected by this mutation. A sibling endpoint may change remotely
+        // while the user is deciding, and first creates must refresh both.
+        const dependencyIds = [...new Set(selectedEndpoints.map(([accountId]) => accountId))]
+          .map(encodeURIComponent)
+          .join(',');
+        const reason = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: accounts=${dependencyIds}; `
+          + '請重新開啟轉帳並明確確認來源與目的帳戶。';
+        preflightBlockedKeys.add(transferKey);
+        preflightBlockedReasons.set(transferKey, reason);
+      }
       for (const operation of state.outbox.filter((candidate) => candidate.batchId)) {
         const key = recordKey(operation.entity, operation.recordId);
         const remoteRecord = preflightByKey.get(key);
@@ -1450,14 +1692,91 @@ export async function syncFinanceState(
     }
   }
 
+  const completedHistoricalImportKeys = new Set<string>();
+  const visitedHistoricalImportBatchIds = new Set<string>();
   for (const queuedOperation of state.outbox) {
     const key = recordKey(queuedOperation.entity, queuedOperation.recordId);
     const operation = preflightApplyOverrides.get(key) ?? queuedOperation;
+    if (queuedOperation.historicalImportBatchId) {
+      const batchId = queuedOperation.historicalImportBatchId;
+      if (visitedHistoricalImportBatchIds.has(batchId)) continue;
+      visitedHistoricalImportBatchIds.add(batchId);
+      const batchOperations = state.outbox.filter((candidate) => (
+        candidate.historicalImportBatchId === batchId
+      ));
+      const transferOperations = batchOperations.filter((candidate) => candidate.entity === 'transfers');
+      const endpointIds = new Set(transferOperations.flatMap((candidate) => {
+        const candidateTransfer = candidate.record as FinanceData['transfers'][number];
+        return [candidateTransfer.sourceAccountId, candidateTransfer.destinationAccountId];
+      }));
+      const endpointAccounts = state.data.accounts.filter((account) => endpointIds.has(account.id));
+      const blockedEndpointKey = [...endpointIds]
+        .map((accountId) => recordKey('accounts', accountId))
+        .find((accountKey) => unresolvedKeys.has(accountKey) || preflightBlockedReasons.has(accountKey));
+      const blockedOperation = batchOperations.find((candidate) => {
+        const candidateKey = recordKey(candidate.entity, candidate.recordId);
+        return unresolvedKeys.has(candidateKey)
+          || (preflightBlockedKeys.has(candidateKey)
+            && (!candidate.record.deletedAt || preflightBlockedReasons.has(candidateKey)));
+      });
+      const failureReason = endpointAccounts.length !== endpointIds.size
+        ? '歷史轉帳匯入批次缺少完整的端點帳戶快照。'
+        : blockedEndpointKey
+          ? `歷史轉帳匯入端點 ${blockedEndpointKey} 尚未完成衝突確認。`
+          : blockedOperation
+            ? '歷史轉帳匯入批次包含未解衝突；本次未上傳任何批次成員。'
+            : !remote.applyHistoricalImportBatch
+              ? '遠端不支援原子歷史轉帳匯入；本次未上傳任何批次成員。'
+              : undefined;
+      if (failureReason) {
+        for (const candidate of batchOperations) {
+          remaining.push({ ...candidate, lastError: failureReason });
+          failures.push({
+            stage: unresolvedKeys.has(recordKey(candidate.entity, candidate.recordId)) ? 'conflict' : 'apply',
+            message: failureReason,
+            operationId: candidate.id,
+            entity: candidate.entity,
+            recordId: candidate.recordId,
+          });
+        }
+        continue;
+      }
+      try {
+        await remote.applyHistoricalImportBatch(authenticatedOwnerId, {
+          id: batchId,
+          operations: batchOperations,
+          endpointAccounts,
+        });
+        for (const candidate of batchOperations) {
+          completedHistoricalImportKeys.add(recordKey(candidate.entity, candidate.recordId));
+        }
+        applied += batchOperations.length;
+      } catch (error) {
+        const message = errorMessage(error);
+        for (const candidate of batchOperations) {
+          remaining.push({
+            ...candidate,
+            attempts: candidate.attempts + 1,
+            lastError: message,
+          });
+          failures.push({
+            stage: 'apply',
+            message,
+            operationId: candidate.id,
+            entity: candidate.entity,
+            recordId: candidate.recordId,
+          });
+        }
+      }
+      continue;
+    }
     if (
       unresolvedKeys.has(key)
       || (queuedOperation.batchId !== undefined && unresolvedBatchIds.has(queuedOperation.batchId))
     ) {
-      const message = `unresolved sync conflict for ${operation.entity}/${operation.recordId}; pending write was not sent`;
+      const message = hasTransferDependencyConflict(queuedOperation)
+        ? queuedOperation.lastError!
+        : `unresolved sync conflict for ${operation.entity}/${operation.recordId}; pending write was not sent`;
       remaining.push({ ...operation, lastError: message });
       failures.push({
         stage: 'conflict',
@@ -1751,7 +2070,10 @@ export async function syncFinanceState(
       finalRemaining.map((operation) => [recordKey(operation.entity, operation.recordId), operation]),
     );
     for (const operation of state.outbox) {
-      if (!operation.batchId || retainedByKey.has(recordKey(operation.entity, operation.recordId))) continue;
+      const completedAtomicWrite = operation.batchId
+        || (operation.historicalImportBatchId
+          && completedHistoricalImportKeys.has(recordKey(operation.entity, operation.recordId)));
+      if (!completedAtomicWrite || retainedByKey.has(recordKey(operation.entity, operation.recordId))) continue;
       retainedByKey.set(recordKey(operation.entity, operation.recordId), {
         ...operation,
         lastError: '批次寫入後尚未完成雲端確認；本筆將安全重試。',
@@ -1894,6 +2216,9 @@ export async function syncFinanceState(
   // the user intended to keep. Persist the lock until the explicit
   // accept-remote resolution path clears it.
   for (const key of currentUnresolvedKeys) unresolvedSyncRecordKeys.add(key);
+  for (const operation of finalRemaining.filter(hasTransferDependencyConflict)) {
+    unresolvedSyncRecordKeys.add(recordKey(operation.entity, operation.recordId));
+  }
   const nextState: PersistedFinanceState = {
     ...state,
     data,

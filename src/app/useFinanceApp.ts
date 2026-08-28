@@ -10,12 +10,15 @@ import type {
   SavingsGoal,
   PersistedFinanceState,
   SyncRecord,
+  Transfer,
 } from '../domain/model';
 import { catchUpRecurringTransactions } from '../domain/recurrence';
 import { recurringRuleParentIssue } from '../domain/recurringSafety';
 import {
   acceptRemoteConflictRecord,
+  confirmTransferDependencyConflict,
   hasUnresolvedPayloadConflict,
+  hasTransferDependencyConflict,
   syncRecordKey,
   unresolvedPayloadConflictKeys,
   type SyncReport,
@@ -47,6 +50,12 @@ import {
   tombstoneRecordMeta,
 } from './state';
 import { assertCategoryUpsert, type CategoryAction } from '../domain/lifecycle';
+import {
+  assertTransferCollectionMutationAllowed,
+  assertTransferMutationAllowed,
+  createTransferReadOnlyRemoteAdapter,
+  TRANSFER_MUTATIONS_ENABLED,
+} from './transferMutationPolicy';
 
 export interface FinanceAppController {
   state: PersistedFinanceState;
@@ -57,6 +66,8 @@ export interface FinanceAppController {
   syncReport: SyncReport | null;
   unresolvedSyncRecordKeys: ReadonlySet<string>;
   mutationLockedRecordKeys: ReadonlySet<string>;
+  transferDependencyConflictIds: ReadonlySet<string>;
+  transferMutationsEnabled: boolean;
   conflictResolutionImpact: ReadonlyMap<string, number>;
   storageError?: string;
   storageRecovery?: LocalStateRecovery;
@@ -74,6 +85,7 @@ export interface FinanceAppController {
   archiveAccount(record: AssetAccount): boolean;
   releaseGoalAllocations(goal: SavingsGoal): boolean;
   softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): boolean;
+  confirmTransferAccounts(record: Transfer): boolean;
   acceptRemoteConflict(entity: FinanceEntityName, recordId: string): Promise<boolean>;
   syncNow(): Promise<void>;
   signIn(): Promise<void>;
@@ -276,6 +288,16 @@ export function syncMutationTargets<E extends FinanceEntityName>(
       if (candidate.recurringRuleId) {
         targets.push({ entity: 'recurringRules', recordId: candidate.recurringRuleId });
       }
+    }
+  }
+  if (entity === 'transfers') {
+    const transfer = record as Transfer;
+    const existing = state.data.transfers.find((candidate) => candidate.id === transfer.id);
+    for (const candidate of [transfer, existing].filter(Boolean) as Transfer[]) {
+      targets.push(
+        { entity: 'accounts', recordId: candidate.sourceAccountId },
+        { entity: 'accounts', recordId: candidate.destinationAccountId },
+      );
     }
   }
   if (entity === 'adjustments') {
@@ -496,7 +518,12 @@ export function useFinanceApp(): FinanceAppController {
         started,
         ownerId,
         storageRecoveryRef.current,
-        () => createSupabaseRemoteAdapter(supabase),
+        () => {
+          const remote = createSupabaseRemoteAdapter(supabase);
+          return TRANSFER_MUTATIONS_ENABLED
+            ? remote
+            : createTransferReadOnlyRemoteAdapter(remote);
+        },
       );
       if (!result) return;
       if (ownerGenerationRef.current !== generation || activeOwnerRef.current !== ownerId) return;
@@ -565,6 +592,7 @@ export function useFinanceApp(): FinanceAppController {
     }
     try {
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertTransferMutationAllowed(entity, TRANSFER_MUTATIONS_ENABLED);
       assertSyncRecordMutationsAllowed(
         stateRef.current,
         syncMutationTargets(stateRef.current, entity, record),
@@ -584,6 +612,26 @@ export function useFinanceApp(): FinanceAppController {
       return true;
     } catch (error) {
       setSafetyNotice(`資料未儲存：${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }, [assertRenderedOwnerContext, commitState]);
+
+  const confirmTransferAccounts = useCallback((record: Transfer): boolean => {
+    try {
+      assertRenderedOwnerContext();
+      assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertTransferMutationAllowed('transfers', TRANSFER_MUTATIONS_ENABLED);
+      if (stateRef.current.legacyBootstrap?.status === 'pending' || stateRef.current.initialBootstrap) {
+        throw new Error('雲端帳本尚在安全讀取；完成前無法重新確認轉帳帳戶。');
+      }
+      if (storageRecoveryRef.current) {
+        throw new Error('本機快照仍在復原保護中；無法重新確認轉帳帳戶。');
+      }
+      commitState((current) => confirmTransferDependencyConflict(current, record));
+      setSafetyNotice(undefined);
+      return true;
+    } catch (error) {
+      setSafetyNotice(`轉帳帳戶未重新確認：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
   }, [assertRenderedOwnerContext, commitState]);
@@ -700,6 +748,7 @@ export function useFinanceApp(): FinanceAppController {
     }
     try {
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertTransferMutationAllowed(entity, TRANSFER_MUTATIONS_ENABLED);
       assertSyncRecordMutationsAllowed(
         stateRef.current,
         syncMutationTargets(stateRef.current, entity, record),
@@ -736,6 +785,11 @@ export function useFinanceApp(): FinanceAppController {
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
+      assertTransferCollectionMutationAllowed(
+        stateRef.current.data.transfers,
+        data.transfers,
+        TRANSFER_MUTATIONS_ENABLED,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setSafetyNotice(message);
@@ -911,6 +965,10 @@ export function useFinanceApp(): FinanceAppController {
       return;
     }
     const imported = remapOwner(loadedGuest.state.data, stateRef.current.ownerId);
+    if (!TRANSFER_MUTATIONS_ENABLED && imported.transfers.length > 0) {
+      setGuestImportNotice('緊急 transfer read-only 模式下不會匯入新轉帳；訪客快照仍保持不變。');
+      return;
+    }
     const plan = planGuestImport(stateRef.current, imported);
     if (plan.conflicts.length > 0) {
       setGuestImportNotice(`訪客匯入已中止：${plan.conflicts.length} 筆同來源資料在兩邊內容不同，本次未修改任何帳號資料，也未把此快照標記為已處理。請先下載兩邊 JSON 備份，再選擇保持分離或以備份還原流程明確合併。`);
@@ -1031,6 +1089,11 @@ export function useFinanceApp(): FinanceAppController {
     }
     return keys;
   }, [exposedState.outbox, unresolvedSyncRecordKeys]);
+  const transferDependencyConflictIds = useMemo(() => new Set(
+    exposedState.outbox
+      .filter(hasTransferDependencyConflict)
+      .map((operation) => operation.recordId),
+  ), [exposedState.outbox]);
 
   return {
     state: exposedState,
@@ -1041,6 +1104,8 @@ export function useFinanceApp(): FinanceAppController {
     syncReport,
     unresolvedSyncRecordKeys,
     mutationLockedRecordKeys,
+    transferDependencyConflictIds,
+    transferMutationsEnabled: TRANSFER_MUTATIONS_ENABLED,
     conflictResolutionImpact,
     storageError,
     storageRecovery,
@@ -1058,6 +1123,7 @@ export function useFinanceApp(): FinanceAppController {
     archiveAccount,
     releaseGoalAllocations: releaseGoalAllocationRecords,
     softDelete,
+    confirmTransferAccounts,
     acceptRemoteConflict,
     syncNow,
     signIn,

@@ -31,6 +31,7 @@ const EXPECTED_TABLES = [
   'settings',
   'subscriptions',
   'transactions',
+  'transfers',
 ];
 
 function base64Url(value) {
@@ -119,7 +120,7 @@ async function verifyFreshAndRetry() {
     `);
     assert.equal(
       numeric(policyCount.count),
-      34,
+      37,
       'Expected owner CRUD policies plus DELETE only where a tombstone bridge exists',
     );
     const deletePolicyCount = await one(db, `
@@ -140,7 +141,7 @@ async function verifyFreshAndRetry() {
       where tgname = 'finance_v3_conflict_clock'
         and not tgisinternal
     `);
-    assert.equal(numeric(triggerCount.count), 8, 'Expected one conflict-clock trigger per sync entity');
+    assert.equal(numeric(triggerCount.count), 9, 'Expected one conflict-clock trigger per sync entity');
 
     const allocationCapacityTriggerCount = await one(db, `
       select count(*)::integer as count
@@ -232,7 +233,7 @@ async function verifyFreshAndRetry() {
       from pg_constraint
       where conname ~ '^finance_v3_.*_operation_check$'
     `);
-    assert.equal(numeric(operationCheckCount.count), 10, 'Expected a stable operation check on every finance table');
+    assert.equal(numeric(operationCheckCount.count), 11, 'Expected a stable operation check on every finance table');
 
     const resourceGuardCounts = await one(db, `
       select
@@ -247,9 +248,9 @@ async function verifyFreshAndRetry() {
           from pg_constraint
           where conname ~ '^finance_v3_.*_len_chk$') as text_checks
     `);
-    assert.equal(numeric(resourceGuardCounts.triggers), 9, 'Expected one row quota trigger per owner-scoped entity table');
-    assert.equal(numeric(resourceGuardCounts.numeric_checks), 9, 'Expected one future-write check per finance numeric column');
-    assert.equal(numeric(resourceGuardCounts.text_checks), 70, 'Expected a future-write check on every persisted text field');
+    assert.equal(numeric(resourceGuardCounts.triggers), 10, 'Expected one row quota trigger per owner-scoped entity table');
+    assert.equal(numeric(resourceGuardCounts.numeric_checks), 10, 'Expected one future-write check per finance numeric column');
+    assert.equal(numeric(resourceGuardCounts.text_checks), 78, 'Expected a future-write check on every persisted text field');
 
     const domainCheckCount = await one(db, `
       select count(*)::integer as count
@@ -265,9 +266,12 @@ async function verifyFreshAndRetry() {
         'finance_v3_budgets_relation_check',
         'finance_v3_accounts_name_check',
         'finance_v3_categories_name_check'
+        ,'finance_v3_transfers_amount_check'
+        ,'finance_v3_transfers_distinct_accounts_check'
+        ,'finance_v3_transfers_relations_check'
       )
     `);
-    assert.equal(numeric(domainCheckCount.count), 10, 'Expected future-write domain checks');
+    assert.equal(numeric(domainCheckCount.count), 13, 'Expected future-write domain checks');
 
     const recurrenceIndex = await one(db, `
       select count(*)::integer as count
@@ -2382,6 +2386,431 @@ async function verifyServerResourceAbuseGuards() {
   }
 }
 
+async function verifyAtomicTransfers() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseAuth(db);
+    await db.exec(`insert into auth.users (id) values ('${OWNER_A}'), ('${OWNER_B}')`);
+    await db.exec(migrationSql);
+    await db.exec('set role authenticated');
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+
+    await db.query(`
+      insert into public.accounts (
+        user_id, id, name, icon_type, icon_value, opening_balance,
+        include_in_total_assets, is_active, sort_order, version,
+        updated_at, last_operation_id
+      ) values
+        ($1, 'included-a', '計入 A', 'vector', 'wallet', 1000, true, true, 1, 1, now(), 'account-a-op'),
+        ($1, 'included-b', '計入 B', 'vector', 'wallet', 1000, true, true, 2, 1, now(), 'account-b-op'),
+        ($1, 'excluded-a', '排除 A', 'vector', 'wallet', 0, false, true, 3, 1, now(), 'account-c-op'),
+        ($1, 'excluded-b', '排除 B', 'vector', 'wallet', 0, false, true, 4, 1, now(), 'account-d-op')
+    `, [OWNER_A]);
+
+    const historicalAccountRows = [{
+      user_id: OWNER_A,
+      id: 'historical-archived-source',
+      name: '目前銀行名',
+      icon_type: 'vector',
+      icon_value: 'wallet',
+      opening_balance: 500,
+      include_in_total_assets: false,
+      is_active: false,
+      sort_order: 10,
+      legacy_key: null,
+      requires_review: false,
+      version: 2,
+      updated_at: '2026-08-28T01:00:00.000Z',
+      last_operation_id: 'historical-source-archive-op',
+      deleted_at: null,
+    }, {
+      user_id: OWNER_A,
+      id: 'historical-active-destination',
+      name: '現金',
+      icon_type: 'vector',
+      icon_value: 'wallet',
+      opening_balance: 0,
+      include_in_total_assets: false,
+      is_active: true,
+      sort_order: 11,
+      legacy_key: null,
+      requires_review: false,
+      version: 1,
+      updated_at: '2026-08-28T01:00:00.000Z',
+      last_operation_id: 'historical-destination-op',
+      deleted_at: null,
+    }];
+    const historicalTransferRows = [{
+      user_id: OWNER_A,
+      id: 'historical-imported-transfer',
+      amount: 250,
+      source_account_id: 'historical-archived-source',
+      source_account_name: '舊銀行名',
+      destination_account_id: 'historical-active-destination',
+      destination_account_name: '現金',
+      occurred_at: '2026-08-20 08:00',
+      note: null,
+      version: 1,
+      updated_at: '2026-08-28T01:00:00.000Z',
+      last_operation_id: 'historical-transfer-op',
+      deleted_at: null,
+    }];
+    const trustedHistoricalImport = async (
+      batchId,
+      accountRows,
+      endpointRows,
+      transferRows,
+      ownerId = OWNER_A,
+    ) => {
+      await db.exec('reset role; set role service_role');
+      try {
+        return await db.query(`
+          select entity, id, version, last_operation_id
+          from public.finance_import_historical_transfer_batch(
+            $1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb
+          )
+          order by entity, id
+        `, [
+          ownerId,
+          batchId,
+          JSON.stringify(accountRows),
+          JSON.stringify(endpointRows),
+          JSON.stringify(transferRows),
+        ]);
+      } finally {
+        await db.exec('reset role; set role authenticated');
+        await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+      }
+    };
+    await assert.rejects(
+      db.query(`
+        select * from public.finance_import_historical_transfer_batch(
+          $1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb
+        )
+      `, [
+        OWNER_A,
+        'historical-import:guest:ordinary-client',
+        JSON.stringify(historicalAccountRows),
+        JSON.stringify(historicalAccountRows),
+        JSON.stringify(historicalTransferRows),
+      ]),
+      /permission denied|42501/i,
+      'An ordinary authenticated browser must not execute the trusted import transaction',
+    );
+    const importHistorical = () => trustedHistoricalImport(
+      'historical-import:guest:migration-verifier',
+      historicalAccountRows,
+      historicalAccountRows,
+      historicalTransferRows,
+    );
+    const firstHistoricalImport = await importHistorical();
+    assert.equal(firstHistoricalImport.rows.length, 3,
+      'Historical import RPC must confirm both endpoint accounts and one transfer');
+    const importedHistoricalAccount = await one(db, `
+      select is_active, deleted_at from public.accounts
+      where user_id = $1 and id = 'historical-archived-source'
+    `, [OWNER_A]);
+    assert.equal(importedHistoricalAccount.is_active, false,
+      'Historical import must retain the endpoint archived state');
+    assert.equal(importedHistoricalAccount.deleted_at, null,
+      'Historical import must not invent a tombstone');
+    const importedHistoricalTransfer = await one(db, `
+      select source_account_id, source_account_name from public.transfers
+      where user_id = $1 and id = 'historical-imported-transfer'
+    `, [OWNER_A]);
+    assert.equal(importedHistoricalTransfer.source_account_id, 'historical-archived-source');
+    assert.equal(importedHistoricalTransfer.source_account_name, '舊銀行名',
+      'Historical import must preserve the original endpoint name snapshot');
+    const repeatedHistoricalImport = await importHistorical();
+    assert.equal(repeatedHistoricalImport.rows.length, 3,
+      'An exact historical import retry must be idempotently confirmed');
+    const historicalTransferCount = await one(db, `
+      select count(*)::integer as count from public.transfers
+      where user_id = $1 and id = 'historical-imported-transfer'
+    `, [OWNER_A]);
+    assert.equal(numeric(historicalTransferCount.count), 1,
+      'Historical import retry must not duplicate the atomic transfer row');
+
+    const softDeletedAt = '2026-08-27T01:00:00.000Z';
+    const softDeletedAccounts = historicalAccountRows.map((row, index) => ({
+      ...row,
+      id: index === 0 ? 'historical-deleted-source' : 'historical-deleted-destination',
+      name: index === 0 ? '已刪除帳戶' : '保留帳戶',
+      opening_balance: 0,
+      is_active: index !== 0,
+      version: index === 0 ? 3 : 1,
+      last_operation_id: index === 0 ? 'historical-source-delete-op' : 'historical-destination-2-op',
+      deleted_at: index === 0 ? softDeletedAt : null,
+    }));
+    const softDeletedTransfers = [{
+      ...historicalTransferRows[0],
+      id: 'historical-soft-deleted-transfer',
+      source_account_id: 'historical-deleted-source',
+      source_account_name: '刪除前舊名',
+      destination_account_id: 'historical-deleted-destination',
+      destination_account_name: '保留帳戶',
+      last_operation_id: 'historical-soft-deleted-transfer-op',
+    }];
+    await trustedHistoricalImport(
+      'historical-import:restore:soft-deleted',
+      softDeletedAccounts,
+      softDeletedAccounts,
+      softDeletedTransfers,
+    );
+    const retainedSoftDelete = await one(db, `
+      select is_active, deleted_at from public.accounts
+      where user_id = $1 and id = 'historical-deleted-source'
+    `, [OWNER_A]);
+    assert.equal(retainedSoftDelete.is_active, false);
+    assert.equal(retainedSoftDelete.deleted_at.toISOString(), softDeletedAt,
+      'Historical import must retain a safely supported endpoint tombstone');
+    const softDeletedTransferCount = await one(db, `
+      select count(*)::integer as count from public.transfers
+      where user_id = $1 and id = 'historical-soft-deleted-transfer' and deleted_at is null
+    `, [OWNER_A]);
+    assert.equal(numeric(softDeletedTransferCount.count), 1,
+      'An active historical transfer may retain a soft-deleted endpoint through the explicit RPC');
+
+    const partialFailureAccounts = historicalAccountRows.map((row, index) => ({
+      ...row,
+      id: index === 0 ? 'rolled-back-source' : 'rolled-back-destination',
+      name: index === 0 ? '回滾來源' : '回滾目的',
+      opening_balance: 0,
+      is_active: true,
+      last_operation_id: `rolled-back-account-${index}-op`,
+    }));
+    const invalidTransfer = [{
+      ...historicalTransferRows[0],
+      id: 'rolled-back-invalid-transfer',
+      source_account_id: 'rolled-back-source',
+      source_account_name: '回滾來源',
+      destination_account_id: 'rolled-back-source',
+      destination_account_name: '回滾來源',
+      last_operation_id: 'rolled-back-invalid-transfer-op',
+    }];
+    await assert.rejects(
+      trustedHistoricalImport(
+        'historical-import:restore:must-roll-back',
+        partialFailureAccounts,
+        partialFailureAccounts,
+        invalidTransfer,
+      ),
+      /distinct_accounts|check constraint/i,
+      'A transfer-stage failure must roll back earlier account writes in the same RPC',
+    );
+    const rolledBackAccountCount = await one(db, `
+      select count(*)::integer as count from public.accounts
+      where user_id = $1 and id like 'rolled-back-%'
+    `, [OWNER_A]);
+    assert.equal(numeric(rolledBackAccountCount.count), 0,
+      'A failed historical import must not leave misleading staged account rows');
+
+    const foreignManifest = historicalAccountRows.map((row) => ({ ...row, user_id: OWNER_B }));
+    await assert.rejects(
+      trustedHistoricalImport(
+        'historical-import:restore:foreign-owner',
+        foreignManifest,
+        foreignManifest,
+        historicalTransferRows.map((row) => ({ ...row, user_id: OWNER_B })),
+      ),
+      /owner mismatch|row-level security|42501/i,
+      'Historical import must reject a manifest owned by another user',
+    );
+    const rpcPrivileges = await one(db, `
+      select
+        has_function_privilege('anon',
+          'public.finance_import_historical_transfer_batch(uuid,text,jsonb,jsonb,jsonb)', 'EXECUTE') as anon_executes,
+        has_function_privilege('authenticated',
+          'public.finance_import_historical_transfer_batch(uuid,text,jsonb,jsonb,jsonb)', 'EXECUTE') as authenticated_executes,
+        has_function_privilege('service_role',
+          'public.finance_import_historical_transfer_batch(uuid,text,jsonb,jsonb,jsonb)', 'EXECUTE') as service_executes
+    `);
+    assert.equal(rpcPrivileges.anon_executes, false,
+      'Signed-out ordinary clients must not activate the historical import RPC');
+    assert.equal(rpcPrivileges.authenticated_executes, false,
+      'Ordinary signed-in browser clients must not activate the historical import RPC');
+    assert.equal(rpcPrivileges.service_executes, true,
+      'Only the trusted server role may execute the historical import transaction');
+    const importFunction = await one(db, `
+      select pg_get_functiondef(
+        'public.finance_import_historical_transfer_batch(uuid,text,jsonb,jsonb,jsonb)'::regprocedure
+      ) as definition
+    `);
+    assert.match(importFunction.definition, /order by public\.accounts\.id\s+for update/i,
+      'Historical import must lock every endpoint in deterministic order until commit');
+
+    await db.query(`
+      insert into public.transfers (
+        user_id, id, amount, source_account_id, source_account_name,
+        destination_account_id, destination_account_name, occurred_at,
+        version, updated_at, last_operation_id
+      ) values
+        ($1, 'included-to-included', 100, 'included-a', '計入 A', 'included-b', '計入 B', '2026-08-28 09:00', 1, now(), 'transfer-1-op'),
+        ($1, 'included-to-excluded', 100, 'included-a', '計入 A', 'excluded-a', '排除 A', '2026-08-28 09:01', 1, now(), 'transfer-2-op'),
+        ($1, 'excluded-to-included', 40, 'excluded-a', '排除 A', 'included-b', '計入 B', '2026-08-28 09:02', 1, now(), 'transfer-3-op'),
+        ($1, 'excluded-to-excluded', 30, 'excluded-a', '排除 A', 'excluded-b', '排除 B', '2026-08-28 09:03', 1, now(), 'transfer-4-op')
+    `, [OWNER_A]);
+
+    const transferCount = await one(db, `
+      select count(*)::integer as count from public.transfers
+      where user_id = $1 and id in (
+        'included-to-included', 'included-to-excluded',
+        'excluded-to-included', 'excluded-to-excluded'
+      )
+    `, [OWNER_A]);
+    assert.equal(numeric(transferCount.count), 4, 'Each transfer must persist as one atomic row');
+
+    await assert.rejects(
+      db.query(`
+        insert into public.transfers (
+          user_id, id, amount, source_account_id, source_account_name,
+          destination_account_id, destination_account_name, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'same-account', 1, 'included-a', '計入 A', 'included-a', '計入 A',
+          '2026-08-28 10:00', 1, now(), 'same-account-op')
+      `, [OWNER_A]),
+      /distinct_accounts|check constraint/i,
+      'A transfer must not target the same account',
+    );
+
+    await db.query(`
+      insert into public.goals (
+        user_id, id, name, target_amount, current_amount, unit, is_active,
+        version, updated_at, last_operation_id
+      ) values ($1, 'transfer-capacity-goal', '轉帳容量', 5000, 0, '元', true,
+        1, now(), 'transfer-capacity-goal-op')
+    `, [OWNER_A]);
+    await db.query(`
+      insert into public.savings_allocations (
+        user_id, id, goal_id, amount_delta, occurred_at,
+        version, updated_at, last_operation_id
+      ) values ($1, 'transfer-capacity-fit', 'transfer-capacity-goal', 1940,
+        '2026-08-28', 1, now(), 'transfer-capacity-fit-op')
+    `, [OWNER_A]);
+    await assert.rejects(
+      db.query(`
+        insert into public.savings_allocations (
+          user_id, id, goal_id, amount_delta, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'transfer-capacity-over', 'transfer-capacity-goal', 0.01,
+          '2026-08-28', 1, now(), 'transfer-capacity-over-op')
+      `, [OWNER_A]),
+      /allocation_capacity|exceeds available assets/i,
+      'Allocation capacity must include transfer net effects across the total-assets boundary',
+    );
+
+    await db.query(`
+      update public.accounts
+      set is_active = false, version = 2, last_operation_id = 'archive-excluded-b-op'
+      where user_id = $1 and id = 'excluded-b'
+    `, [OWNER_A]);
+    await db.query(`
+      update public.transfers
+      set note = '歷史端點仍可修改', version = 2, last_operation_id = 'transfer-4-edit-op'
+      where user_id = $1 and id = 'excluded-to-excluded'
+    `, [OWNER_A]);
+    const staleRetarget = await one(db, `
+      insert into public.transfers (
+        user_id, id, amount, source_account_id, source_account_name,
+        destination_account_id, destination_account_name, occurred_at, note,
+        version, updated_at, last_operation_id
+      ) values ($1, 'excluded-to-excluded', 999, 'included-a', '計入 A',
+        'excluded-b', '排除 B', '2026-08-28 10:00', '較舊重試', 1, now(), 'older-transfer-op')
+      on conflict (user_id, id) do update set
+        amount = excluded.amount,
+        source_account_id = excluded.source_account_id,
+        source_account_name = excluded.source_account_name,
+        destination_account_id = excluded.destination_account_id,
+        destination_account_name = excluded.destination_account_name,
+        occurred_at = excluded.occurred_at,
+        note = excluded.note,
+        version = excluded.version,
+        updated_at = excluded.updated_at,
+        last_operation_id = excluded.last_operation_id
+      returning source_account_id, destination_account_id, note, version, last_operation_id
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        source: staleRetarget.source_account_id,
+        destination: staleRetarget.destination_account_id,
+        note: staleRetarget.note,
+        version: numeric(staleRetarget.version),
+        operation: staleRetarget.last_operation_id,
+      },
+      {
+        source: 'excluded-a',
+        destination: 'excluded-b',
+        note: '歷史端點仍可修改',
+        version: 2,
+        operation: 'transfer-4-edit-op',
+      },
+      'A stale retarget retry must preserve the newer transfer before account availability checks',
+    );
+    const partialHistoricalRetarget = await one(db, `
+      update public.transfers
+      set source_account_id = 'included-a', source_account_name = '計入 A',
+        version = 3, last_operation_id = 'transfer-4-retarget-source-op'
+      where user_id = $1 and id = 'excluded-to-excluded'
+      returning source_account_id, destination_account_id, destination_account_name, version
+    `, [OWNER_A]);
+    assert.deepEqual(
+      {
+        source: partialHistoricalRetarget.source_account_id,
+        destination: partialHistoricalRetarget.destination_account_id,
+        destinationName: partialHistoricalRetarget.destination_account_name,
+        version: numeric(partialHistoricalRetarget.version),
+      },
+      {
+        source: 'included-a',
+        destination: 'excluded-b',
+        destinationName: '排除 B',
+        version: 3,
+      },
+      'Changing one endpoint must retain the other historical snapshot even after that account is archived',
+    );
+    await assert.rejects(
+      db.query(`
+        insert into public.transfers (
+          user_id, id, amount, source_account_id, source_account_name,
+          destination_account_id, destination_account_name, occurred_at,
+          version, updated_at, last_operation_id
+        ) values ($1, 'new-to-archived', 1, 'included-a', '計入 A', 'excluded-b', '排除 B',
+          '2026-08-28 10:01', 1, now(), 'new-to-archived-op')
+      `, [OWNER_A]),
+      /destination account must be active|transfer_active_destination/i,
+      'New transfers must not target an archived account',
+    );
+    await assert.rejects(
+      db.query(`
+        update public.transfers
+        set destination_account_id = 'excluded-b',
+          destination_account_name = '排除 B',
+          version = 2,
+          last_operation_id = 'retarget-to-archived-op'
+        where user_id = $1 and id = 'included-to-included'
+      `, [OWNER_A]),
+      /destination account must be active|transfer_active_destination/i,
+      'Ordinary retargeting must not select an archived account',
+    );
+    await assert.rejects(
+      db.query(`
+        update public.transfers
+        set note = 'divergent same clock'
+        where user_id = $1 and id = 'included-to-included'
+      `, [OWNER_A]),
+      /conflicting payload|40001/i,
+      'A divergent same-clock transfer payload must fail closed',
+    );
+
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
+    const foreignCount = await one(db, `select count(*)::integer as count from public.transfers`);
+    assert.equal(numeric(foreignCount.count), 0, 'Transfer RLS must isolate owners');
+  } finally {
+    await db.exec('reset role');
+    await db.close();
+  }
+}
+
 await verifyFreshAndRetry();
 console.log('[pass] fresh schema and retry-safe DDL');
 console.log('[pass] future public objects require explicit grants');
@@ -2403,4 +2832,6 @@ console.log('[pass] legacy negative goal delete tombstones allocations atomicall
 
 await verifyServerResourceAbuseGuards();
 console.log('[pass] server-side text, numeric, and RLS-complete per-owner resource abuse guards');
+await verifyAtomicTransfers();
+console.log('[pass] atomic transfer constraints, RLS, sync clock, and allocation capacity');
 console.log('Supabase migration verification passed without an external database.');
