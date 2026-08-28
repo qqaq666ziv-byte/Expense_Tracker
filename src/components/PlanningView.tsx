@@ -43,7 +43,7 @@ import {
   shortDate,
   toLocalInput,
 } from "../app/format";
-import { completeAppliedMutation } from "../app/mutationResult";
+import { completeAppliedMutation, type MutationApplication } from "../app/mutationResult";
 import { resolveExplicitSelection } from "../app/explicitSelection";
 import { useCalendarReference } from "../app/useCalendarReference";
 import { RecurringPanel } from "./SettingsView";
@@ -52,14 +52,14 @@ import { MoneyInput } from "./MoneyInput";
 interface PlanningViewProps {
   data: FinanceData;
   ownerId: string;
-  putGoal(record: SavingsGoal): boolean;
-  putAllocation(record: SavingsAllocation): boolean;
-  putBudget(record: Budget): boolean;
-  putRecurring(record: RecurringRule): boolean;
-  deleteRecurring(record: RecurringRule): boolean;
-  archiveGoal(record: SavingsGoal): boolean;
-  releaseGoalAllocations?(record: SavingsGoal): boolean;
-  archiveBudget(record: Budget): boolean;
+  putGoal(record: SavingsGoal): MutationApplication;
+  putAllocation(record: SavingsAllocation): MutationApplication;
+  putBudget(record: Budget): MutationApplication;
+  putRecurring(record: RecurringRule): MutationApplication;
+  deleteRecurring(record: RecurringRule): MutationApplication;
+  archiveGoal(record: SavingsGoal): MutationApplication;
+  releaseGoalAllocations?(record: SavingsGoal): MutationApplication;
+  archiveBudget(record: Budget): MutationApplication;
   unresolvedSyncRecordKeys?: ReadonlySet<string>;
 }
 

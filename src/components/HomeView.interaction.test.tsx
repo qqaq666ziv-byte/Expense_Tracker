@@ -298,6 +298,28 @@ describe('HomeView transfer interactions', () => {
   });
 });
 
+describe('HomeView durable mutation feedback', () => {
+  it('keeps the financial form intact and never reports success when durable persistence fails', async () => {
+    const user = userEvent.setup();
+    const data = createInitialState('guest').data;
+    const put = vi.fn(() => Promise.resolve(false));
+    render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+    const amount = screen.getByRole('textbox', { name: '金額' });
+    const note = screen.getByRole('textbox', { name: '備註' });
+    await user.type(amount, '88');
+    await user.type(note, 'durability failure draft');
+    await user.click(screen.getByRole('button', { name: '餐飲' }));
+    await user.click(screen.getByRole('button', { name: '現金' }));
+
+    await user.click(screen.getByRole('button', { name: '記下這筆支出' }));
+
+    expect(await screen.findByText(/操作未執行/)).toBeInTheDocument();
+    expect(amount).toHaveValue('88');
+    expect(note).toHaveValue('durability failure draft');
+    expect(screen.queryByText(/已記下.*88/)).not.toBeInTheDocument();
+  });
+});
+
 describe('HomeView smart quick entry interactions', () => {
   it('discards every owner-derived entry state before another owner can observe or save it', async () => {
     const user = userEvent.setup();

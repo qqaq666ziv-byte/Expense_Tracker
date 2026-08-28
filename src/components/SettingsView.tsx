@@ -37,7 +37,7 @@ import { nextDisplayOrder, sortByDisplayOrder } from "../domain/displayOrder";
 import { stableLegacyId } from "../domain/legacyMigration";
 import { changedRecordMeta, newRecordMeta } from "../app/state";
 import { localDate, money, parseRequiredNumberInput } from "../app/format";
-import { completeAppliedMutation } from "../app/mutationResult";
+import { completeAppliedMutation, type MutationApplication } from "../app/mutationResult";
 import { resolveExplicitSelection } from "../app/explicitSelection";
 import { FinanceIcon, IconPicker } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
@@ -53,11 +53,11 @@ import {
 interface SettingsViewProps {
   data: FinanceData;
   ownerId: string;
-  putCategory(record: Category): boolean;
-  putRecurring(record: RecurringRule): boolean;
-  categoryLifecycle(record: Category, action: CategoryAction): boolean;
-  deleteRecurring(record: RecurringRule): boolean;
-  restore(data: FinanceData): void;
+  putCategory(record: Category): MutationApplication;
+  putRecurring(record: RecurringRule): MutationApplication;
+  categoryLifecycle(record: Category, action: CategoryAction): MutationApplication;
+  deleteRecurring(record: RecurringRule): MutationApplication;
+  restore(data: FinanceData): void | Promise<void>;
   unresolvedSyncRecordKeys?: ReadonlySet<string>;
 }
 
@@ -359,8 +359,8 @@ function CategoriesPanel({
 export interface RecurringPanelProps {
   data: FinanceData;
   ownerId: string;
-  putRecurring(record: RecurringRule): boolean;
-  deleteRecurring(record: RecurringRule): boolean;
+  putRecurring(record: RecurringRule): MutationApplication;
+  deleteRecurring(record: RecurringRule): MutationApplication;
   unresolvedSyncRecordKeys?: ReadonlySet<string>;
 }
 
@@ -911,14 +911,14 @@ function BackupPanel({ data, ownerId, restore }: SettingsViewProps) {
       );
     }
   };
-  const runRestore = () => {
+  const runRestore = async () => {
     try {
       const restored = restoreFinanceBackup(data, input, {
         mode,
         confirmReplace: mode === "replace" && confirmText === "REPLACE",
         ownerId,
       });
-      restore(restored);
+      await restore(restored);
       setSuccess(`還原完成（${mode === "merge" ? "安全合併" : "明確取代"}）`);
     } catch (error) {
       setFailure(

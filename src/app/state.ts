@@ -2,12 +2,17 @@ import type {
   FinanceData,
   FinanceEntityName,
   AssetAccount,
+  BalanceAdjustment,
+  Budget,
   Category,
   OwnerId,
   PendingOperation,
   PersistedFinanceState,
   SavingsAllocation,
+  RecurringRule,
   SyncRecord,
+  Transaction,
+  Transfer,
 } from '../domain/model';
 import { activeOperationId, enqueueSyncRecord } from '../domain/syncEngine';
 import { migrateLegacyData, stableLegacyId } from '../domain/legacyMigration';
@@ -18,6 +23,9 @@ import {
   assertFinanceOwnerRowLimit,
   assertFinanceRecordWithinWriteLimits,
 } from '../domain/resourceLimits';
+import { calculateFinancials } from '../domain/financeEngine';
+import { compareMoney, subtractMoney } from '../domain/money';
+import { recurringRuleParentIssue } from '../domain/recurringSafety';
 
 export const LOCAL_STATE_PREFIX = 'shiba-finance:v3:';
 
@@ -429,7 +437,7 @@ function readLegacyArray(storage: Pick<Storage, 'getItem'>, key: string): unknow
   return value;
 }
 
-function legacyStorageKeys(ownerId: OwnerId): string[] {
+export function legacyStorageKeys(ownerId: OwnerId): string[] {
   const prefix = ownerId === 'guest' ? 'guest_' : 'user_';
   const suffix = ownerId === 'guest' ? '' : `_${ownerId}`;
   const keys = ['transactions', 'goals', 'subscriptions', 'budgets']
@@ -598,6 +606,181 @@ export function putRecord<E extends FinanceEntityName>(
     ...state,
     data: { ...state.data, [entity]: nextRecords },
   };
+}
+
+/**
+ * Recheck a caller-built record against the latest durable owner snapshot.
+ * Separate browsing contexts can render the same version; only the first
+ * commit may advance it, and an active edit must never resurrect a tombstone.
+ */
+export function assertFreshLocalRecordMutation<E extends FinanceEntityName>(
+  state: PersistedFinanceState,
+  entity: E,
+  record: FinanceData[E][number],
+): void {
+  if (record.ownerId !== state.ownerId) throw new Error('拒絕寫入其他使用者的資料');
+  const current = (state.data[entity] as FinanceData[E][number][])
+    .find((candidate) => candidate.id === record.id);
+  if (!current) {
+    if (record.version !== 1) {
+      throw new Error('找不到本次修改所依據的最新資料；本次寫入未執行。');
+    }
+    return;
+  }
+  if (JSON.stringify(current) === JSON.stringify(record)) return;
+  if (current.deletedAt && !record.deletedAt) {
+    throw new Error('資料已在其他分頁刪除；本次舊版本修改未執行。');
+  }
+  if (record.version !== current.version + 1) {
+    throw new Error('資料已在其他分頁更新；本次舊版本修改未執行。');
+  }
+}
+
+function assertAvailableAccount(
+  state: PersistedFinanceState,
+  accountId: string,
+  requireActive: boolean,
+  label: string,
+): AssetAccount {
+  const account = state.data.accounts.find((candidate) => candidate.id === accountId);
+  if (!account || account.ownerId !== state.ownerId || account.deletedAt
+    || (requireActive && !account.isActive)) {
+    throw new Error(`${label}已在其他分頁封存、刪除或變成不可用；本次寫入未執行。`);
+  }
+  return account;
+}
+
+function assertAvailableCategory(
+  state: PersistedFinanceState,
+  categoryId: string,
+  requireActive: boolean,
+  label: string,
+): Category {
+  const category = state.data.categories.find((candidate) => candidate.id === categoryId);
+  if (!category || category.ownerId !== state.ownerId || category.deletedAt
+    || (requireActive && !category.isActive)) {
+    throw new Error(`${label}已在其他分頁封存、刪除或變成不可用；本次寫入未執行。`);
+  }
+  return category;
+}
+
+/** Revalidate cross-record choices against the latest durable snapshot. */
+export function assertLatestMutationDependencies<E extends FinanceEntityName>(
+  state: PersistedFinanceState,
+  entity: E,
+  record: FinanceData[E][number],
+): void {
+  const existing = (state.data[entity] as FinanceData[E][number][])
+    .find((candidate) => candidate.id === record.id);
+  if (record.deletedAt) return;
+  if (entity === 'transactions') {
+    const value = record as Transaction;
+    const previous = existing as Transaction | undefined;
+    const category = assertAvailableCategory(
+      state,
+      value.categoryId,
+      !previous || previous.categoryId !== value.categoryId,
+      '交易分類',
+    );
+    if (category.kind !== value.type) throw new Error('交易分類的收支類型已不相符；本次寫入未執行。');
+    assertAvailableAccount(
+      state,
+      value.accountId,
+      !previous || previous.accountId !== value.accountId,
+      '交易帳戶',
+    );
+  } else if (entity === 'transfers') {
+    const value = record as Transfer;
+    const previous = existing as Transfer | undefined;
+    assertAvailableAccount(
+      state,
+      value.sourceAccountId,
+      !previous || previous.sourceAccountId !== value.sourceAccountId,
+      '轉帳來源帳戶',
+    );
+    assertAvailableAccount(
+      state,
+      value.destinationAccountId,
+      !previous || previous.destinationAccountId !== value.destinationAccountId,
+      '轉帳目的帳戶',
+    );
+  } else if (entity === 'adjustments') {
+    const value = record as BalanceAdjustment;
+    const previous = existing as BalanceAdjustment | undefined;
+    assertAvailableAccount(
+      state,
+      value.accountId,
+      !previous || previous.accountId !== value.accountId,
+      '餘額調整帳戶',
+    );
+  } else if (entity === 'allocations') {
+    const value = record as SavingsAllocation;
+    const previous = existing as SavingsAllocation | undefined;
+    const goal = state.data.goals.find((candidate) => candidate.id === value.goalId);
+    const requiresActiveGoal = !previous || previous.goalId !== value.goalId;
+    if (!goal || goal.ownerId !== state.ownerId || goal.deletedAt
+      || (requiresActiveGoal && !goal.isActive)) {
+      throw new Error('儲蓄目標已在其他分頁封存、刪除或變成不可用；本次寫入未執行。');
+    }
+    const additionalAmount = subtractMoney(value.amountDelta, previous?.amountDelta ?? 0);
+    if (compareMoney(additionalAmount, 0) > 0
+      && compareMoney(additionalAmount, calculateFinancials(state.data).availableAssets) > 0) {
+      throw new Error('可配置資產已被其他分頁使用；本次配置未建立。');
+    }
+  } else if (entity === 'budgets') {
+    const value = record as Budget;
+    const previous = existing as Budget | undefined;
+    if (value.scope === 'category' && value.categoryId) {
+      assertAvailableCategory(
+        state,
+        value.categoryId,
+        !previous || previous.categoryId !== value.categoryId,
+        '預算分類',
+      );
+    }
+  } else if (entity === 'recurringRules') {
+    const value = record as RecurringRule;
+    if (value.isActive) {
+      const issue = recurringRuleParentIssue(state.data, value);
+      if (issue) throw new Error(`週期規則的帳戶或分類已不可用：${issue}`);
+    }
+  }
+}
+
+/** A restore preview must not be applied to a durable state it never showed. */
+export function assertRestoreBaseUnchanged(
+  previewBase: PersistedFinanceState,
+  latest: PersistedFinanceState,
+): void {
+  if (previewBase.ownerId !== latest.ownerId || JSON.stringify(previewBase) !== JSON.stringify(latest)) {
+    throw new Error('帳本已在其他分頁變更；本次還原未執行，請重新載入並再次預覽。');
+  }
+}
+
+/** Destructive actions must apply to the exact record snapshot the user saw. */
+export function assertMutationBaseUnchanged<T extends SyncRecord>(
+  expected: T,
+  latest: T | undefined,
+  label = '資料',
+): void {
+  if (!latest || expected.ownerId !== latest.ownerId
+    || JSON.stringify(expected) !== JSON.stringify(latest)) {
+    throw new Error(`${label}已在其他分頁變更；本次操作未執行，請重新載入後再試。`);
+  }
+}
+
+/** Compare a destructive action's complete dependent set, not only its root id. */
+export function assertMutationSetUnchanged<T extends SyncRecord>(
+  expected: readonly T[],
+  latest: readonly T[],
+  label: string,
+): void {
+  const normalized = (records: readonly T[]) => [...records]
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .map((record) => JSON.stringify(record));
+  if (JSON.stringify(normalized(expected)) !== JSON.stringify(normalized(latest))) {
+    throw new Error(`${label}已在其他分頁變更；本次操作未執行，請重新載入後再試。`);
+  }
 }
 
 export interface GuestImportConflict {

@@ -20,7 +20,7 @@ import {
   toLocalInput,
 } from "../app/format";
 import { subtractMoney } from "../domain/money";
-import { completeAppliedMutation } from "../app/mutationResult";
+import { completeAppliedMutation, type MutationApplication } from "../app/mutationResult";
 import { isFinancialTransaction } from "../domain/tutorialRecord";
 import { FinanceIcon, IconPicker } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
@@ -33,9 +33,9 @@ import {
 interface AssetsViewProps {
   data: FinanceData;
   ownerId: string;
-  putAccount(record: AssetAccount): boolean;
-  putAdjustment(record: BalanceAdjustment): boolean;
-  archiveAccount(record: AssetAccount): boolean;
+  putAccount(record: AssetAccount): MutationApplication;
+  putAdjustment(record: BalanceAdjustment): MutationApplication;
+  archiveAccount(record: AssetAccount): MutationApplication;
   unresolvedSyncRecordKeys?: ReadonlySet<string>;
 }
 
