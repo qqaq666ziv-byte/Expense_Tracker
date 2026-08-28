@@ -423,7 +423,7 @@ describe('offline sync engine', () => {
       ...transfer('historical-import', 'user-a', 1, 'transfer-import'),
       sourceAccountName: '舊銀行名',
     };
-    const batchId = 'historical-import:guest-1';
+    const batchId = 'historical-import:guest:1';
     const withBatch = (pending: PendingOperation) => ({
       ...pending,
       historicalImportBatchId: batchId,

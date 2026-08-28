@@ -833,7 +833,37 @@ describe('owner-scoped local state', () => {
 
     expect(accountAndTransferOperations.some((operation) => operation.entity === 'transfers')).toBe(true);
     expect(importBatchIds.size).toBe(1);
-    expect([...importBatchIds][0]).toMatch(/^historical-import:/);
+    expect([...importBatchIds][0]).toMatch(/^historical-import:guest:/);
+  });
+
+  it('marks authenticated backup transfer restores as an explicit restore server batch', () => {
+    const current = readyAuthenticatedState();
+    current.outbox = [];
+    const restored = structuredClone(current.data);
+    const destination = {
+      ...restored.accounts[0],
+      id: 'restored-cash',
+      name: '現金備用',
+      lastOperationId: 'restored-cash-op',
+    };
+    restored.accounts.push(destination);
+    restored.transfers.push({
+      ...newRecordForTest('restored-history-transfer', 'user-a'),
+      amount: 250,
+      sourceAccountId: restored.accounts[0].id,
+      sourceAccountName: restored.accounts[0].name,
+      destinationAccountId: destination.id,
+      destinationAccountName: destination.name,
+      occurredAt: '2026-08-20 08:00',
+    });
+
+    const result = applyRestoredData(current, restored);
+    const batchIds = new Set(result.outbox
+      .filter((operation) => operation.entity === 'accounts' || operation.entity === 'transfers')
+      .map((operation) => operation.historicalImportBatchId));
+
+    expect(batchIds.size).toBe(1);
+    expect([...batchIds][0]).toMatch(/^historical-import:restore:/);
   });
 
   it('never remembers a guest import when its owner snapshot could not be persisted', () => {

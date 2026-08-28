@@ -150,13 +150,14 @@ begin
     return new;
   end if;
 
-  -- The dedicated import RPC validates and commits the complete owner-scoped
-  -- endpoint manifest and transfer rows in this same database transaction. A
-  -- regular PostgREST table UPSERT cannot set this transaction-local context.
-  -- Existing transfer updates still use the normal historical/retarget rules.
+  -- The service-role-only import RPC validates and commits the complete
+  -- owner-scoped endpoint manifest and transfer rows in this same database
+  -- transaction. Browser roles cannot execute that RPC or activate this
+  -- transaction-local context through an ordinary table write. Existing
+  -- transfer updates still use the normal historical/retarget rules.
   if not has_existing and historical_import_batch like 'historical-import:%' then
-    if auth.uid() is null or new.user_id is distinct from auth.uid() then
-      raise exception 'historical transfer import owner mismatch'
+    if current_user <> 'service_role' then
+      raise exception 'historical transfer import requires trusted server authorization'
         using errcode = '42501';
     end if;
     select * into source_account
@@ -222,12 +223,15 @@ create trigger finance_v3_20_validate_transfer_accounts
 before insert or update on public.transfers
 for each row execute function finance_private.validate_transfer_accounts();
 
--- Explicit import/restore path for first-class historical transfers. The
--- function is SECURITY INVOKER, so the caller's owner RLS remains in force.
--- It accepts a full endpoint manifest rather than an import boolean, verifies
--- every persisted account/clock, and then applies transfers in the same SQL
--- transaction. Any rejection rolls back both account and transfer stages.
+-- Trusted import/restore transaction for first-class historical transfers.
+-- Browser roles cannot execute it. The verified Edge Function derives the
+-- owner from the caller's JWT and invokes this function with service_role. The
+-- function accepts a full endpoint manifest rather than an import boolean,
+-- locks and verifies every persisted account/clock, and applies transfers in
+-- the same SQL transaction. Any rejection rolls back all stages.
+drop function if exists public.finance_import_historical_transfer_batch(text, jsonb, jsonb, jsonb);
 create or replace function public.finance_import_historical_transfer_batch(
+  p_owner_id uuid,
   p_batch_id text,
   p_account_operations jsonb,
   p_endpoint_accounts jsonb,
@@ -240,7 +244,7 @@ set search_path = pg_catalog
 as $function$
 #variable_conflict use_column
 declare
-  caller_id uuid := auth.uid();
+  caller_id uuid := p_owner_id;
   account_payload jsonb;
   transfer_payload jsonb;
   persisted_account public.accounts%rowtype;
@@ -249,12 +253,13 @@ declare
   payload_owner uuid;
   payload_id text;
 begin
-  if caller_id is null then
-    raise exception 'historical transfer import requires authentication'
+  if current_user <> 'service_role' or caller_id is null then
+    raise exception 'historical transfer import requires trusted server authorization'
       using errcode = '42501';
   end if;
   if p_batch_id is null
-    or p_batch_id not like 'historical-import:%'
+    or (p_batch_id not like 'historical-import:guest:%'
+      and p_batch_id not like 'historical-import:restore:%')
     or pg_catalog.octet_length(p_batch_id) > 512
   then
     raise exception 'invalid historical transfer import batch id'
@@ -364,6 +369,21 @@ begin
         using errcode = '22023';
     end if;
     endpoint_ids := pg_catalog.array_append(endpoint_ids, payload_id);
+  end loop;
+
+  -- Lock every endpoint in one deterministic order and retain those locks
+  -- until the transfer stage commits. Concurrent ordinary account writes must
+  -- therefore finish before manifest validation or wait until this batch ends.
+  perform 1
+  from public.accounts
+  where user_id = caller_id and public.accounts.id = any(endpoint_ids)
+  order by public.accounts.id
+  for update;
+
+  for account_payload in
+    select value from pg_catalog.jsonb_array_elements(p_endpoint_accounts)
+  loop
+    payload_id := account_payload ->> 'id';
     select * into persisted_account
     from public.accounts
     where user_id = caller_id and public.accounts.id = payload_id;
@@ -466,10 +486,10 @@ begin
 end
 $function$;
 
-revoke all on function public.finance_import_historical_transfer_batch(text, jsonb, jsonb, jsonb)
-  from public, anon, authenticated;
-grant execute on function public.finance_import_historical_transfer_batch(text, jsonb, jsonb, jsonb)
-  to authenticated;
+revoke all on function public.finance_import_historical_transfer_batch(uuid, text, jsonb, jsonb, jsonb)
+  from public, anon, authenticated, service_role;
+grant execute on function public.finance_import_historical_transfer_batch(uuid, text, jsonb, jsonb, jsonb)
+  to service_role;
 
 drop trigger if exists finance_v3_conflict_clock on public.transfers;
 create trigger finance_v3_conflict_clock

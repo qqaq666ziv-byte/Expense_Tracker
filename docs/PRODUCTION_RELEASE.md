@@ -176,6 +176,17 @@ invalid, or conflicting before changing the guard.
 Do not bulk rewrite, delete, reassign, or merge real financial records without
 an explicit migration/recovery rule and appropriate authorization.
 
+The transfer release has one server artifact in addition to the additive
+migration: `supabase/functions/finance-import-historical-transfer-batch`. Its
+public handler verifies the Supabase user JWT and complete owner-scoped
+import/restore manifest, then uses the server-only service role to enter the
+single atomic database transaction. `anon` and ordinary `authenticated` roles
+must have no `EXECUTE` privilege on that RPC. On isolated staging, deploy and
+smoke the reviewed Edge Function together with the migration, verify the role
+grants and endpoint row locks, and only then enable the matching frontend.
+Production migration/function deployment remains a separately authorized
+operation; never copy a service-role credential into Vercel or browser code.
+
 ---
 
 ## Rollback

@@ -2455,18 +2455,54 @@ async function verifyAtomicTransfers() {
       last_operation_id: 'historical-transfer-op',
       deleted_at: null,
     }];
-    const importHistorical = () => db.query(`
-      select entity, id, version, last_operation_id
-      from public.finance_import_historical_transfer_batch(
-        $1, $2::jsonb, $3::jsonb, $4::jsonb
-      )
-      order by entity, id
-    `, [
-      'historical-import:migration-verifier',
-      JSON.stringify(historicalAccountRows),
-      JSON.stringify(historicalAccountRows),
-      JSON.stringify(historicalTransferRows),
-    ]);
+    const trustedHistoricalImport = async (
+      batchId,
+      accountRows,
+      endpointRows,
+      transferRows,
+      ownerId = OWNER_A,
+    ) => {
+      await db.exec('reset role; set role service_role');
+      try {
+        return await db.query(`
+          select entity, id, version, last_operation_id
+          from public.finance_import_historical_transfer_batch(
+            $1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb
+          )
+          order by entity, id
+        `, [
+          ownerId,
+          batchId,
+          JSON.stringify(accountRows),
+          JSON.stringify(endpointRows),
+          JSON.stringify(transferRows),
+        ]);
+      } finally {
+        await db.exec('reset role; set role authenticated');
+        await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+      }
+    };
+    await assert.rejects(
+      db.query(`
+        select * from public.finance_import_historical_transfer_batch(
+          $1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb
+        )
+      `, [
+        OWNER_A,
+        'historical-import:guest:ordinary-client',
+        JSON.stringify(historicalAccountRows),
+        JSON.stringify(historicalAccountRows),
+        JSON.stringify(historicalTransferRows),
+      ]),
+      /permission denied|42501/i,
+      'An ordinary authenticated browser must not execute the trusted import transaction',
+    );
+    const importHistorical = () => trustedHistoricalImport(
+      'historical-import:guest:migration-verifier',
+      historicalAccountRows,
+      historicalAccountRows,
+      historicalTransferRows,
+    );
     const firstHistoricalImport = await importHistorical();
     assert.equal(firstHistoricalImport.rows.length, 3,
       'Historical import RPC must confirm both endpoint accounts and one transfer');
@@ -2515,16 +2551,12 @@ async function verifyAtomicTransfers() {
       destination_account_name: '保留帳戶',
       last_operation_id: 'historical-soft-deleted-transfer-op',
     }];
-    await db.query(`
-      select * from public.finance_import_historical_transfer_batch(
-        $1, $2::jsonb, $3::jsonb, $4::jsonb
-      )
-    `, [
-      'historical-import:soft-deleted',
-      JSON.stringify(softDeletedAccounts),
-      JSON.stringify(softDeletedAccounts),
-      JSON.stringify(softDeletedTransfers),
-    ]);
+    await trustedHistoricalImport(
+      'historical-import:restore:soft-deleted',
+      softDeletedAccounts,
+      softDeletedAccounts,
+      softDeletedTransfers,
+    );
     const retainedSoftDelete = await one(db, `
       select is_active, deleted_at from public.accounts
       where user_id = $1 and id = 'historical-deleted-source'
@@ -2557,16 +2589,12 @@ async function verifyAtomicTransfers() {
       last_operation_id: 'rolled-back-invalid-transfer-op',
     }];
     await assert.rejects(
-      db.query(`
-        select * from public.finance_import_historical_transfer_batch(
-          $1, $2::jsonb, $3::jsonb, $4::jsonb
-        )
-      `, [
-        'historical-import:must-roll-back',
-        JSON.stringify(partialFailureAccounts),
-        JSON.stringify(partialFailureAccounts),
-        JSON.stringify(invalidTransfer),
-      ]),
+      trustedHistoricalImport(
+        'historical-import:restore:must-roll-back',
+        partialFailureAccounts,
+        partialFailureAccounts,
+        invalidTransfer,
+      ),
       /distinct_accounts|check constraint/i,
       'A transfer-stage failure must roll back earlier account writes in the same RPC',
     );
@@ -2579,30 +2607,37 @@ async function verifyAtomicTransfers() {
 
     const foreignManifest = historicalAccountRows.map((row) => ({ ...row, user_id: OWNER_B }));
     await assert.rejects(
-      db.query(`
-        select * from public.finance_import_historical_transfer_batch(
-          $1, $2::jsonb, $3::jsonb, $4::jsonb
-        )
-      `, [
-        'historical-import:foreign-owner',
-        JSON.stringify(foreignManifest),
-        JSON.stringify(foreignManifest),
-        JSON.stringify(historicalTransferRows.map((row) => ({ ...row, user_id: OWNER_B }))),
-      ]),
+      trustedHistoricalImport(
+        'historical-import:restore:foreign-owner',
+        foreignManifest,
+        foreignManifest,
+        historicalTransferRows.map((row) => ({ ...row, user_id: OWNER_B })),
+      ),
       /owner mismatch|row-level security|42501/i,
       'Historical import must reject a manifest owned by another user',
     );
     const rpcPrivileges = await one(db, `
       select
         has_function_privilege('anon',
-          'public.finance_import_historical_transfer_batch(text,jsonb,jsonb,jsonb)', 'EXECUTE') as anon_executes,
+          'public.finance_import_historical_transfer_batch(uuid,text,jsonb,jsonb,jsonb)', 'EXECUTE') as anon_executes,
         has_function_privilege('authenticated',
-          'public.finance_import_historical_transfer_batch(text,jsonb,jsonb,jsonb)', 'EXECUTE') as authenticated_executes
+          'public.finance_import_historical_transfer_batch(uuid,text,jsonb,jsonb,jsonb)', 'EXECUTE') as authenticated_executes,
+        has_function_privilege('service_role',
+          'public.finance_import_historical_transfer_batch(uuid,text,jsonb,jsonb,jsonb)', 'EXECUTE') as service_executes
     `);
     assert.equal(rpcPrivileges.anon_executes, false,
       'Signed-out ordinary clients must not activate the historical import RPC');
-    assert.equal(rpcPrivileges.authenticated_executes, true,
-      'Authenticated owners may use the explicit import/restore RPC');
+    assert.equal(rpcPrivileges.authenticated_executes, false,
+      'Ordinary signed-in browser clients must not activate the historical import RPC');
+    assert.equal(rpcPrivileges.service_executes, true,
+      'Only the trusted server role may execute the historical import transaction');
+    const importFunction = await one(db, `
+      select pg_get_functiondef(
+        'public.finance_import_historical_transfer_batch(uuid,text,jsonb,jsonb,jsonb)'::regprocedure
+      ) as definition
+    `);
+    assert.match(importFunction.definition, /order by public\.accounts\.id\s+for update/i,
+      'Historical import must lock every endpoint in deterministic order until commit');
 
     await db.query(`
       insert into public.transfers (

@@ -830,7 +830,12 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
 
     async applyHistoricalImportBatch(ownerId, batch: HistoricalImportBatch) {
       await assertAuthenticatedOwner(client, ownerId);
-      if (!batch.id.startsWith('historical-import:') || batch.operations.length === 0) {
+      const intent = batch.id.startsWith('historical-import:guest:')
+        ? 'guest-import'
+        : batch.id.startsWith('historical-import:restore:')
+          ? 'backup-restore'
+          : undefined;
+      if (!intent || batch.operations.length === 0) {
         throw new Error('Historical import batch requires an explicit non-empty import id');
       }
       const operationKeys = new Set<string>();
@@ -864,25 +869,31 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
         .map((operation) => encodeRecord('transfers', operation.record));
       const endpointAccounts = [...endpointById.values()]
         .map((endpoint) => encodeRecord('accounts', endpoint));
-      const { data, error } = await client.rpc(
-        'finance_import_historical_transfer_batch' as never,
+      // The browser cannot execute the privileged database RPC. The verified
+      // Edge Function is the only public import/restore entry point and calls
+      // the service-role-only transaction after revalidating this manifest.
+      const { data, error } = await client.functions.invoke(
+        'finance-import-historical-transfer-batch',
         {
-          p_batch_id: batch.id,
-          p_account_operations: accountOperations,
-          p_endpoint_accounts: endpointAccounts,
-          p_transfer_operations: transferOperations,
-        } as never,
+          body: {
+            intent,
+            batch_id: batch.id,
+            account_operations: accountOperations,
+            endpoint_accounts: endpointAccounts,
+            transfer_operations: transferOperations,
+          },
+        },
       ) as unknown as {
         data: unknown;
         error: null | { code?: string; message?: string };
       };
       if (error) {
         throw new Error(
-          `Unable to apply historical transfer import batch: ${error.code ?? 'unknown'}: ${error.message ?? 'unknown error'}`,
+          `Unable to apply authorized historical transfer import batch: ${error.code ?? 'unknown'}: ${error.message ?? 'unknown error'}`,
         );
       }
       if (!Array.isArray(data)) {
-        throw new Error('Supabase historical import RPC returned an invalid confirmation payload');
+        throw new Error('Supabase historical import service returned an invalid confirmation payload');
       }
       const confirmedKeys = new Set(data.map((value) => {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
@@ -897,7 +908,7 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
       }));
       if (confirmedKeys.has('') || confirmedKeys.size !== batch.operations.length
         || [...operationKeys].some((key) => !confirmedKeys.has(key))) {
-        throw new Error('Supabase historical import RPC did not confirm every requested conflict clock');
+        throw new Error('Supabase historical import service did not confirm every requested conflict clock');
       }
     },
 

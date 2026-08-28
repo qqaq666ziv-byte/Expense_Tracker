@@ -234,6 +234,14 @@ class FakeSupabaseClient {
   } | null;
   rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
   rpcResponse?: { data: unknown; error: null | { code: string; message: string } };
+  functionCalls: Array<{ fn: string; body: Record<string, unknown> }> = [];
+  functionResponse?: { data: unknown; error: null | { code?: string; message: string } };
+  readonly functions = {
+    invoke: async (fn: string, options: { body: Record<string, unknown> }) => {
+      this.functionCalls.push({ fn, body: options.body });
+      return this.functionResponse ?? { data: [], error: null };
+    },
+  };
 
   constructor(ownerId = 'user-a') {
     this.auth = {
@@ -317,7 +325,7 @@ function asSupabaseClient(client: FakeSupabaseClient): SupabaseClient {
 }
 
 describe('Supabase remote adapter', () => {
-  it('uses the dedicated RPC for an explicitly marked historical transfer import batch', async () => {
+  it('uses the trusted Edge Function for an explicitly marked historical transfer import batch', async () => {
     const client = new FakeSupabaseClient();
     const source = account({ id: 'bank', name: '主要銀行', isActive: false });
     const destination = account({ id: 'cash', name: '現金' });
@@ -342,9 +350,9 @@ describe('Supabase remote adapter', () => {
       transferPending,
     ].map((pending) => ({
       ...pending,
-      historicalImportBatchId: 'historical-import:restore-1',
+      historicalImportBatchId: 'historical-import:restore:1',
     }));
-    client.rpcResponse = {
+    client.functionResponse = {
       data: operations.map((pending) => ({
         entity: pending.entity,
         id: pending.recordId,
@@ -356,22 +364,24 @@ describe('Supabase remote adapter', () => {
     const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
 
     await remote.applyHistoricalImportBatch!('user-a', {
-      id: 'historical-import:restore-1',
+      id: 'historical-import:restore:1',
       operations,
       endpointAccounts: [source, destination],
     });
 
-    expect(client.rpcCalls).toEqual([expect.objectContaining({
-      fn: 'finance_import_historical_transfer_batch',
-      args: expect.objectContaining({
-        p_batch_id: 'historical-import:restore-1',
-        p_account_operations: expect.arrayContaining([
+    expect(client.rpcCalls).toEqual([]);
+    expect(client.functionCalls).toEqual([expect.objectContaining({
+      fn: 'finance-import-historical-transfer-batch',
+      body: expect.objectContaining({
+        intent: 'backup-restore',
+        batch_id: 'historical-import:restore:1',
+        account_operations: expect.arrayContaining([
           expect.objectContaining({ id: 'bank', is_active: false, user_id: 'user-a' }),
         ]),
-        p_endpoint_accounts: expect.arrayContaining([
+        endpoint_accounts: expect.arrayContaining([
           expect.objectContaining({ id: 'bank', name: '主要銀行', user_id: 'user-a' }),
         ]),
-        p_transfer_operations: [expect.objectContaining({
+        transfer_operations: [expect.objectContaining({
           id: 'historical-transfer', source_account_name: '舊銀行名', user_id: 'user-a',
         })],
       }),

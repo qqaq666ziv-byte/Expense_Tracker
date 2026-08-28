@@ -249,7 +249,7 @@ export function loadFinanceStateWithRecovery(
             || operation.batchBeforeRecord.id !== operation.recordId))
         || (operation.historicalImportBatchId !== undefined
           && (typeof operation.historicalImportBatchId !== 'string'
-            || !operation.historicalImportBatchId.startsWith('historical-import:')
+            || !/^historical-import:(guest|restore):[A-Za-z0-9-]+$/.test(operation.historicalImportBatchId)
             || !['accounts', 'transfers'].includes(operation.entity)))
         || !entityNames.includes(operation.entity)) {
         throw new Error('invalid or foreign operation in outbox');
@@ -315,7 +315,7 @@ export function loadFinanceStateWithRecovery(
               || operation.batchBeforeRecord.id !== operation.recordId))
           || (operation.historicalImportBatchId !== undefined
             && (typeof operation.historicalImportBatchId !== 'string'
-              || !operation.historicalImportBatchId.startsWith('historical-import:')
+              || !/^historical-import:(guest|restore):[A-Za-z0-9-]+$/.test(operation.historicalImportBatchId)
               || !['accounts', 'transfers'].includes(operation.entity)))
           || !entityNames.includes(operation.entity)
           || pendingKeys.has(key)) {
@@ -673,7 +673,7 @@ export function planGuestImport(
   let addedCount = 0;
   const currentTransferIds = new Set(state.data.transfers.map((record) => record.id));
   const historicalImportBatchId = imported.transfers.some((record) => !currentTransferIds.has(record.id))
-    ? `historical-import:${crypto.randomUUID()}`
+    ? `historical-import:guest:${crypto.randomUUID()}`
     : undefined;
   for (const entity of entityNames) {
     const existingIds = new Set((state.data[entity] as SyncRecord[]).map((record) => record.id));
@@ -715,7 +715,7 @@ export function applyRestoredData(
   const historicalImportBatchId = restoredData.transfers.some((record) => {
     const existing = state.data.transfers.find((candidate) => candidate.id === record.id);
     return !existing || JSON.stringify(existing) !== JSON.stringify(record);
-  }) ? `historical-import:${crypto.randomUUID()}` : undefined;
+  }) ? `historical-import:restore:${crypto.randomUUID()}` : undefined;
   let next: PersistedFinanceState = {
     ...state,
     data: { ...state.data, settings: structuredClone(restoredData.settings) },

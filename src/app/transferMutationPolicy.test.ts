@@ -59,8 +59,8 @@ describe('transfer-aware emergency mode', () => {
     await expect(readOnly.apply('user-a', pending('accounts'))).resolves.toBeUndefined();
     await expect(readOnly.apply('user-a', pending('transfers'))).rejects.toThrow(/read-only/i);
     await expect(readOnly.applyHistoricalImportBatch?.('user-a', {
-      id: 'historical-import:blocked',
-      operations: [{ ...pending('transfers'), historicalImportBatchId: 'historical-import:blocked' }],
+      id: 'historical-import:restore:blocked',
+      operations: [{ ...pending('transfers'), historicalImportBatchId: 'historical-import:restore:blocked' }],
       endpointAccounts: [account],
     })).rejects.toThrow(/read-only/i);
     await expect(readOnly.compareAndSwap?.(
