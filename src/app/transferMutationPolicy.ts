@@ -33,7 +33,7 @@ export function assertTransferCollectionMutationAllowed(
  */
 export function createTransferReadOnlyRemoteAdapter(remote: RemoteAdapter): RemoteAdapter {
   return {
-    pull: (ownerId) => remote.pull(ownerId),
+    pull: (ownerId, options) => remote.pull(ownerId, options),
     apply: async (ownerId, operation) => {
       assertTransferMutationAllowed(operation.entity, false);
       return remote.apply(ownerId, operation);
