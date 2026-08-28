@@ -2,7 +2,6 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../app/state';
 import {
-  AccountOpeningBalanceField,
   AssetsView,
   buildEditedAccount,
   calculateBalanceAdjustmentDelta,
@@ -27,19 +26,8 @@ describe('AssetsView product language', () => {
     expect(html).toContain('新增帳戶');
   });
 
-  it('keeps an existing opening balance read-only and directs corrections to adjustments', () => {
+  it('keeps an existing opening balance immutable in account edits', () => {
     const account = createInitialState('guest').data.accounts[0];
-    const html = renderToStaticMarkup(
-      <AccountOpeningBalanceField
-        editing={account}
-        opening="999999"
-        onOpeningChange={() => undefined}
-      />,
-    );
-
-    expect(html).toContain('期初餘額建立後不會改寫');
-    expect(html).toContain('調整餘額');
-    expect(html).toContain('readOnly');
     expect(resolveAccountOpeningBalance(account, '999999')).toBe(account.openingBalance);
   });
 

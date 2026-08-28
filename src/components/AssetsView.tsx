@@ -71,42 +71,26 @@ function trapDialogFocus(event: KeyboardEvent<HTMLElement>, close: () => void) {
 }
 
 interface AccountOpeningBalanceFieldProps {
-  editing: AssetAccount | null;
   opening: string;
   onOpeningChange(value: string): void;
 }
 
-/** Existing opening balances are historical inputs; corrections use adjustments. */
+/** New accounts begin with a writable current balance. */
 export function AccountOpeningBalanceField({
-  editing,
   opening,
   onOpeningChange,
 }: AccountOpeningBalanceFieldProps) {
   return (
     <label className="field-label">
-      {editing ? "期初餘額" : "目前金額"}
-      {editing && (
-        <small>
-          期初餘額建立後不會改寫；若帳面金額不同，請從帳戶明細使用「調整餘額」。
-        </small>
-      )}
-      {editing ? (
-        <input
-          aria-label="期初餘額"
-          className="field mt-1"
-          readOnly
-          value={String(editing.openingBalance)}
-        />
-      ) : (
-        <MoneyInput
-          aria-label="期初餘額"
-          className="field mt-1"
-          value={opening}
-          allowDecimal
-          allowNegative
-          onValueChange={onOpeningChange}
-        />
-      )}
+      目前金額
+      <MoneyInput
+        aria-label="目前金額"
+        className="field mt-1"
+        value={opening}
+        allowDecimal
+        allowNegative
+        onValueChange={onOpeningChange}
+      />
     </label>
   );
 }
@@ -239,7 +223,6 @@ export function AssetsView({
     captureTrigger(accountTriggerRef);
     setEditing(account);
     setName(account.name);
-    setOpening(String(account.openingBalance));
     setIncluded(account.includeInTotalAssets);
     setKind(inferAccountKind(account));
     setIcon(account.icon);
@@ -618,11 +601,12 @@ export function AssetsView({
                   onChange={(event) => setName(event.target.value)}
                 />
               </label>
-              <AccountOpeningBalanceField
-                editing={editing}
-                opening={opening}
-                onOpeningChange={setOpening}
-              />
+              {!editing && (
+                <AccountOpeningBalanceField
+                  opening={opening}
+                  onOpeningChange={setOpening}
+                />
+              )}
               <label className="friendly-check">
                 <input
                   aria-label="納入總資產"
