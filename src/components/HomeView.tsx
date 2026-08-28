@@ -18,6 +18,7 @@ import {
   toLocalInput,
 } from "../app/format";
 import { completeAppliedMutation } from "../app/mutationResult";
+import { resolveExplicitSelection } from "../app/explicitSelection";
 import {
   TUTORIAL_RECORD_NOTE,
   isTutorialTransaction,
@@ -78,16 +79,16 @@ export function HomeView({
         (item.isActive || editing?.categoryId === item.id),
     ),
   );
-  const resolvedCategoryId = categories.some((item) => item.id === categoryId)
-    ? categoryId
-    : (categories.find((item) => !unresolvedSyncRecordKeys.has(
-        syncRecordKey("categories", item.id),
-      ))?.id ?? "");
-  const resolvedAccountId = accounts.some((item) => item.id === accountId)
-    ? accountId
-    : (accounts.find((item) => !unresolvedSyncRecordKeys.has(
-        syncRecordKey("accounts", item.id),
-      ))?.id ?? "");
+  const selectableCategories = categories.filter((item) => !unresolvedSyncRecordKeys.has(
+    syncRecordKey("categories", item.id),
+  ));
+  const selectableAccounts = accounts.filter((item) => !unresolvedSyncRecordKeys.has(
+    syncRecordKey("accounts", item.id),
+  ));
+  const resolvedCategoryId = resolveExplicitSelection(categoryId, selectableCategories);
+  const resolvedAccountId = resolveExplicitSelection(accountId, selectableAccounts);
+  const selectedCategoryUnavailable = Boolean(categoryId && !resolvedCategoryId);
+  const selectedAccountUnavailable = Boolean(accountId && !resolvedAccountId);
 
   useEffect(() => {
     try {
@@ -171,6 +172,10 @@ export function HomeView({
     event.preventDefault();
     if (editing && unresolvedSyncRecordKeys.has(syncRecordKey("transactions", editing.id))) {
       setError("這筆交易有未解同步衝突；請先選擇雲端版本，本次修改未執行。");
+      return;
+    }
+    if (selectedCategoryUnavailable || selectedAccountUnavailable) {
+      setError("原先選取的帳戶或分類目前不可用；本次交易未儲存，請明確選擇其他可用項目。");
       return;
     }
     const numericAmount = parseRequiredNumberInput(amount);
@@ -386,6 +391,12 @@ export function HomeView({
             </div>
           </fieldset>
 
+          {(selectedCategoryUnavailable || selectedAccountUnavailable) && (
+            <p className="error-message" role="alert">
+              原先選取的{selectedCategoryUnavailable ? "分類" : "帳戶"}目前不可用，請明確選擇其他可用項目。
+            </p>
+          )}
+
           <details className="optional-details" open={Boolean(editing)}>
             <summary>
               <ChevronDown className="h-4 w-4" />
@@ -437,6 +448,9 @@ export function HomeView({
               )) || !resolvedCategoryId || !resolvedAccountId
                 || unresolvedSyncRecordKeys.has(syncRecordKey("categories", resolvedCategoryId))
                 || unresolvedSyncRecordKeys.has(syncRecordKey("accounts", resolvedAccountId))}
+              title={selectedCategoryUnavailable || selectedAccountUnavailable
+                ? "原先選取的帳戶或分類目前不可用，請明確選擇其他可用項目。"
+                : undefined}
             >
               {editing
                 ? "儲存修改"

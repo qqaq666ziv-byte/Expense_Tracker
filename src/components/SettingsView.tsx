@@ -37,6 +37,7 @@ import { stableLegacyId } from "../domain/legacyMigration";
 import { changedRecordMeta, newRecordMeta } from "../app/state";
 import { localDate, money, parseRequiredNumberInput } from "../app/format";
 import { completeAppliedMutation } from "../app/mutationResult";
+import { resolveExplicitSelection } from "../app/explicitSelection";
 import { FinanceIcon, IconPicker } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
 import {
@@ -434,13 +435,19 @@ export function RecurringPanel({
   const selectableAccounts = accounts.filter((item) => (
     !unresolvedSyncRecordKeys.has(syncRecordKey("accounts", item.id))
   ));
-  const resolvedCategory =
-    selectableCategories.find((item) => item.id === categoryId) ?? selectableCategories[0];
-  const resolvedAccount =
-    selectableAccounts.find((item) => item.id === accountId) ?? selectableAccounts[0];
+  const resolvedCategoryId = resolveExplicitSelection(categoryId, selectableCategories);
+  const resolvedAccountId = resolveExplicitSelection(accountId, selectableAccounts);
+  const resolvedCategory = selectableCategories.find((item) => item.id === resolvedCategoryId);
+  const resolvedAccount = selectableAccounts.find((item) => item.id === resolvedAccountId);
+  const selectedCategoryUnavailable = Boolean(categoryId && !resolvedCategoryId);
+  const selectedAccountUnavailable = Boolean(accountId && !resolvedAccountId);
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const numeric = parseRequiredNumberInput(amount);
+    if (selectedCategoryUnavailable || selectedAccountUnavailable) {
+      setMessage("原先選取的分類或帳戶目前不可用；資料未變更，請明確選擇其他可用項目");
+      return;
+    }
     if (
       !name.trim() ||
       !resolvedCategory ||
@@ -611,9 +618,10 @@ export function RecurringPanel({
               <select
                 aria-label="週期分類"
                 className="field mt-1"
-                value={resolvedCategory?.id ?? ""}
+                value={resolvedCategoryId}
                 onChange={(event) => setCategoryId(event.target.value)}
               >
+                <option value="" disabled>請選擇分類</option>
                 {categories.map((item) => (
                   <option
                     value={item.id}
@@ -631,9 +639,10 @@ export function RecurringPanel({
               <select
                 aria-label="週期帳戶"
                 className="field mt-1"
-                value={resolvedAccount?.id ?? ""}
+                value={resolvedAccountId}
                 onChange={(event) => setAccountId(event.target.value)}
               >
+                <option value="" disabled>請選擇帳戶</option>
                 {accounts.map((item) => (
                   <option
                     value={item.id}
@@ -647,6 +656,11 @@ export function RecurringPanel({
               </select>
             </label>
           </div>
+          {(selectedCategoryUnavailable || selectedAccountUnavailable) && (
+            <p className="error-message" role="alert">
+              原先選取的{selectedCategoryUnavailable ? "分類" : "帳戶"}目前不可用，請明確選擇其他可用項目。
+            </p>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <label className="field-label">
               頻率
@@ -685,8 +699,10 @@ export function RecurringPanel({
               className="primary-button flex-1"
               type="submit"
               disabled={!resolvedCategory || !resolvedAccount}
-              title={!resolvedCategory || !resolvedAccount
-                ? "分類或帳戶仍有同步批次待完成，暫時不能建立或更新週期規則。"
+              title={selectedCategoryUnavailable || selectedAccountUnavailable
+                ? "原先選取的分類或帳戶目前不可用，請明確選擇其他可用項目。"
+                : !resolvedCategory || !resolvedAccount
+                ? "請先明確選擇分類與帳戶。"
                 : undefined}
             >
               {editing ? <Save className="h-4 w-4" /> : <Plus className="h-4 w-4" />}

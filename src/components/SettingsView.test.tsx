@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../app/state';
+import { resolveExplicitSelection } from '../app/explicitSelection';
 import { MAX_BACKUP_BYTES, parseFinanceBackup } from '../domain/backup';
 import { MAX_RECURRING_CATCH_UP_OCCURRENCES } from '../domain/recurrence';
 import {
@@ -128,6 +129,30 @@ describe('SettingsView backup safety', () => {
 });
 
 describe('SettingsView recurring safety', () => {
+  it('fails closed instead of retargeting recurring parents when the selected IDs become unavailable', () => {
+    const state = createInitialState('guest');
+    const categories = state.data.categories.filter((item) => item.kind === 'expense');
+    const [categoryA, categoryB] = categories;
+    const accountA = state.data.accounts[0];
+    const accountB = { ...accountA, id: 'account-b', name: '帳戶 B' };
+
+    expect(resolveExplicitSelection(categoryA.id, [categoryA, categoryB])).toBe(categoryA.id);
+    expect(resolveExplicitSelection(categoryA.id, [categoryB])).toBe('');
+    expect(resolveExplicitSelection(categoryB.id, [categoryB])).toBe(categoryB.id);
+    expect(resolveExplicitSelection(accountA.id, [accountA, accountB])).toBe(accountA.id);
+    expect(resolveExplicitSelection(accountA.id, [accountB])).toBe('');
+    expect(resolveExplicitSelection(accountB.id, [accountB])).toBe(accountB.id);
+    expect(resolveExplicitSelection(categoryA.id, [{ ...categoryA, isActive: false }])).toBe(categoryA.id);
+    expect(resolveExplicitSelection(accountA.id, [{ ...accountA, isActive: false }])).toBe(accountA.id);
+
+    const html = renderToStaticMarkup(
+      <RecurringPanel data={state.data} ownerId="guest" putRecurring={() => true} deleteRecurring={() => true} />,
+    );
+    expect(html).toContain('<option value="" disabled="" selected="">請選擇分類</option>');
+    expect(html).toContain('<option value="" disabled="" selected="">請選擇帳戶</option>');
+    expect(html.match(/<button class="primary-button flex-1"[^>]*>/)?.[0]).toContain('disabled=""');
+  });
+
   it('preserves archived parents while editing and blocks resume until they are active', () => {
     const state = createInitialState('guest');
     const account = { ...state.data.accounts[0], isActive: false };

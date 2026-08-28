@@ -1,10 +1,34 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../app/state';
+import { resolveExplicitSelection } from '../app/explicitSelection';
 import { TUTORIAL_RECORD_NOTE, startTutorial } from '../app/tutorial';
 import { HomeView } from './HomeView';
 
 describe('HomeView ledger access', () => {
+  it('fails closed instead of retargeting a transaction when its selected parents become unavailable', () => {
+    const state = createInitialState('guest');
+    const categories = state.data.categories.filter((item) => item.kind === 'expense');
+    const [categoryA, categoryB] = categories;
+    const accountA = state.data.accounts[0];
+    const accountB = { ...accountA, id: 'account-b', name: '帳戶 B' };
+
+    expect(resolveExplicitSelection(categoryA.id, [categoryA, categoryB])).toBe(categoryA.id);
+    expect(resolveExplicitSelection('', [categoryA, categoryB])).toBe('');
+    expect(resolveExplicitSelection(categoryA.id, [categoryB])).toBe('');
+    expect(resolveExplicitSelection(categoryB.id, [categoryB])).toBe(categoryB.id);
+    expect(resolveExplicitSelection(accountA.id, [accountA, accountB])).toBe(accountA.id);
+    expect(resolveExplicitSelection(accountA.id, [accountB])).toBe('');
+    expect(resolveExplicitSelection(accountB.id, [accountB])).toBe(accountB.id);
+
+    const html = renderToStaticMarkup(
+      <HomeView data={state.data} ownerId="guest" put={() => true} deleteTransaction={() => true} />,
+    );
+    expect(html).not.toMatch(/class="category-choice[^"]*" aria-pressed="true"/);
+    expect(html).not.toMatch(/class="account-chip[^"]*" aria-pressed="true"/);
+    expect(html.match(/<button[^>]*data-tutorial="create"[^>]*>/)?.[0]).toContain('disabled=""');
+  });
+
   it('keeps the primary entry path in amount, category, account order', () => {
     const state = createInitialState('guest');
     const html = renderToStaticMarkup(

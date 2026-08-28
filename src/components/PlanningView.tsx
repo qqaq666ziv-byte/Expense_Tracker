@@ -44,6 +44,7 @@ import {
   toLocalInput,
 } from "../app/format";
 import { completeAppliedMutation } from "../app/mutationResult";
+import { resolveExplicitSelection } from "../app/explicitSelection";
 import { useCalendarReference } from "../app/useCalendarReference";
 import { RecurringPanel } from "./SettingsView";
 import { MoneyInput } from "./MoneyInput";
@@ -114,10 +115,7 @@ export function resolveBudgetCategoryId(
   requestedCategoryId: string,
   categoryOptions: readonly Category[],
 ): string {
-  if (!requestedCategoryId) return "";
-  return categoryOptions.some((item) => item.id === requestedCategoryId)
-    ? requestedCategoryId
-    : "";
+  return resolveExplicitSelection(requestedCategoryId, categoryOptions);
 }
 
 export function buildEditedBudget(
@@ -239,9 +237,8 @@ function SavingsPanel({
     ))
   );
   const allocatableGoals = goals.filter((goal) => !goalHasUnresolvedConflict(goal.id));
-  const resolvedGoalId = allocatableGoals.some((goal) => goal.id === goalId)
-    ? goalId
-    : (allocatableGoals[0]?.id ?? "");
+  const resolvedGoalId = resolveExplicitSelection(goalId, allocatableGoals);
+  const selectedGoalUnavailable = Boolean(goalId && !resolvedGoalId);
   const allocatedToGoal = (id: string) =>
     sumMoney(
       data.allocations
@@ -316,6 +313,9 @@ function SavingsPanel({
   const allocate = (event: FormEvent) => {
     event.preventDefault();
     const amount = parseRequiredNumberInput(allocation);
+    if (selectedGoalUnavailable) return setMessage(
+      "原先選取的儲蓄目標目前不可用；未建立配置，請明確選擇其他可用目標",
+    );
     if (!resolvedGoalId || amount === null || amount <= 0)
       return setMessage(
         allocatableGoals.length === 0 && goals.length > 0
@@ -478,6 +478,7 @@ function SavingsPanel({
                 value={resolvedGoalId}
                 onChange={(event) => setGoalId(event.target.value)}
               >
+                <option value="" disabled>請選擇目標</option>
                 {goals.map((goal) => (
                   <option
                     key={goal.id}
@@ -489,6 +490,11 @@ function SavingsPanel({
                 ))}
               </select>
             </label>
+            {selectedGoalUnavailable && (
+              <p className="error-message" role="alert">
+                原先選取的儲蓄目標目前不可用，請明確選擇其他可用目標。
+              </p>
+            )}
             <label className="field-label">
               配置金額
               <MoneyInput
@@ -506,7 +512,9 @@ function SavingsPanel({
                 !resolvedGoalId ||
                 compareMoney(financials.availableAssets, 0) <= 0
               }
-              title={!resolvedGoalId && goals.length > 0
+              title={selectedGoalUnavailable
+                ? "原先選取的儲蓄目標目前不可用，請明確選擇其他可用目標。"
+                : !resolvedGoalId && goals.length > 0
                 ? "目標或既有配置有未解同步衝突，請先完成同步處理。"
                 : undefined}
             >

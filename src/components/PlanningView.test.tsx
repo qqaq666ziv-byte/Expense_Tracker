@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../app/state';
+import { resolveExplicitSelection } from '../app/explicitSelection';
 import {
   BudgetPanel,
   buildEditedBudget,
@@ -11,6 +12,45 @@ import {
 } from './PlanningView';
 
 describe('PlanningView goal lifecycle', () => {
+  it('fails closed instead of allocating to another goal when the selected goal becomes unavailable', () => {
+    const state = createInitialState('guest');
+    state.data.accounts = [{ ...state.data.accounts[0], openingBalance: 10_000 }];
+    const goalA = {
+      id: 'goal-a', ownerId: 'guest', version: 1,
+      updatedAt: '2026-08-28T00:00:00.000Z', lastOperationId: 'goal-a-create',
+      name: '目標 A', targetAmount: 5_000, isActive: true,
+    } as const;
+    const goalB = {
+      ...goalA,
+      id: 'goal-b',
+      lastOperationId: 'goal-b-create',
+      name: '目標 B',
+    };
+    state.data.goals = [goalA, goalB];
+
+    expect(resolveExplicitSelection(goalA.id, [goalA, goalB])).toBe(goalA.id);
+    expect(resolveExplicitSelection(goalA.id, [goalB])).toBe('');
+    expect(resolveExplicitSelection(goalB.id, [goalB])).toBe(goalB.id);
+
+    const html = renderToStaticMarkup(
+      <PlanningView
+        data={state.data}
+        ownerId="guest"
+        putGoal={() => true}
+        putAllocation={() => true}
+        putBudget={() => true}
+        putRecurring={() => true}
+        deleteRecurring={() => true}
+        archiveGoal={() => true}
+        archiveBudget={() => true}
+        unresolvedSyncRecordKeys={new Set([`goals:${goalA.id}`])}
+      />,
+    );
+    expect(html).toContain('<option value="" disabled="" selected="">請選擇目標</option>');
+    expect(html.match(/<button class="primary-button w-full"[^>]*>配置到目標<\/button>/)?.[0])
+      .toContain('disabled=""');
+  });
+
   it('edits the goal record without changing its allocation history', () => {
     const state = createInitialState('guest');
     const goal = {
