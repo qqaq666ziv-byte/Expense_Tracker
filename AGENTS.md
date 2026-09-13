@@ -1,100 +1,31 @@
-# AGENTS.md — Expense Tracker
+# Expense Tracker 工作規則
 
-> Scope: repository root and all descendants unless a deeper `AGENTS.md` overrides it.
-> Purpose: maximize Codex autonomy while preserving recoverability, secrets, production data, and verifiable quality.
+適用本儲存庫與工作樹。依全域指令自主完成任務並交付 GitHub；保護財務正確性、資料隔離與可回復性。
 
-## 1. Autonomy
+## 開工與可回復性
+- 先檢查分支、HEAD、工作目錄及既有變更。保留他人工作，只提交本次範圍。
+- 在任務分支工作；涉及財務行為、資料庫、認證、同步或正式環境時，使用隔離工作樹。
+- 同一連續任務以變更批次保存 checkpoint，不因補充訊息重建。完全相同狀態已有遠端 checkpoint 時直接重用。
+- 財務、資料完整性、認證／授權、同步、遷移、正式環境及大幅重構：在首次相關修改前保有精確可回復的遠端程式 checkpoint。已有未提交內容須先安全保存，不能為備份夾帶秘密或擅自提交他人未完成工作。
+- 純文件、指令、測試說明、低風險文案／樣式：記錄起始 SHA 與本機差異即可開始；完成後正常 commit／push。遇到會影響資料或使用者流程的證據，提升驗證與備份等級。
+- 遠端受阻時僅停止依賴遠端備份保障的修改；唯讀診斷及不依賴該保障的工作可繼續。交付須列明未完成的備份／推送。
+- 不刪 checkpoint、不 force-push、不重寫已推送歷史。Git 備份不等於資料庫備份。
 
-- Own the implementation end to end. Choose architecture, libraries, refactors, file layout, and implementation details based on the repository and task.
-- Do not ask the user to decide routine engineering details that can be resolved from code, tests, documentation, or established conventions.
-- Prefer the smallest coherent design that satisfies the requested product behavior and improves maintainability.
-- Preserve the existing product identity and working behavior unless the task explicitly changes it.
-- Ask for user input only when blocked by missing credentials/permissions, an irreversible or destructive action, a material product-value ambiguity that cannot be inferred, or a significant security/legal/financial consequence.
-- Prefer clear goals, invariants, and repository evidence over prescriptive implementation recipes; use engineering judgment unless a hard safety or product boundary requires otherwise.
+## 財務與正式資料
+- 金額、日期、餘額、轉帳、週期、同步、持久化及備份還原等變更，需驗證公開行為與重要邊界。
+- 保留使用者隔離、RLS、伺服器端授權；不得用前端隱藏取代權限控制。
+- 正式財務資料不得默默刪除、覆寫、合併或重新解讀。遷移優先採用可相容的新增設計、可驗證回填與明確回復路徑。
+- 破壞性正式資料變更或大量寫入，仍需使用者明確授權及已驗證的獨立資料庫備份／回復能力。
+- 正式部署、網域、OAuth、PWA／Service Worker 或回復任務，按需讀取 docs/PRODUCTION_RELEASE.md，依實際環境核對部署拓樸。
+- 真實秘密、.env、私密日誌、正式備份與使用者財務紀錄不進 Git；只使用去識別的測試資料及設定範例。
 
-## 2. Mandatory remote checkpoint before mutation
+## 驗證與審查
+- Astra 依風險選擇足夠的檢查：文件以差異／引用一致性為主；UI 驗證受影響畫面；資料與安全行為執行相關測試、型別／lint、建置及必要使用者流程驗證。
+- 財務／同步／權限變更補足能實際揭露錯誤的測試。低風險修改不為湊流程而新增 E2E、全庫依賴掃描或紅隊審查。
+- 重要變更做獨立或明確分離的正確性審查；只有涉及相關風險才擴大到安全／資料完整性檢查。
+- 修正有證據的問題；相關檢查通過且沒有阻擋問題便交付。重跑僅限新變更、新證據或失敗，不以固定輪數或反覆自評取代判斷。
+- 不隱藏、削弱或刪除失敗檢查；本機通過不冒充正式環境或 ChatGPT 獨立驗收。
 
-The user requires a remotely recoverable snapshot before work begins on every new prompt that can mutate code, configuration, repository state, or production data.
-
-Before the first mutation for a new prompt:
-
-1. Inspect the current branch, `git status`, and HEAD SHA.
-2. Confirm that the exact current repository state is safely committed. Never commit suspected secrets merely to create a checkpoint.
-3. If the current state differs from the last remotely persisted checkpoint, create a checkpoint commit when needed, then create an annotated tag using a clear name such as:
-   `checkpoint/YYYYMMDD-HHMM-before-<short-task-slug>`
-4. Push the current working branch/commit and the checkpoint tag to the remote before making task changes.
-5. Record the checkpoint tag and SHA for the final report.
-6. If the exact current SHA already has a remote checkpoint and the repository state has not changed, reuse it rather than creating a duplicate tag.
-7. If a remote checkpoint cannot be persisted because of authentication, network, permissions, or another blocker, do **not** start mutating work. Report the blocker.
-
-Never, without explicit user authorization:
-
-- delete checkpoint tags;
-- force-push;
-- rewrite already-pushed history;
-- amend or rebase away a remotely checkpointed state.
-
-Work on a task/feature branch rather than making experimental changes directly on `main`. Do not merge to `main` or deploy destructive production changes unless the user explicitly authorizes that action.
-
-## 3. Secrets and privacy
-
-- Never commit real secrets, credentials, private keys, access tokens, service-role keys, database passwords, OAuth client secrets, production dumps, real user financial data, or private debug logs.
-- Frontend-safe public configuration may be referenced through environment variables, but local `.env` files must not be tracked. Keep only a sanitized `.env.example` in Git.
-- If a suspected secret is discovered, stop exposing it in output, identify the affected credential by type/name only, and use a rotation-first remediation plan.
-- Never place production database backups inside the Git repository.
-
-## 4. Production data and migrations
-
-- Treat user financial data as high-value production data.
-- Schema/data migrations must be backward-aware, idempotent where practical, and designed to preserve existing records.
-- Before any destructive production migration or bulk data mutation, ensure an independent rollback/backup path exists. A Git checkpoint is not a database backup.
-- Prefer additive migrations and verified backfills over destructive rewrites.
-- Never silently discard, overwrite, merge, or reinterpret existing financial records without a documented migration rule and verification.
-- Maintain row-level ownership protections for all user-scoped Supabase tables.
-- For production deployment, domain, OAuth, PWA/Service Worker, or rollback/recovery work, read `docs/PRODUCTION_RELEASE.md` as the detailed release runbook and verify recorded deployment topology against the live environment before relying on it.
-
-## 5. Verification is required
-
-A task is not complete because the UI looks correct or the build succeeds.
-
-After changes, run all relevant checks available in the repository, including at minimum when configured:
-
-- type checking / linting;
-- automated tests;
-- production build;
-- relevant security/dependency checks;
-- focused manual or browser smoke verification for changed user flows.
-
-Add or improve tests when changing financial calculations, dates, migrations, sync, authentication boundaries, recurring logic, account balances, categories, budgets, backup/restore, or other data-integrity behavior.
-
-Do not hide, delete, weaken, or skip a failing check merely to make the task appear complete. Fix the cause or report the unresolved blocker.
-
-## 6. Review loop
-
-For substantial tasks, separate implementation from review:
-
-1. Implement.
-2. Run automated verification.
-3. Perform a correctness/data-integrity review.
-4. Perform a security/privacy review.
-5. Perform an adversarial/red-team pass for edge cases and regression risks.
-6. Repair findings.
-7. Repeat until no blocking finding remains or a genuine user-only blocker is reached.
-
-Use independent agents/reviewers when the environment supports them; otherwise perform clearly separated review passes. Do not inflate a quality score or claim perfection without evidence.
-
-## 7. Completion report
-
-When finishing a modifying task, report concisely:
-
-- checkpoint tag + SHA used as the pre-task restore point;
-- branch / PR if created;
-- what changed and why;
-- migrations or production actions performed (or intentionally not performed);
-- tests/checks run and their results;
-- security/data-integrity review findings;
-- any remaining limitations or blockers;
-- the exact rollback path.
-
-Leave the worktree in a clean, understandable state and commit the completed work.
-
+## 交付
+- 正常提交並推送本次變更，必要時建立 PR。保留既有正式上線及合併邊界；GitHub 持續授權不等於破壞性正式資料授權。
+- 簡要回報修改、實際檢查、分支／PR、起始 SHA 或 checkpoint，以及適用的回復方法與真正阻礙。
