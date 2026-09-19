@@ -174,3 +174,28 @@ describe('budget engine', () => {
     }]);
   });
 });
+
+describe('transfer fees in budgets', () => {
+  it('counts current fees only in overall budgets and removes deleted fees', () => {
+    const stamp = { ownerId: 'guest', version: 1, updatedAt: '2026-08-21T04:00:00.000Z', lastOperationId: 'fixture' };
+    const transfer = { ...stamp, id: 'transfer', amount: 100, fee: 15,
+      sourceAccountId: 'cash', sourceAccountName: '現金', destinationAccountId: 'bank', destinationAccountName: '銀行',
+      occurredAt: '2026-08-21 12:00' };
+    const data: FinanceData = {
+      accounts: [], categories: [], transactions: [], adjustments: [], goals: [], allocations: [], recurringRules: [],
+      settings: { currency: 'TWD', locale: 'zh-TW' },
+      transfers: [transfer, { ...transfer, id: 'deleted', fee: 999, deletedAt: stamp.updatedAt },
+        { ...transfer, id: 'prior', fee: 888, occurredAt: '2026-07-01 12:00' }],
+      budgets: [
+        { ...stamp, id: 'overall', scope: 'overall', period: 'monthly', amount: 10, isActive: true },
+        { ...stamp, id: 'weekly', scope: 'overall', period: 'weekly', amount: 100, isActive: true },
+        { ...stamp, id: 'category', scope: 'category', categoryId: 'system:transfer-fee', period: 'monthly', amount: 10, isActive: true },
+      ],
+    };
+    expect(calculateBudgetUsage(data, new Date(2026, 7, 21))).toMatchObject([
+      { used: 15, remaining: 0, overBy: 5 }, { used: 15, remaining: 85 }, { used: 0, remaining: 10 },
+    ]);
+    data.transfers[0] = { ...transfer, deletedAt: stamp.updatedAt };
+    expect(calculateBudgetUsage(data, new Date(2026, 7, 21)).map((budget) => budget.used)).toEqual([0, 0, 0]);
+  });
+});

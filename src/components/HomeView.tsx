@@ -15,6 +15,7 @@ import { buildLedgerHistory, calculateInsights } from "../domain/financeEngine";
 import { sortByDisplayOrder } from "../domain/displayOrder";
 import { changedRecordMeta, newRecordMeta } from "../app/state";
 import { displayMoney } from "../app/presentation";
+import { addMoney } from "../domain/money";
 import {
   parseRequiredNumberInput,
   shortDate,
@@ -87,6 +88,7 @@ function OwnerScopedHomeView({
   const [type, setType] = useState<"expense" | "income">("expense");
   const [mode, setMode] = useState<"expense" | "income" | "transfer">("expense");
   const [amount, setAmount] = useState("");
+  const [transferFee, setTransferFee] = useState("");
   const [categoryId, setCategoryId] = useState("");
   const [accountId, setAccountId] = useState("");
   const [occurredAt, setOccurredAt] = useState(toLocalInput());
@@ -288,6 +290,7 @@ function OwnerScopedHomeView({
 
   const resetForm = () => {
     setAmount("");
+    setTransferFee("");
     setNote("");
     setOccurredAt(toLocalInput());
     setEditing(null);
@@ -302,6 +305,7 @@ function OwnerScopedHomeView({
   };
 
   const switchType = (next: "expense" | "income") => {
+    setTransferFee("");
     setMode(next);
     setType(next);
     setEditingTransfer(null);
@@ -329,6 +333,11 @@ function OwnerScopedHomeView({
     event.preventDefault();
     if (mode === "transfer") {
       const numericAmount = parseRequiredNumberInput(amount);
+      const numericFee = transferFee.trim() === "" ? 0 : parseRequiredNumberInput(transferFee);
+      if (numericFee === null || numericFee < 0) {
+        setError("手續費請輸入 0 或正數，最多兩位小數");
+        return;
+      }
       if (numericAmount === null || numericAmount <= 0) {
         setError("請輸入大於 0、最多兩位小數的轉帳金額");
         return;
@@ -399,6 +408,7 @@ function OwnerScopedHomeView({
           : newRecordMeta(ownerId);
         const record = buildTransferRecord(data, {
           amount: numericAmount,
+          fee: numericFee,
           sourceAccountId: resolvedSourceAccountId,
           destinationAccountId: resolvedDestinationAccountId,
           occurredAt,
@@ -550,6 +560,7 @@ function OwnerScopedHomeView({
     setDestinationAccountId("");
     setType(transaction.type);
     setAmount(String(transaction.amount));
+    setTransferFee("");
     setCategoryId(transaction.categoryId);
     setAccountId(transaction.accountId);
     setOccurredAt(transaction.occurredAt.slice(0, 16).replace(" ", "T"));
@@ -566,6 +577,7 @@ function OwnerScopedHomeView({
     setEditingTransfer(transfer);
     setQuickReentryParents(null);
     setAmount(String(transfer.amount));
+    setTransferFee(String(transfer.fee ?? 0));
     setSourceAccountId(transfer.sourceAccountId);
     setDestinationAccountId(transfer.destinationAccountId);
     setOccurredAt(transfer.occurredAt.slice(0, 16).replace(" ", "T"));
@@ -697,6 +709,24 @@ function OwnerScopedHomeView({
               }}
             />
           </label>
+
+          {mode === "transfer" && (
+            <div className="choice-section">
+              <label>
+                <span>手續費（選填）</span>
+                <MoneyInput aria-label="手續費" value={transferFee} placeholder="0"
+                  onValueChange={(value) => { setTransferFee(value); setError(""); setSuccess(""); }} />
+              </label>
+              <p className="muted">由來源帳戶額外扣除，並計入支出。</p>
+              {parseRequiredNumberInput(amount) !== null
+                && (transferFee.trim() === "" || parseRequiredNumberInput(transferFee) !== null) && (
+                <p aria-live="polite">
+                  來源扣款 {displayMoney(addMoney(parseRequiredNumberInput(amount)!, parseRequiredNumberInput(transferFee) ?? 0))}
+                  {" · "}目的入帳 {displayMoney(parseRequiredNumberInput(amount)!)}
+                </p>
+              )}
+            </div>
+          )}
 
           {mode !== "transfer" && <fieldset className="choice-section" data-tutorial="category">
             <legend>選擇分類</legend>
@@ -1139,6 +1169,7 @@ function OwnerScopedHomeView({
                       <strong>{transferLabel}</strong>
                       <small>
                         {shortDate(transfer.occurredAt)}
+                        {(transfer.fee ?? 0) > 0 ? ` · 手續費 ${displayMoney(transfer.fee!)}` : ""}
                         {transfer.note ? ` · ${transfer.note}` : ""}
                       </small>
                       {hasDependencyConflict && (

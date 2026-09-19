@@ -1,7 +1,7 @@
 import { getPeriodRange, isWithinRange } from './dateRange';
 import type { Budget, FinanceData } from './model';
 import { stableLegacyId } from './legacyMigration';
-import { subtractMoney, sumMoney } from './money';
+import { addMoney, subtractMoney, sumMoney } from './money';
 import { isFinancialTransaction } from './tutorialRecord';
 
 export interface BudgetUsage {
@@ -90,12 +90,18 @@ export function calculateBudgetUsage(data: FinanceData, reference: Date): Budget
     .filter((budget) => !budget.deletedAt && budget.isActive)
     .map((budget) => {
       const range = getPeriodRange(budget.period === 'weekly' ? 'week' : 'month', reference);
-      const used = sumMoney(expenses
+      const transactionExpense = sumMoney(expenses
         .filter((transaction) => (
           isWithinRange(transaction.occurredAt, range)
           && (budget.scope === 'overall' || transaction.categoryId === budget.categoryId)
         ))
         .map((transaction) => transaction.amount));
+      const transferFees = budget.scope === 'overall'
+        ? sumMoney(data.transfers
+            .filter((transfer) => !transfer.deletedAt && isWithinRange(transfer.occurredAt, range))
+            .map((transfer) => transfer.fee ?? 0))
+        : 0;
+      const used = addMoney(transactionExpense, transferFees);
       const limit = sumMoney([budget.amount]);
       return {
         budgetId: budget.id,

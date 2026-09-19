@@ -325,6 +325,31 @@ describe('versioned finance backup', () => {
     expect(secondRestore.transfers).toHaveLength(1);
   });
 
+  it.each([false, true])('merges omitted and zero transfer fees with identical metadata (reverse=%s)', (reverse) => {
+    const omitted = structuredClone(fixture);
+    const explicitZero = structuredClone(fixture);
+    explicitZero.transfers[0].fee = 0;
+    const current = reverse ? explicitZero : omitted;
+    const incoming = reverse ? omitted : explicitZero;
+
+    const restored = restoreFinanceBackup(current, createFinanceBackup(incoming), { ownerId: 'guest' });
+
+    expect(restored).toEqual(current);
+    expect(restored.transfers).toHaveLength(1);
+  });
+
+  it.each([[undefined, 15], [15, undefined], [15, 20]])(
+    'rejects conflicting transfer fees %s and %s with identical metadata', (currentFee, incomingFee) => {
+      const current = structuredClone(fixture);
+      const incoming = structuredClone(fixture);
+      if (currentFee !== undefined) current.transfers[0].fee = currentFee;
+      if (incomingFee !== undefined) incoming.transfers[0].fee = incomingFee;
+
+      expect(() => restoreFinanceBackup(current, createFinanceBackup(incoming), { ownerId: 'guest' }))
+        .toThrow(/conflicting.*transfer-withdrawal/i);
+    },
+  );
+
   it('rejects equal-version divergent payloads that reuse one operation identity', () => {
     const current = structuredClone(fixture);
     current.transactions[0].updatedAt = '2026-08-21T10:00:00+08:00';
@@ -513,7 +538,7 @@ describe('transaction CSV export', () => {
 
     expect(transactionCsv).not.toContain('transfer-withdrawal');
     expect(transferCsv.startsWith(
-      'id,owner_id,amount,occurred_at,source_account_id,source_account_name,destination_account_id,destination_account_name,note,deleted_at\r\n',
+      'id,owner_id,amount,occurred_at,source_account_id,source_account_name,destination_account_id,destination_account_name,note,deleted_at,fee\r\n',
     )).toBe(true);
     expect(transferCsv).toContain('"transfer-withdrawal","guest","500"');
     expect(transferCsv).toContain('"account-bank","銀行","account-cash","現金"');
@@ -556,5 +581,22 @@ describe('transaction CSV export', () => {
     expect(csv).toContain('tx-breakfast');
     expect(csv).not.toContain('tutorial-record');
     expect(csv).not.toContain(TUTORIAL_RECORD_NOTE);
+  });
+});
+
+
+describe('transfer fee backups', () => {
+  it('preserves fees in JSON restore and CSV while accepting old fee-less records', () => {
+    const data = structuredClone(fixture);
+    data.transfers[0].fee = 15.25;
+    const backup = createFinanceBackup(data);
+    expect(parseFinanceBackup(JSON.stringify(backup)).data.transfers[0].fee).toBe(15.25);
+    expect(exportTransfersCsv(data)).toContain(',"15.25"');
+    expect(parseFinanceBackup(JSON.stringify(createFinanceBackup(fixture))).data.transfers[0].fee).toBeUndefined();
+  });
+  it.each([-1, NaN, Infinity, 100000001, 0.0000001, null])('rejects invalid fee %s', (fee) => {
+    const backup = createFinanceBackup(fixture);
+    (backup.data.transfers[0] as unknown as Record<string, unknown>).fee = fee;
+    expect(() => parseFinanceBackup(backup)).toThrow(/fee/);
   });
 });

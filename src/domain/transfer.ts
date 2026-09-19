@@ -8,6 +8,7 @@ import {
 
 export interface TransferDraft {
   amount: number;
+  fee?: number;
   sourceAccountId: string;
   destinationAccountId: string;
   occurredAt: string;
@@ -54,6 +55,11 @@ export function buildTransferRecord(
   if (draft.sourceAccountId === draft.destinationAccountId) {
     throw new Error('來源帳戶與目的帳戶必須不同');
   }
+  if (draft.fee !== undefined && (!Number.isFinite(draft.fee) || draft.fee < 0
+    || draft.fee > MAX_SAFE_MONEY
+    || moneyDecimalPlaces(draft.fee) > MAX_LEGACY_MONEY_DECIMAL_PLACES)) {
+    throw new Error('手續費必須為安全金額範圍內的非負數，小數位最多 6 位');
+  }
   try {
     parseLocalDateTime(draft.occurredAt);
   } catch {
@@ -78,6 +84,7 @@ export function buildTransferRecord(
   return {
     ...metadata,
     amount: draft.amount,
+    ...(draft.fee !== undefined ? { fee: draft.fee } : {}),
     sourceAccountId: source.id,
     sourceAccountName: previous?.sourceAccountId === source.id
       ? previous.sourceAccountName

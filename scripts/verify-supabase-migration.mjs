@@ -27,6 +27,9 @@ assert.notEqual(
   'Expected an additive finance_cloud_consistency migration',
 );
 const cloudConsistencyMigrationSql = migrationSources[cloudConsistencyMigrationIndex];
+const transferFeeMigrationIndex = migrationFiles.findIndex((name) => name.endsWith('_finance_transfer_fees.sql'));
+assert.notEqual(transferFeeMigrationIndex, -1, 'Expected an additive finance_transfer_fees migration');
+const transferFeeMigrationSql = migrationSources[transferFeeMigrationIndex];
 
 const OWNER_A = '11111111-1111-4111-8111-111111111111';
 const OWNER_B = '22222222-2222-4222-8222-222222222222';
@@ -263,7 +266,7 @@ async function verifyFreshAndRetry() {
           where conname ~ '^finance_v3_.*_len_chk$') as text_checks
     `);
     assert.equal(numeric(resourceGuardCounts.triggers), 10, 'Expected one row quota trigger per owner-scoped entity table');
-    assert.equal(numeric(resourceGuardCounts.numeric_checks), 10, 'Expected one future-write check per finance numeric column');
+    assert.equal(numeric(resourceGuardCounts.numeric_checks), 11, 'Expected one future-write check per finance numeric column');
     assert.equal(numeric(resourceGuardCounts.text_checks), 78, 'Expected a future-write check on every persisted text field');
 
     const domainCheckCount = await one(db, `
@@ -2458,6 +2461,7 @@ async function verifyAtomicTransfers() {
       user_id: OWNER_A,
       id: 'historical-imported-transfer',
       amount: 250,
+      fee: 15.25,
       source_account_id: 'historical-archived-source',
       source_account_name: '舊銀行名',
       destination_account_id: 'historical-active-destination',
@@ -2529,9 +2533,10 @@ async function verifyAtomicTransfers() {
     assert.equal(importedHistoricalAccount.deleted_at, null,
       'Historical import must not invent a tombstone');
     const importedHistoricalTransfer = await one(db, `
-      select source_account_id, source_account_name from public.transfers
+      select source_account_id, source_account_name, fee from public.transfers
       where user_id = $1 and id = 'historical-imported-transfer'
     `, [OWNER_A]);
+    assert.equal(numeric(importedHistoricalTransfer.fee), 15.25, 'Historical import preserves fees');
     assert.equal(importedHistoricalTransfer.source_account_id, 'historical-archived-source');
     assert.equal(importedHistoricalTransfer.source_account_name, '舊銀行名',
       'Historical import must preserve the original endpoint name snapshot');
@@ -2665,6 +2670,35 @@ async function verifyAtomicTransfers() {
         ($1, 'excluded-to-excluded', 30, 'excluded-a', '排除 A', 'excluded-b', '排除 B', '2026-08-28 09:03', 1, now(), 'transfer-4-op')
     `, [OWNER_A]);
 
+    // Defaults preserve legacy rows, and fees reduce only included-source capacity.
+    const legacyFee = await one(db, `select fee from public.transfers where user_id = $1 and id = 'included-to-included'`, [OWNER_A]);
+    assert.equal(numeric(legacyFee.fee), 0);
+    for (const invalidFee of ['-1', 'NaN', 'Infinity', '100000001', '0.0000001']) {
+      await assert.rejects(db.query(`update public.transfers set fee = $2::numeric,
+        version = 2, last_operation_id = 'invalid-fee-op'
+        where user_id = $1 and id = 'included-to-included'`, [OWNER_A, invalidFee]), /fee_numeric_chk|check constraint/i);
+    }
+    await db.query(`update public.transfers set fee = 15.005, version = 2,
+      last_operation_id = 'valid-fee-op' where user_id = $1 and id = 'included-to-included'`, [OWNER_A]);
+    await db.query(`update public.transfers set fee = 20, version = 2,
+      last_operation_id = 'excluded-fee-op' where user_id = $1 and id = 'excluded-to-included'`, [OWNER_A]);
+    await db.query(`insert into public.transfers (
+      user_id, id, amount, source_account_id, source_account_name,
+      destination_account_id, destination_account_name, occurred_at,
+      version, updated_at, last_operation_id
+    ) values ($1, 'included-to-included', 100, 'included-a', '計入 A',
+      'included-b', '計入 B', '2026-08-28 09:00', 3, now(), 'legacy-edit-fee-op')
+    on conflict (user_id, id) do update set fee = excluded.fee,
+      version = excluded.version, last_operation_id = excluded.last_operation_id`, [OWNER_A]);
+    const preservedFee = await one(db, `select fee from public.transfers where user_id = $1 and id = 'included-to-included'`, [OWNER_A]);
+    assert.equal(numeric(preservedFee.fee), 15.005, 'Old clients must not reset a fee when omitting it from UPSERT');
+    await db.exec('reset role');
+    const beforeFeeReapply = await db.query('select * from public.transfers order by user_id, id');
+    await db.exec(transferFeeMigrationSql);
+    const afterFeeReapply = await db.query('select * from public.transfers order by user_id, id');
+    assert.deepEqual(afterFeeReapply.rows, beforeFeeReapply.rows,
+      'Reapplying the fee migration must preserve every transfer, including existing nonzero fees');
+    await db.exec('set role authenticated');
     const transferCount = await one(db, `
       select count(*)::integer as count from public.transfers
       where user_id = $1 and id in (
@@ -2698,7 +2732,7 @@ async function verifyAtomicTransfers() {
       insert into public.savings_allocations (
         user_id, id, goal_id, amount_delta, occurred_at,
         version, updated_at, last_operation_id
-      ) values ($1, 'transfer-capacity-fit', 'transfer-capacity-goal', 1940,
+      ) values ($1, 'transfer-capacity-fit', 'transfer-capacity-goal', 1924.99,
         '2026-08-28', 1, now(), 'transfer-capacity-fit-op')
     `, [OWNER_A]);
     await assert.rejects(
@@ -2799,7 +2833,7 @@ async function verifyAtomicTransfers() {
         update public.transfers
         set destination_account_id = 'excluded-b',
           destination_account_name = '排除 B',
-          version = 2,
+          version = 4,
           last_operation_id = 'retarget-to-archived-op'
         where user_id = $1 and id = 'included-to-included'
       `, [OWNER_A]),
@@ -2815,6 +2849,11 @@ async function verifyAtomicTransfers() {
       /conflicting payload|40001/i,
       'A divergent same-clock transfer payload must fail closed',
     );
+
+    const clearedFee = await one(db, `update public.transfers set fee = 0,
+      version = 4, last_operation_id = 'clear-fee-op'
+      where user_id = $1 and id = 'included-to-included' returning fee`, [OWNER_A]);
+    assert.equal(numeric(clearedFee.fee), 0, 'An explicit zero must clear a previously nonzero fee');
 
     await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
     const foreignCount = await one(db, `select count(*)::integer as count from public.transfers`);

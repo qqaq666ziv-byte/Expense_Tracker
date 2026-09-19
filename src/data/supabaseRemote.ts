@@ -63,7 +63,7 @@ const MONEY_TEXT_ALIAS = '__finance_money_text';
 
 function selectProjection(entity: FinanceEntityName): string {
   const column = MONEY_COLUMN_BY_ENTITY[entity];
-  return column === undefined ? '*' : `*,${MONEY_TEXT_ALIAS}:${column}::text`;
+  return column === undefined ? '*' : `*,${MONEY_TEXT_ALIAS}:${column}::text${entity === 'transfers' ? ',__finance_fee_text:fee::text' : ''}`;
 }
 
 interface SupabaseErrorDiagnostic {
@@ -485,6 +485,7 @@ function encodeRecord(entity: FinanceEntityName, record: SyncEntityRecord): Data
       return {
         ...common,
         amount: transfer.amount,
+        fee: transfer.fee ?? 0,
         source_account_id: transfer.sourceAccountId,
         source_account_name: transfer.sourceAccountName,
         destination_account_id: transfer.destinationAccountId,
@@ -993,6 +994,10 @@ export function createSupabaseRemoteAdapter(client: SupabaseClient): RemoteAdapt
 
 function decodeTransfer(row: DatabaseRow): Transfer {
   const note = optionalString(row, 'note');
+  const fee = row.fee === undefined ? 0 : requiredMoney({
+    ...row, [MONEY_TEXT_ALIAS]: row.__finance_fee_text,
+  }, 'fee');
+  if (fee < 0) throw new Error('Supabase transfer fee must be nonnegative');
   const sourceAccountId = requiredString(row, 'source_account_id');
   const destinationAccountId = requiredString(row, 'destination_account_id');
   if (sourceAccountId === destinationAccountId) {
@@ -1001,6 +1006,7 @@ function decodeTransfer(row: DatabaseRow): Transfer {
   return {
     ...commonRecord(row),
     amount: requiredPositiveNumber(row, 'amount'),
+    ...(fee === 0 ? {} : { fee }),
     sourceAccountId,
     sourceAccountName: requiredString(row, 'source_account_name'),
     destinationAccountId,

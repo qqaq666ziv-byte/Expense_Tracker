@@ -653,3 +653,67 @@ describe('finance engine', () => {
     }
   });
 });
+
+describe('transfer fee analytics', () => {
+  const transfer = {
+    id: 'fee-transfer', ownerId: 'guest', amount: 100.25, fee: 0.15,
+    sourceAccountId: 'cash', sourceAccountName: '現金',
+    destinationAccountId: 'jkopay', destinationAccountName: '街口支付',
+    occurredAt: '2026-08-21 12:00', version: 1,
+    updatedAt: '2026-08-21T04:00:00.000Z', lastOperationId: 'transfer-create',
+  };
+
+  it('deducts principal plus fee once from source and counts only fees in cash flow', () => {
+    const data: FinanceData = { ...baseData, transfers: [transfer] };
+    const summary = calculateFinancials(data);
+    expect(summary.accountBalances.map((account) => account.balance)).toEqual([899.6, 600.25]);
+    expect(summary.totalAssets).toBe(1499.85);
+    expect(summary.allTime).toMatchObject({ income: 0, expense: 0.15, net: -0.15 });
+    expect(summary.allTime.expenseByCategory).toEqual([
+      { categoryId: 'system:transfer-fee', name: '手續費', amount: 0.15 },
+    ]);
+    expect(data.transactions).toEqual([]);
+    expect(buildLedgerHistory(data)).toEqual([{ kind: 'transfer', record: transfer }]);
+  });
+
+  it('includes fees in today, period comparisons, largest expense and local-day trends', () => {
+    const reference = new Date(2026, 7, 21, 15);
+    const data: FinanceData = { ...baseData, transfers: [
+      transfer,
+      { ...transfer, id: 'prior', fee: 0.05, occurredAt: '2026-07-21 12:00' },
+      { ...transfer, id: 'removed', fee: 99, deletedAt: transfer.updatedAt },
+    ] };
+    const insights = calculateInsights(data, { period: 'month', reference });
+    expect(insights.today).toMatchObject({ expense: 0.15, net: -0.15, topExpenseCategory: { name: '手續費', amount: 0.15 } });
+    expect(insights.period).toMatchObject({ expense: 0.15, largestExpense: { amount: 0.15, categoryName: '手續費' } });
+    expect(insights.previousPeriod.expense).toBe(0.05);
+    expect(insights.comparison.expenseDelta).toBe(0.1);
+    expect(calculateSpendingTrend(data, getPeriodRange('month', reference))).toEqual([['2026-08-21', 0.15]]);
+  });
+
+  it('treats absent and zero fees alike and removes fee impact when transfer is deleted', () => {
+    const { fee: _fee, ...legacy } = transfer;
+    for (const record of [legacy, { ...transfer, fee: 0 }, { ...transfer, deletedAt: transfer.updatedAt }]) {
+      const data = { ...baseData, transfers: [record] };
+      expect(calculateFinancials(data).allTime.expense).toBe(0);
+      expect(calculateFinancials(data).totalAssets).toBe(1500);
+      expect(calculateSpendingTrend(data, getPeriodRange('month', new Date(2026, 7, 21)))).toEqual([]);
+    }
+  });
+
+  it('keeps a real category with the synthetic base ID separate from transfer fees', () => {
+    const data: FinanceData = { ...baseData,
+      categories: [{ ...baseData.categories[0], id: 'system:transfer-fee', name: '自訂分類' }],
+      transfers: [transfer],
+      transactions: [{
+        id: 'expense', ownerId: 'guest', amount: 1, type: 'expense',
+        categoryId: 'system:transfer-fee', categoryName: '自訂分類', accountId: 'cash', accountName: '現金',
+        occurredAt: transfer.occurredAt, version: 1, updatedAt: transfer.updatedAt, lastOperationId: 'expense-create',
+      }],
+    };
+    expect(calculateFinancials(data).allTime.expenseByCategory).toEqual([
+      { categoryId: 'system:transfer-fee', name: '自訂分類', amount: 1 },
+      { categoryId: 'system:transfer-fee:', name: '手續費', amount: 0.15 },
+    ]);
+  });
+});

@@ -700,6 +700,9 @@ function normalizedRecord(entity: FinanceEntityName, record: SyncEntityRecord): 
   if (entity === 'accounts' && normalized.requiresReview === undefined) {
     normalized.requiresReview = false;
   }
+  if (entity === 'transfers' && normalized.fee === undefined) {
+    normalized.fee = 0;
+  }
   return normalized;
 }
 

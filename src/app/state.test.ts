@@ -63,7 +63,7 @@ describe('owner-scoped local state', () => {
     expect(loaded.state.initialBootstrap?.candidate.transfers).toEqual([]);
   });
 
-  it('round-trips a pending authenticated transfer across an app restart', () => {
+  it.each([undefined, 0, 15.25])('round-trips a pending authenticated transfer with fee %s across an app restart', (fee) => {
     const storage = memoryStorage();
     const initial = readyAuthenticatedState();
     const source = initial.data.accounts[0];
@@ -74,6 +74,7 @@ describe('owner-scoped local state', () => {
     initial.data.accounts.push(destination);
     const record = {
       id: 'offline-transfer', ownerId: initial.ownerId, amount: 321,
+      ...(fee === undefined ? {} : { fee }),
       sourceAccountId: source.id, sourceAccountName: source.name,
       destinationAccountId: destination.id, destinationAccountName: destination.name,
       occurredAt: '2026-08-28 10:30', note: '離線建立', version: 1,
@@ -799,6 +800,62 @@ describe('owner-scoped local state', () => {
     expect(repeated.conflicts).toEqual([]);
     expect(repeated.addedCount).toBe(0);
     expect(repeated.skippedCount).toBeGreaterThan(0);
+  });
+
+  it.each([
+    { guestFee: undefined, savedFee: 0, conflict: false },
+    { guestFee: 0, savedFee: undefined, conflict: false },
+    { guestFee: 15.25, savedFee: 15.25, conflict: false },
+    { guestFee: undefined, savedFee: 15, conflict: true },
+    { guestFee: 15, savedFee: undefined, conflict: true },
+    { guestFee: 15, savedFee: 20, conflict: true },
+    { guestFee: undefined, savedFee: 0, conflict: true, amount: 300 },
+    { guestFee: undefined, savedFee: 0, conflict: true, note: '已修改' },
+  ])('re-imports guest transfers without masking business changes: %j', ({ guestFee, savedFee, conflict, amount, note }) => {
+    const guest = createInitialState('guest').data;
+    const source = guest.accounts[0];
+    const destination = { ...source, id: 'guest-bank', name: '銀行', lastOperationId: 'bank-create' };
+    guest.accounts.push(destination);
+    guest.transfers.push({
+      ...newRecordForTest('guest-transfer', 'guest'), amount: 250,
+      ...(guestFee === undefined ? {} : { fee: guestFee }),
+      sourceAccountId: source.id, sourceAccountName: source.name,
+      destinationAccountId: destination.id, destinationAccountName: destination.name,
+      occurredAt: '2026-08-20 08:00',
+    });
+    const first = planGuestImport(readyAuthenticatedState(), remapOwner(guest, 'user-a')).state;
+    // Simulate an authenticated edit or cloud pull that changes the zero-fee representation.
+    const saved = first.data.transfers[0];
+    if (savedFee === undefined) delete saved.fee;
+    else saved.fee = savedFee;
+    if (amount !== undefined) saved.amount = amount;
+    if (note !== undefined) saved.note = note;
+    saved.version += 1;
+    saved.lastOperationId = 'authenticated-edit';
+    first.outbox = [];
+    const before = structuredClone(first);
+    const category = guest.categories.find((item) => item.kind === 'expense')!;
+    guest.transactions.push({
+      ...newRecordForTest('new-guest-transaction', 'guest'),
+      type: 'expense', amount: 10, occurredAt: '2026-08-21 08:00',
+      accountId: source.id, accountName: source.name,
+      categoryId: category.id, categoryName: category.name,
+    });
+
+    const repeated = planGuestImport(first, remapOwner(guest, 'user-a'));
+
+    expect(first).toEqual(before);
+    expect(repeated.state.data.transfers).toEqual(before.data.transfers);
+    if (conflict) {
+      expect(repeated.conflicts).toEqual([{ entity: 'transfers', id: saved.id }]);
+      expect(repeated.addedCount).toBe(0);
+      expect(repeated.state).toBe(first);
+    } else {
+      expect(repeated.conflicts).toEqual([]);
+      expect(repeated.addedCount).toBe(1);
+      expect(repeated.state.data.transactions).toHaveLength(1);
+      expect(repeated.state.outbox).toEqual([expect.objectContaining({ entity: 'transactions' })]);
+    }
   });
 
   it('marks guest-imported accounts and historical transfers as one explicit server batch', () => {

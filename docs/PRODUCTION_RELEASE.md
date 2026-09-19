@@ -195,6 +195,14 @@ or browser code.
 
 Frontend rollback and database rollback are separate operations.
 
+After the transfer-fee release, any potentially existing nonzero fee requires a
+**fee-aware** frontend as well. Build the emergency `transfer-read-only` mode
+from the reviewed fee-capable release commit; an older transfer-only release
+omits fees from balances and expense reports. Do not route users to that older
+release unless authoritative evidence rules out cloud fees and local pending
+fee records. Preserve the additive fee column and records during recovery.
+See [TRANSFER_FEES.md](TRANSFER_FEES.md) for the fee-specific release rules.
+
 Use one operational rule for a code-only frontend rollback: **if any
 Production `public.transfers` row may exist, deploy a transfer-aware frontend.**
 Unless an authoritative, current aggregate check proves the table is empty,
