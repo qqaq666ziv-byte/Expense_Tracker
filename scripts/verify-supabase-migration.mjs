@@ -27,6 +27,9 @@ assert.notEqual(
   'Expected an additive finance_cloud_consistency migration',
 );
 const cloudConsistencyMigrationSql = migrationSources[cloudConsistencyMigrationIndex];
+const transferFeeMigrationIndex = migrationFiles.findIndex((name) => name.endsWith('_finance_transfer_fees.sql'));
+assert.notEqual(transferFeeMigrationIndex, -1, 'Expected an additive finance_transfer_fees migration');
+const transferFeeMigrationSql = migrationSources[transferFeeMigrationIndex];
 
 const OWNER_A = '11111111-1111-4111-8111-111111111111';
 const OWNER_B = '22222222-2222-4222-8222-222222222222';
@@ -2689,6 +2692,13 @@ async function verifyAtomicTransfers() {
       version = excluded.version, last_operation_id = excluded.last_operation_id`, [OWNER_A]);
     const preservedFee = await one(db, `select fee from public.transfers where user_id = $1 and id = 'included-to-included'`, [OWNER_A]);
     assert.equal(numeric(preservedFee.fee), 15.005, 'Old clients must not reset a fee when omitting it from UPSERT');
+    await db.exec('reset role');
+    const beforeFeeReapply = await db.query('select * from public.transfers order by user_id, id');
+    await db.exec(transferFeeMigrationSql);
+    const afterFeeReapply = await db.query('select * from public.transfers order by user_id, id');
+    assert.deepEqual(afterFeeReapply.rows, beforeFeeReapply.rows,
+      'Reapplying the fee migration must preserve every transfer, including existing nonzero fees');
+    await db.exec('set role authenticated');
     const transferCount = await one(db, `
       select count(*)::integer as count from public.transfers
       where user_id = $1 and id in (
@@ -2839,6 +2849,11 @@ async function verifyAtomicTransfers() {
       /conflicting payload|40001/i,
       'A divergent same-clock transfer payload must fail closed',
     );
+
+    const clearedFee = await one(db, `update public.transfers set fee = 0,
+      version = 4, last_operation_id = 'clear-fee-op'
+      where user_id = $1 and id = 'included-to-included' returning fee`, [OWNER_A]);
+    assert.equal(numeric(clearedFee.fee), 0, 'An explicit zero must clear a previously nonzero fee');
 
     await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
     const foreignCount = await one(db, `select count(*)::integer as count from public.transfers`);

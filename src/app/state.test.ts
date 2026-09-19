@@ -63,7 +63,7 @@ describe('owner-scoped local state', () => {
     expect(loaded.state.initialBootstrap?.candidate.transfers).toEqual([]);
   });
 
-  it('round-trips a pending authenticated transfer across an app restart', () => {
+  it.each([undefined, 0, 15.25])('round-trips a pending authenticated transfer with fee %s across an app restart', (fee) => {
     const storage = memoryStorage();
     const initial = readyAuthenticatedState();
     const source = initial.data.accounts[0];
@@ -74,6 +74,7 @@ describe('owner-scoped local state', () => {
     initial.data.accounts.push(destination);
     const record = {
       id: 'offline-transfer', ownerId: initial.ownerId, amount: 321,
+      ...(fee === undefined ? {} : { fee }),
       sourceAccountId: source.id, sourceAccountName: source.name,
       destinationAccountId: destination.id, destinationAccountName: destination.name,
       occurredAt: '2026-08-28 10:30', note: '離線建立', version: 1,

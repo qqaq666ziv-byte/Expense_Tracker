@@ -623,7 +623,9 @@ export function restoreFinanceBackup(
     accounts: mergeById(current.accounts, incoming.accounts),
     categories: mergeById(current.categories, incoming.categories),
     transactions: mergeById(current.transactions, incoming.transactions),
-    transfers: mergeById(current.transfers, incoming.transfers),
+    transfers: mergeById(current.transfers, incoming.transfers, (record) => ({
+      ...record, fee: record.fee ?? 0,
+    })),
     adjustments: mergeById(current.adjustments, incoming.adjustments),
     goals: mergeById(current.goals, incoming.goals),
     allocations: mergeById(current.allocations, incoming.allocations),
@@ -645,6 +647,7 @@ function mergeById<T extends {
 }>(
   current: readonly T[],
   incoming: readonly T[],
+  normalizeForComparison: (record: T) => unknown = (record) => record,
 ): T[] {
   const merged = current.map(clone);
   const indexById = new Map(merged.map((record, index) => [record.id, index]));
@@ -665,7 +668,7 @@ function mergeById<T extends {
       merged[existingIndex] = record;
     } else if (record.version === existing.version
       && updateOrder === 0
-      && canonicalJson(record) !== canonicalJson(existing)) {
+      && canonicalJson(normalizeForComparison(record)) !== canonicalJson(normalizeForComparison(existing))) {
       throw new BackupValidationError(
         `Backup contains conflicting data for record ${record.id} with identical version metadata.`,
       );

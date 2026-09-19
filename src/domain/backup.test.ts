@@ -325,6 +325,31 @@ describe('versioned finance backup', () => {
     expect(secondRestore.transfers).toHaveLength(1);
   });
 
+  it.each([false, true])('merges omitted and zero transfer fees with identical metadata (reverse=%s)', (reverse) => {
+    const omitted = structuredClone(fixture);
+    const explicitZero = structuredClone(fixture);
+    explicitZero.transfers[0].fee = 0;
+    const current = reverse ? explicitZero : omitted;
+    const incoming = reverse ? omitted : explicitZero;
+
+    const restored = restoreFinanceBackup(current, createFinanceBackup(incoming), { ownerId: 'guest' });
+
+    expect(restored).toEqual(current);
+    expect(restored.transfers).toHaveLength(1);
+  });
+
+  it.each([[undefined, 15], [15, undefined], [15, 20]])(
+    'rejects conflicting transfer fees %s and %s with identical metadata', (currentFee, incomingFee) => {
+      const current = structuredClone(fixture);
+      const incoming = structuredClone(fixture);
+      if (currentFee !== undefined) current.transfers[0].fee = currentFee;
+      if (incomingFee !== undefined) incoming.transfers[0].fee = incomingFee;
+
+      expect(() => restoreFinanceBackup(current, createFinanceBackup(incoming), { ownerId: 'guest' }))
+        .toThrow(/conflicting.*transfer-withdrawal/i);
+    },
+  );
+
   it('rejects equal-version divergent payloads that reuse one operation identity', () => {
     const current = structuredClone(fixture);
     current.transactions[0].updatedAt = '2026-08-21T10:00:00+08:00';
