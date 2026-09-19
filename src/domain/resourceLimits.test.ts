@@ -48,3 +48,12 @@ describe('server-aligned finance write limits', () => {
     )).toThrow(/safe monetary range/i);
   });
 });
+
+
+it.each([-1, NaN, Infinity, 100000001, 0.0000001])('rejects unsafe transfer fee %s before persistence', (fee) => {
+  expect(() => assertFinanceRecordWithinWriteLimits('transfers', {
+    id: 'transfer-1', ownerId: 'user-a', version: 1, updatedAt: '2026-09-19', lastOperationId: 'op',
+    amount: 100, fee, sourceAccountId: 'source', sourceAccountName: '來源',
+    destinationAccountId: 'destination', destinationAccountName: '目的', occurredAt: '2026-09-19',
+  })).toThrow(/transfers.fee/);
+});

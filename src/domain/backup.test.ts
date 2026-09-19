@@ -513,7 +513,7 @@ describe('transaction CSV export', () => {
 
     expect(transactionCsv).not.toContain('transfer-withdrawal');
     expect(transferCsv.startsWith(
-      'id,owner_id,amount,occurred_at,source_account_id,source_account_name,destination_account_id,destination_account_name,note,deleted_at\r\n',
+      'id,owner_id,amount,occurred_at,source_account_id,source_account_name,destination_account_id,destination_account_name,note,deleted_at,fee\r\n',
     )).toBe(true);
     expect(transferCsv).toContain('"transfer-withdrawal","guest","500"');
     expect(transferCsv).toContain('"account-bank","銀行","account-cash","現金"');
@@ -556,5 +556,22 @@ describe('transaction CSV export', () => {
     expect(csv).toContain('tx-breakfast');
     expect(csv).not.toContain('tutorial-record');
     expect(csv).not.toContain(TUTORIAL_RECORD_NOTE);
+  });
+});
+
+
+describe('transfer fee backups', () => {
+  it('preserves fees in JSON restore and CSV while accepting old fee-less records', () => {
+    const data = structuredClone(fixture);
+    data.transfers[0].fee = 15.25;
+    const backup = createFinanceBackup(data);
+    expect(parseFinanceBackup(JSON.stringify(backup)).data.transfers[0].fee).toBe(15.25);
+    expect(exportTransfersCsv(data)).toContain(',"15.25"');
+    expect(parseFinanceBackup(JSON.stringify(createFinanceBackup(fixture))).data.transfers[0].fee).toBeUndefined();
+  });
+  it.each([-1, NaN, Infinity, 100000001, 0.0000001, null])('rejects invalid fee %s', (fee) => {
+    const backup = createFinanceBackup(fixture);
+    (backup.data.transfers[0] as unknown as Record<string, unknown>).fee = fee;
+    expect(() => parseFinanceBackup(backup)).toThrow(/fee/);
   });
 });

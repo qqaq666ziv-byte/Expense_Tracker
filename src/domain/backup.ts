@@ -136,7 +136,7 @@ export function exportTransactionsCsv(data: FinanceData): string {
 const TRANSFER_CSV_HEADERS = [
   'id', 'owner_id', 'amount', 'occurred_at', 'source_account_id',
   'source_account_name', 'destination_account_id', 'destination_account_name',
-  'note', 'deleted_at',
+  'note', 'deleted_at', 'fee',
 ] as const;
 
 /** Separate export preserves the established transaction CSV contract. */
@@ -153,6 +153,7 @@ export function exportTransfersCsv(data: FinanceData): string {
     csvCell(transfer.destinationAccountName),
     csvCell(transfer.note),
     csvCell(transfer.deletedAt),
+    csvCell(transfer.fee ?? 0, false),
   ].join(','));
   return `${TRANSFER_CSV_HEADERS.join(',')}\r\n${rows.join('\r\n')}${rows.length > 0 ? '\r\n' : ''}`;
 }
@@ -197,7 +198,7 @@ export function parseFinanceBackup(input: string | unknown): FinanceBackup {
   return clone(normalized) as unknown as FinanceBackup;
 }
 
-const MONEY_JSON_KEYS = new Set(['amount', 'amountDelta', 'openingBalance', 'targetAmount']);
+const MONEY_JSON_KEYS = new Set(['amount', 'fee', 'amountDelta', 'openingBalance', 'targetAmount']);
 
 interface JsonParseSourceContext {
   source?: string;
@@ -465,6 +466,10 @@ export function validateFinanceData(value: unknown, path: string): asserts value
   transfers.forEach((transfer, index) => {
     const itemPath = `${path}.transfers[${index}]`;
     assertPositiveAmount(transfer.amount, `${itemPath}.amount`);
+    if (transfer.fee !== undefined) {
+      assertMoneyAmount(transfer.fee, `${itemPath}.fee`);
+      if (transfer.fee < 0) fail(`${itemPath}.fee`, 'must be nonnegative');
+    }
     assertReference(transfer.sourceAccountId, accountIds, `${itemPath}.sourceAccountId`, 'account');
     assertString(transfer.sourceAccountName, `${itemPath}.sourceAccountName`);
     assertReference(

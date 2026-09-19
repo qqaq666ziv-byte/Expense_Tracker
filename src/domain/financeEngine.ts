@@ -3,6 +3,7 @@ import type { CustomRangeInput, DateRange, PeriodKey } from './dateRange';
 import { sortByDisplayOrder } from './displayOrder';
 import { addMoney, compareMoney, subtractMoney, sumMoney } from './money';
 import { isFinancialTransaction } from './tutorialRecord';
+import { getAnalyticsTransactions } from './analyticsTransactions';
 import {
   countElapsedDays,
   getEquivalentPreviousPeriodRange,
@@ -103,7 +104,7 @@ export function calculateSpendingTrend(
 ): SpendingTrendPoint[] {
   if (maxPoints <= 0) return [];
   const totals = new Map<string, number>();
-  for (const transaction of data.transactions) {
+  for (const transaction of getAnalyticsTransactions(data)) {
     if (!isFinancialTransaction(transaction) || transaction.type !== 'expense' || !isWithinRange(transaction.occurredAt, range)) {
       continue;
     }
@@ -130,7 +131,7 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
         .filter((adjustment) => adjustment.accountId === account.id)
         .map((adjustment) => adjustment.amountDelta));
       const transferDelta = sumMoney(transfers.flatMap((transfer) => {
-        if (transfer.sourceAccountId === account.id) return [-transfer.amount];
+        if (transfer.sourceAccountId === account.id) return [-addMoney(transfer.amount, transfer.fee ?? 0)];
         if (transfer.destinationAccountId === account.id) return [transfer.amount];
         return [];
       }));
@@ -146,7 +147,7 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
   const income = sumMoney(transactions
     .filter((transaction) => transaction.type === 'income')
     .map((transaction) => transaction.amount));
-  const expenseTransactions = transactions.filter((transaction) => transaction.type === 'expense');
+  const expenseTransactions = getAnalyticsTransactions(data).filter((transaction) => transaction.type === 'expense');
   const expense = sumMoney(expenseTransactions.map((transaction) => transaction.amount));
   const expenseByCategoryMap = new Map<string, number>();
   for (const transaction of expenseTransactions) {
@@ -187,7 +188,7 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
 
 export function calculateInsights(data: FinanceData, options: InsightsOptions): InsightsSummary {
   const todayRange = getTodayRange(options.reference);
-  const todayTransactions = data.transactions.filter(
+  const todayTransactions = getAnalyticsTransactions(data).filter(
     (transaction) => isFinancialTransaction(transaction) && isWithinRange(transaction.occurredAt, todayRange),
   );
   const income = sumMoney(todayTransactions
@@ -234,7 +235,7 @@ export function calculateInsights(data: FinanceData, options: InsightsOptions): 
 }
 
 function summarizePeriod(data: FinanceData, range: DateRange, reference: Date): PeriodAnalytics {
-  const transactions = data.transactions.filter(
+  const transactions = getAnalyticsTransactions(data).filter(
     (transaction) => isFinancialTransaction(transaction) && isWithinRange(transaction.occurredAt, range),
   );
   const income = sumMoney(transactions

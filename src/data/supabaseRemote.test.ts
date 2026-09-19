@@ -273,6 +273,7 @@ class FakeSupabaseClient {
         ? {
           ...row,
           __finance_money_text: row.__finance_money_text ?? String(row[moneyColumn]),
+          ...(table === 'transfers' && row.fee !== undefined ? { __finance_fee_text: row.__finance_fee_text ?? String(row.fee) } : {}),
         }
         : row
     );
@@ -451,7 +452,7 @@ describe('Supabase remote adapter', () => {
     const historical: Transfer = {
       id: 'historical-transfer', ownerId: 'user-a', version: 1,
       updatedAt: NOW, lastOperationId: 'historical-transfer-op',
-      amount: 250, sourceAccountId: source.id, sourceAccountName: '舊銀行名',
+      amount: 250, fee: 15.25, sourceAccountId: source.id, sourceAccountName: '舊銀行名',
       destinationAccountId: destination.id, destinationAccountName: destination.name,
       occurredAt: '2026-08-20 08:00',
     };
@@ -501,7 +502,7 @@ describe('Supabase remote adapter', () => {
           expect.objectContaining({ id: 'bank', name: '主要銀行', user_id: 'user-a' }),
         ]),
         transfer_operations: [expect.objectContaining({
-          id: 'historical-transfer', source_account_name: '舊銀行名', user_id: 'user-a',
+          id: 'historical-transfer', source_account_name: '舊銀行名', user_id: 'user-a', fee: 15.25,
         })],
       }),
     })]);
@@ -513,14 +514,14 @@ describe('Supabase remote adapter', () => {
       accountRow(account({ id: 'bank', name: '銀行' })),
       accountRow(account()),
     ]);
-    client.tables.set('transfers', [transferRow('transfer-1')]);
+    client.tables.set('transfers', [transferRow('transfer-1', { fee: 15 })]);
     const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
 
     const pulled = await remote.pull('user-a') as RemotePullResult;
     expect(pulled.records).toContainEqual({
       entity: 'transfers',
       record: expect.objectContaining({
-        id: 'transfer-1', amount: 100, sourceAccountId: 'bank',
+        id: 'transfer-1', amount: 100, fee: 15, sourceAccountId: 'bank',
         destinationAccountId: 'cash', note: '領現',
       }),
     });
@@ -540,8 +541,25 @@ describe('Supabase remote adapter', () => {
       queuedAt: NOW,
     });
     expect(encoded).toMatchObject({
-      source_account_id: 'bank', destination_account_id: 'cash', amount: 100,
+      source_account_id: 'bank', destination_account_id: 'cash', amount: 100, fee: 15,
     });
+  });
+
+  it.each([-1, null, 'NaN', 100000001, 0.0000001])('quarantines an invalid transfer fee %s', async (fee) => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account({ id: 'bank', name: '銀行' })), accountRow(account())]);
+    client.tables.set('transfers', [transferRow('bad-fee', { fee })]);
+    const pulled = await createSupabaseRemoteAdapter(asSupabaseClient(client)).pull('user-a') as RemotePullResult;
+    expect(pulled.records.some((entry) => entry.entity === 'transfers')).toBe(false);
+    expect(pulled.issues).toContainEqual(expect.objectContaining({ recordId: 'bad-fee' }));
+  });
+
+  it('quarantines fee precision that numeric JSON rounded away', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account({ id: 'bank', name: '銀行' })), accountRow(account())]);
+    client.tables.set('transfers', [transferRow('bad-fee', { fee: 15, __finance_fee_text: '15.000000000000001' })]);
+    const pulled = await createSupabaseRemoteAdapter(asSupabaseClient(client)).pull('user-a') as RemotePullResult;
+    expect(pulled.issues).toContainEqual(expect.objectContaining({ recordId: 'bad-fee' }));
   });
 
   it('quarantines a transfer with missing or identical endpoints', async () => {

@@ -19,7 +19,7 @@ import {
   shortDate,
   toLocalInput,
 } from "../app/format";
-import { subtractMoney } from "../domain/money";
+import { addMoney, subtractMoney } from "../domain/money";
 import { completeAppliedMutation, type MutationApplication } from "../app/mutationResult";
 import { isFinancialTransaction } from "../domain/tutorialRecord";
 import { FinanceIcon, IconPicker } from "./FinanceIcon";
@@ -517,10 +517,15 @@ export function AssetsView({
                               <div key={`transfer:${entry.record.id}`}>
                                 <span>
                                   {outgoing ? `轉至 ${counterpart}` : `轉自 ${counterpart}`}
-                                  <small>{shortDate(entry.record.occurredAt)}</small>
+                                  <small>{shortDate(entry.record.occurredAt)}
+                                    {outgoing && (entry.record.fee ?? 0) > 0
+                                      ? ` · 含手續費 ${displayMoney(entry.record.fee!)}` : ""}
+                                  </small>
                                 </span>
                                 <b className="transfer">
-                                  {outgoing ? "−" : "+"}{displayMoney(entry.record.amount)}
+                                  {outgoing ? "−" : "+"}{displayMoney(outgoing
+                                    ? addMoney(entry.record.amount, entry.record.fee ?? 0)
+                                    : entry.record.amount)}
                                 </b>
                               </div>
                             );

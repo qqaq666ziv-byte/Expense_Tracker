@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { FinanceData, SyncRecord } from './model';
 import { buildTransferRecord } from './transfer';
+import { differingSyncRecordFields } from './syncEngine';
 
 const meta: SyncRecord = {
   id: 'transfer-1', ownerId: 'user-a', version: 1,
@@ -26,6 +27,16 @@ const data: FinanceData = {
 };
 
 describe('first-class transfer record', () => {
+  it('preserves a fee atomically and treats absent legacy fees as zero for sync', () => {
+    const record = buildTransferRecord(data, {
+      amount: 100, fee: 15, sourceAccountId: 'bank', destinationAccountId: 'cash',
+      occurredAt: '2026-08-28 10:00',
+    }, meta);
+    expect(record.fee).toBe(15);
+    const { fee: _fee, ...legacy } = record;
+    expect(differingSyncRecordFields('transfers', legacy, { ...legacy, fee: 0 })).toEqual([]);
+    expect(differingSyncRecordFields('transfers', legacy, record)).toEqual(['fee']);
+  });
   it('captures both account display snapshots in one owner-scoped record', () => {
     expect(buildTransferRecord(data, {
       amount: 100,
@@ -46,6 +57,11 @@ describe('first-class transfer record', () => {
   });
 
   it.each([
+    ['negative fee', { fee: -1 }, /手續費/],
+    ['nonfinite fee', { fee: Infinity }, /手續費/],
+    ['NaN fee', { fee: NaN }, /手續費/],
+    ['unsafe fee', { fee: 100_000_001 }, /手續費/],
+    ['fee precision', { fee: 0.0000001 }, /手續費/],
     ['zero amount', { amount: 0 }, /大於零/],
     ['unsafe precision', { amount: 0.0000001 }, /小數位/],
     ['unsafe magnitude', { amount: 100_000_001 }, /安全金額/],

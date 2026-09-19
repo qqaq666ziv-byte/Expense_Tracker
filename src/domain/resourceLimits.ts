@@ -102,6 +102,10 @@ export function assertFinanceRecordWithinWriteLimits<E extends FinanceEntityName
       assertTextLimit('transfers.occurredAt', transfer.occurredAt, FINANCE_WRITE_LIMITS.dateText);
       assertTextLimit('transfers.note', transfer.note, FINANCE_WRITE_LIMITS.longText);
       assertMoneyWriteLimit('transfers.amount', transfer.amount);
+      if (transfer.fee !== undefined) {
+        assertMoneyWriteLimit('transfers.fee', transfer.fee);
+        if (transfer.fee < 0) throw new Error('transfers.fee must be nonnegative');
+      }
       break;
     }
     case 'adjustments': {

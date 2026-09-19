@@ -101,6 +101,40 @@ afterEach(() => {
 });
 
 describe('HomeView transfer interactions', () => {
+  it('creates one atomic transfer with an extra fee, previews debit, and resets the fee', async () => {
+    const user = userEvent.setup();
+    const data = dataWithTwoAccounts();
+    const put = vi.fn(() => true);
+    render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+    await user.click(screen.getByRole('button', { name: '記轉帳' }));
+    await user.type(screen.getByLabelText('金額'), '1000');
+    await user.type(screen.getByLabelText('手續費'), '15');
+    await user.click(within(screen.getByRole('group', { name: '從哪個資產帳戶轉出？' }))
+      .getByRole('button', { name: data.accounts[0].name }));
+    await user.click(within(screen.getByRole('group', { name: '要轉入哪個資產帳戶？' }))
+      .getByRole('button', { name: data.accounts[1].name }));
+    expect(screen.getByText(/來源扣款/)).toHaveTextContent('1,015');
+    expect(screen.getByText(/來源扣款/)).toHaveTextContent('目的入帳');
+    await user.click(screen.getByRole('button', { name: '記下這筆轉帳' }));
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(put).toHaveBeenCalledWith('transfers', expect.objectContaining({ amount: 1000, fee: 15 }));
+    expect(screen.getByLabelText('手續費')).toHaveValue('');
+  });
+
+  it('loads an existing fee and explicitly clears it without changing the principal', async () => {
+    const user = userEvent.setup();
+    const data = dataWithTwoAccounts();
+    data.transfers = [{ ...transferFor(data), fee: 15 }];
+    const put = vi.fn(() => true);
+    render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+    expect(screen.getByTestId('transfer-row')).toHaveTextContent('手續費');
+    await user.click(screen.getByRole('button', { name: /編輯轉帳/ }));
+    expect(screen.getByLabelText('手續費')).toHaveValue('15');
+    await user.clear(screen.getByLabelText('手續費'));
+    await user.click(screen.getByRole('button', { name: '儲存轉帳修改' }));
+    expect(put).toHaveBeenCalledWith('transfers', expect.objectContaining({ amount: 500, fee: 0, id: 'transfer-ui' }));
+  });
+
   it('keeps historical transfers visible while disabling create, edit, and delete in emergency mode', () => {
     const data = dataWithTwoAccounts();
     const historical = transferFor(data);

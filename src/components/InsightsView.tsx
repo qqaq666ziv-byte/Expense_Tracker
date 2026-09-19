@@ -13,6 +13,7 @@ import {
   parseLocalDateTime,
   validateCustomRangeInput,
 } from "../domain/dateRange";
+import { getAnalyticsTransactions } from "../domain/analyticsTransactions";
 import { calculateBudgetUsage } from "../domain/budgetEngine";
 import {
   calculateInsights,
@@ -142,7 +143,7 @@ export function InsightsView({
     () => calculateSpendingTrend(data, insights.period.range),
     [data, insights.period.range],
   );
-  const periodTransactions = data.transactions.filter((item) =>
+  const periodTransactions = getAnalyticsTransactions(data).filter((item) =>
     within(item, insights.period.range.start, insights.period.range.end),
   );
   const selectedTransactions = selectedCategoryId
