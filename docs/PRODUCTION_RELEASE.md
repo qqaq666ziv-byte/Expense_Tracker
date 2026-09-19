@@ -65,6 +65,15 @@ assumptions based on project names or previous deployments.
 
 Do not create redundant deployments merely to obtain a green `READY` status.
 
+Verification and independent review default to the changed behavior and its
+affected dependencies. Full-product E2E is required only when explicitly
+requested or when concrete failures or significant cross-cutting risks justify
+it. An unchanged unrelated screenshot or icon is not a release gate. When a
+review tool needs exclusions, record the baseline and evidence scope rather
+than silently marking missing evidence as reviewed. Keep the actual reviewer
+conclusion separate from the tool's formal status and follow the user's current
+release acceptance criteria.
+
 ---
 
 ## Before production release
@@ -270,6 +279,68 @@ If production is broken:
    specifically authorized recovery operation requires otherwise.
 
 Do not stack speculative fixes across multiple layers at once.
+
+---
+
+## Transfer-fee release record — 2026-09-19
+
+- PR: https://github.com/qqaq666ziv-byte/Expense_Tracker/pull/16
+- Release commit: `82261a94213b1268c4570be048f010fd09533680` (merged at
+  `2026-09-19T15:56:38Z`).
+- Vercel production deployment: `dpl_DzLM9ex1q3QeqKvV7rJ2MB6GDFvX`, project
+  `prj_PDwYdTxA52vgkfRek2AzNofUJCHW`, Git `main`, state `READY`.
+- Canonical URL: https://shiba-expense-tracker.vercel.app; the page, current
+  JavaScript `/assets/index-Ble7tv9m.js`, stylesheet `/assets/index-DE5VnswL.css`,
+  and `/sw.js` returned HTTP 200 with the expected content types.
+- Canonical browser smoke completed after a normal reload updated the old PWA
+  shell, without clearing site data. In guest mode the transfer form displayed
+  the optional fee and correctly previewed principal 1,000 plus fee 15 as source
+  debit 1,015 and destination credit 1,000. No production financial record was
+  saved. No browser warning/error was captured in that smoke session.
+- Local verification: 46 test files / 505 tests passed; lint, migration
+  verification, production build, and transfer-read-only build passed. The
+  dependency audit reported no vulnerabilities. Focused local browser checks
+  covered balances, fee editing/persistence, and the mobile form.
+- Ordinary ChatGPT reviewed the source and test evidence through AutoDev and
+  found no remaining confirmed code blocker in round 3. The historical AutoDev
+  job `7114bee8-b8ea-4f5d-b2a7-21f925c4724d` retained a pending formal status
+  because seven unchanged PNG files lacked separate visual evidence. The user
+  explicitly clarified that affected functionality is the release scope and
+  authorized deployment. This release does not claim a formal AutoDev PASS or
+  a complete-product E2E review; the historical manifest was not rewritten.
+- Applied exactly `20260919000000_finance_transfer_fees.sql` to Supabase project
+  `rarkcgtgfvwymjuxgfkx`; the subsequent migration dry-run was up to date.
+  Verified `fee numeric NOT NULL`, ownership RLS enabled, no anonymous SELECT,
+  no ordinary authenticated DELETE on transfers, and server-only import RPC
+  execution. No existing financial records were rewritten.
+- Aggregate row counts and content fingerprints were identical before/after:
+
+  | Table | Rows | MD5 content fingerprint |
+  | --- | ---: | --- |
+  | accounts | 14 | `596d8168fe0b80cc3a0494f94d559bfc` |
+  | transactions | 118 | `197e079fc863333f4577032a03c00068` |
+  | transfers | 0 | `d41d8cd98f00b204e9800998ecf8427e` |
+  | savings_allocations | 1 | `3dec2ea4fb11b96a99fe57c556b47606` |
+
+  Fingerprints cover row JSON ordered by owner/id, excluding the new fee field
+  for the transfer comparison; no private record contents are stored here.
+- Independent backup, outside Git:
+  `C:\Users\USER\.codex\backups\Expense_Tracker\20260919-transfer-fees-release`.
+  `production.custom` SHA-256
+  `51634551A863F33920DE2D6C414D9434710EA3DEA658C9A133C05FD8CE5C2333`;
+  `roles.sql` SHA-256
+  `95AF5CD4F5924F599B212A6555735E858B2686B287A24AE5004D409E60949C62`.
+  Archive listing and full decompression passed; an actual restore was not run.
+- Pre-deployment source checkpoint:
+  `checkpoint/20260919-2353-before-fees-deploy` at
+  `fab60402d874289d3daefa85450271436c445995`.
+- Recovery: build `build:transfer-read-only` from the release commit above and
+  deploy through the canonical project if transfer writes must be stopped.
+  Preserve the fee column, transfer rows, and tombstones. The previous production
+  deployment `dpl_B1qByNA1BHTSgBF4qUoTn2tC7RGT` at `0f60a473...` is historical,
+  **not** the default rollback target once a cloud or pending local fee may exist.
+  A database restore requires separate authorization and a current recovery
+  plan that preserves data written after this backup.
 
 ---
 
