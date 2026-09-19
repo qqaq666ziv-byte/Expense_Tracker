@@ -812,7 +812,7 @@ function canonicalImportValue(value: unknown): unknown {
   return value;
 }
 
-function guestImportContent(record: SyncRecord): string {
+function guestImportContent(entity: FinanceEntityName, record: SyncRecord): string {
   const content = Object.fromEntries(
     Object.entries(record).filter(([key]) => ![
       'version',
@@ -820,6 +820,7 @@ function guestImportContent(record: SyncRecord): string {
       'lastOperationId',
     ].includes(key)),
   );
+  if (entity === 'transfers') content.fee = content.fee ?? 0;
   return JSON.stringify(canonicalImportValue(content));
 }
 
@@ -848,7 +849,7 @@ export function planGuestImport(
       }
       const existing = currentById.get(record.id);
       if (!existing) continue;
-      if (guestImportContent(existing) === guestImportContent(record)) skippedCount += 1;
+      if (guestImportContent(entity, existing) === guestImportContent(entity, record)) skippedCount += 1;
       else conflicts.push({ entity, id: record.id });
     }
   }
