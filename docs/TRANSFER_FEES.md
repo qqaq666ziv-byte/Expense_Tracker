@@ -10,7 +10,10 @@
 
 ## 發布與還原
 
-- 本功能 PR 未執行正式 migration、merge 或部署。
+- 2026-09-19 已套用正式 migration，合併 PR #16 並部署上線；發布 commit 為
+  `82261a94213b1268c4570be048f010fd09533680`。
+  正式網址已確認手續費欄位及「本金 1,000、手續費 15 → 扣款 1,015、入帳 1,000」預覽正常。
+  完整發布與還原紀錄見 `docs/PRODUCTION_RELEASE.md` 的 2026-09-19 紀錄。
 - 發布依 `docs/PRODUCTION_RELEASE.md` 驗證即時環境及備份，先套用
   `20260919000000_finance_transfer_fees.sql`，再發布前端；新前端需要 fee 欄位。
 - 欄位為 additive；舊 client 遺漏 fee 的寫入會保留既存 fee，新 client 明確送 0 可清除。

@@ -57,7 +57,7 @@ Work on a task/feature branch rather than making experimental changes directly o
 
 A task is not complete because the UI looks correct or the build succeeds.
 
-After changes, run all relevant checks available in the repository, including at minimum when configured:
+Before verification, identify the change and its affected dependencies and user flows. Use that scope to choose relevant checks; a request to verify a feature does not imply a full-product E2E audit. For code changes, run the configured applicable checks:
 
 - type checking / linting;
 - automated tests;
@@ -65,13 +65,17 @@ After changes, run all relevant checks available in the repository, including at
 - relevant security/dependency checks;
 - focused manual or browser smoke verification for changed user flows.
 
+Broaden verification only for an explicit user request, a failing check, or concrete evidence of a significant regression outside the initial scope. Documentation-only changes need document/diff checks, not a rerun of unrelated application tests. Once relevant checks pass and blocking findings are resolved, complete the authorized delivery without repeating successful checks absent new changes or evidence.
+
+Unchanged unrelated screenshots, illustrations, icons, and historical artifacts do not require separate visual approval for every feature release. Record their exclusion against a verified baseline when a review tool requires evidence accounting; changed assets and assets on which the feature actually depends remain in scope. Do not silently discard missing evidence for an affected behavior.
+
 Add or improve tests when changing financial calculations, dates, migrations, sync, authentication boundaries, recurring logic, account balances, categories, budgets, backup/restore, or other data-integrity behavior.
 
 Do not hide, delete, weaken, or skip a failing check merely to make the task appear complete. Fix the cause or report the unresolved blocker.
 
 ## 6. Review loop
 
-For substantial tasks, separate implementation from review:
+For substantial tasks, separate implementation from review, using the same affected scope throughout:
 
 1. Implement.
 2. Run automated verification.
@@ -79,9 +83,11 @@ For substantial tasks, separate implementation from review:
 4. Perform a security/privacy review.
 5. Perform an adversarial/red-team pass for edge cases and regression risks.
 6. Repair findings.
-7. Repeat until no blocking finding remains or a genuine user-only blocker is reached.
+7. Recheck fixes and their affected dependencies until no blocking finding remains or a genuine user-only blocker is reached. Do not restart an unrelated full-product review loop.
 
 Use independent agents/reviewers when the environment supports them; otherwise perform clearly separated review passes. Do not inflate a quality score or claim perfection without evidence.
+
+When the user requests ordinary ChatGPT review through AutoDev, obtain that review of the scoped source and verification evidence; a local sub-agent is not a substitute. Report code-review conclusions separately from a tool's formal review status. If a tool cannot represent the agreed scope, repair the scope handling and preserve historical evidence instead of inventing a PASS or expanding the product review. A user clarification of release acceptance governs subsequent delivery; irrelevant assets are not independent release blockers.
 
 ## 7. Completion report
 
