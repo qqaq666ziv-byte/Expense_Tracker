@@ -33,6 +33,7 @@ describe('first-class transfer record', () => {
       occurredAt: '2026-08-28 10:00',
     }, meta);
     expect(record.fee).toBe(15);
+    expect(record.feeMode).toBe('destination-net');
     const { fee: _fee, ...legacy } = record;
     expect(differingSyncRecordFields('transfers', legacy, { ...legacy, fee: 0 })).toEqual([]);
     expect(differingSyncRecordFields('transfers', legacy, record)).toEqual(['fee']);
@@ -47,6 +48,7 @@ describe('first-class transfer record', () => {
     }, meta)).toEqual({
       ...meta,
       amount: 100,
+      feeMode: 'destination-net',
       sourceAccountId: 'bank',
       sourceAccountName: '銀行',
       destinationAccountId: 'cash',
@@ -62,6 +64,8 @@ describe('first-class transfer record', () => {
     ['NaN fee', { fee: NaN }, /手續費/],
     ['unsafe fee', { fee: 100_000_001 }, /手續費/],
     ['fee precision', { fee: 0.0000001 }, /手續費/],
+    ['fee equals transfer', { fee: 100 }, /手續費必須小於/],
+    ['fee exceeds transfer', { fee: 101 }, /手續費必須小於/],
     ['zero amount', { amount: 0 }, /大於零/],
     ['unsafe precision', { amount: 0.0000001 }, /小數位/],
     ['unsafe magnitude', { amount: 100_000_001 }, /安全金額/],
@@ -75,6 +79,20 @@ describe('first-class transfer record', () => {
       occurredAt: '2026-08-28 10:00',
       ...override,
     }, meta)).toThrow(error);
+  });
+
+  it('keeps a historical transfer on its original fee rule when edited', () => {
+    const historical = {
+      ...meta, amount: 100, fee: 15,
+      sourceAccountId: 'bank', sourceAccountName: '銀行',
+      destinationAccountId: 'cash', destinationAccountName: '現金',
+      occurredAt: '2026-08-28 10:00',
+    };
+    const edited = buildTransferRecord(data, {
+      amount: 120, fee: 10, sourceAccountId: 'bank', destinationAccountId: 'cash',
+      occurredAt: historical.occurredAt,
+    }, meta, historical);
+    expect(edited.feeMode).toBe('source-extra');
   });
 
   it('allows an unchanged archived historical endpoint but rejects retargeting to it', () => {

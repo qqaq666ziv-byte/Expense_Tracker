@@ -39,6 +39,27 @@ describe('AssetsView account form interactions', () => {
     expect(screen.getByText(/含手續費 NT\$15/)).toBeInTheDocument();
   });
 
+  it('shows the source gross debit and destination net credit for a new fee transfer', async () => {
+    const user = userEvent.setup();
+    const data = createInitialState('guest').data;
+    const source = data.accounts[0];
+    data.accounts.push({ ...source, id: 'destination', name: '銀行' });
+    data.transfers = [{
+      id: 'net-fee-transfer', ownerId: 'guest', version: 1,
+      updatedAt: source.updatedAt, lastOperationId: 'fee-create',
+      amount: 1000, fee: 15, feeMode: 'destination-net',
+      sourceAccountId: source.id, sourceAccountName: source.name,
+      destinationAccountId: 'destination', destinationAccountName: '銀行', occurredAt: '2026-09-25T10:00',
+    }];
+    render(<AssetsView data={data} ownerId="guest" putAccount={() => true}
+      putAdjustment={() => true} archiveAccount={() => true} />);
+    await user.click(screen.getByRole('button', { name: /現金.*1,000/ }));
+    expect(screen.getByText('−NT$1,000')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /銀行/ }));
+    expect(screen.getByText('+NT$985')).toBeInTheDocument();
+    expect(screen.getByText(/含手續費 NT\$15/)).toBeInTheDocument();
+  });
+
   it('keeps a writable current-amount money input when creating an account', async () => {
     const user = userEvent.setup();
     const state = createInitialState('guest');

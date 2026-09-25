@@ -8,6 +8,7 @@ import {
   calculateSpendingTrend,
 } from './financeEngine';
 import { TUTORIAL_RECORD_NOTE } from '../app/tutorial';
+import { getAnalyticsTransactions } from './analyticsTransactions';
 
 const baseData: FinanceData = {
   accounts: [
@@ -674,6 +675,15 @@ describe('transfer fee analytics', () => {
     ]);
     expect(data.transactions).toEqual([]);
     expect(buildLedgerHistory(data)).toEqual([{ kind: 'transfer', record: transfer }]);
+  });
+
+  it('deducts the gross amount from source and credits the destination net of fee', () => {
+    const data: FinanceData = { ...baseData, transfers: [{ ...transfer, amount: 1000, fee: 15, feeMode: 'destination-net' }] };
+    const summary = calculateFinancials(data);
+    expect(summary.accountBalances.map((account) => account.balance)).toEqual([0, 1485]);
+    expect(summary.totalAssets).toBe(1485);
+    expect(summary.allTime).toMatchObject({ income: 0, expense: 15, net: -15 });
+    expect(getAnalyticsTransactions(data).at(-1)).toMatchObject({ accountId: 'jkopay', amount: 15 });
   });
 
   it('includes fees in today, period comparisons, largest expense and local-day trends', () => {

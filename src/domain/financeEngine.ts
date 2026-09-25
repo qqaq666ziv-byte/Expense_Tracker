@@ -4,6 +4,7 @@ import { sortByDisplayOrder } from './displayOrder';
 import { addMoney, compareMoney, subtractMoney, sumMoney } from './money';
 import { isFinancialTransaction } from './tutorialRecord';
 import { getAnalyticsTransactions } from './analyticsTransactions';
+import { transferDestinationCredit, transferSourceDebit } from './transfer';
 import {
   countElapsedDays,
   getEquivalentPreviousPeriodRange,
@@ -131,8 +132,8 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
         .filter((adjustment) => adjustment.accountId === account.id)
         .map((adjustment) => adjustment.amountDelta));
       const transferDelta = sumMoney(transfers.flatMap((transfer) => {
-        if (transfer.sourceAccountId === account.id) return [-addMoney(transfer.amount, transfer.fee ?? 0)];
-        if (transfer.destinationAccountId === account.id) return [transfer.amount];
+        if (transfer.sourceAccountId === account.id) return [-transferSourceDebit(transfer)];
+        if (transfer.destinationAccountId === account.id) return [transferDestinationCredit(transfer)];
         return [];
       }));
       return {

@@ -820,7 +820,10 @@ function guestImportContent(entity: FinanceEntityName, record: SyncRecord): stri
       'lastOperationId',
     ].includes(key)),
   );
-  if (entity === 'transfers') content.fee = content.fee ?? 0;
+  if (entity === 'transfers') {
+    content.fee = content.fee ?? 0;
+    content.feeMode = content.feeMode ?? 'source-extra';
+  }
   return JSON.stringify(canonicalImportValue(content));
 }
 

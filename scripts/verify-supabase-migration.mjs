@@ -30,6 +30,9 @@ const cloudConsistencyMigrationSql = migrationSources[cloudConsistencyMigrationI
 const transferFeeMigrationIndex = migrationFiles.findIndex((name) => name.endsWith('_finance_transfer_fees.sql'));
 assert.notEqual(transferFeeMigrationIndex, -1, 'Expected an additive finance_transfer_fees migration');
 const transferFeeMigrationSql = migrationSources[transferFeeMigrationIndex];
+const netCreditMigrationIndex = migrationFiles.findIndex((name) => name.endsWith('_finance_transfer_fee_net_credit.sql'));
+assert.notEqual(netCreditMigrationIndex, -1, 'Expected the destination-net transfer fee migration');
+const netCreditMigrationSql = migrationSources[netCreditMigrationIndex];
 
 const OWNER_A = '11111111-1111-4111-8111-111111111111';
 const OWNER_B = '22222222-2222-4222-8222-222222222222';
@@ -2698,6 +2701,12 @@ async function verifyAtomicTransfers() {
     const afterFeeReapply = await db.query('select * from public.transfers order by user_id, id');
     assert.deepEqual(afterFeeReapply.rows, beforeFeeReapply.rows,
       'Reapplying the fee migration must preserve every transfer, including existing nonzero fees');
+    await db.exec(netCreditMigrationSql);
+    const beforeNetCreditReapply = await db.query('select * from public.transfers order by user_id, id');
+    await db.exec(netCreditMigrationSql);
+    const afterNetCreditReapply = await db.query('select * from public.transfers order by user_id, id');
+    assert.deepEqual(afterNetCreditReapply.rows, beforeNetCreditReapply.rows,
+      'Reapplying the destination-net migration must preserve historical rows');
     await db.exec('set role authenticated');
     const transferCount = await one(db, `
       select count(*)::integer as count from public.transfers
@@ -2854,6 +2863,30 @@ async function verifyAtomicTransfers() {
       version = 4, last_operation_id = 'clear-fee-op'
       where user_id = $1 and id = 'included-to-included' returning fee`, [OWNER_A]);
     assert.equal(numeric(clearedFee.fee), 0, 'An explicit zero must clear a previously nonzero fee');
+
+    const legacyMode = await one(db, `select fee_mode from public.transfers
+      where user_id = $1 and id = 'included-to-included'`, [OWNER_A]);
+    assert.equal(legacyMode.fee_mode, null, 'Historical transfers keep the source-extra rule');
+    await db.query(`update public.transfers set fee = 15, fee_mode = 'destination-net',
+      version = 5, last_operation_id = 'net-credit-op'
+      where user_id = $1 and id = 'included-to-included'`, [OWNER_A]);
+    await assert.rejects(db.query(`update public.transfers set fee = 100,
+      version = 6, last_operation_id = 'invalid-net-fee-op'
+      where user_id = $1 and id = 'included-to-included'`, [OWNER_A]),
+    /net_fee_chk|check constraint/i,
+    'Destination-net fee must leave a positive destination credit');
+    await db.query(`insert into public.transfers (
+      user_id, id, amount, fee, source_account_id, source_account_name,
+      destination_account_id, destination_account_name, occurred_at,
+      version, updated_at, last_operation_id
+    ) values ($1, 'included-to-included', 100, 15, 'included-a', '計入 A',
+      'included-b', '計入 B', '2026-08-28 09:00', 6, now(), 'old-client-net-edit')
+    on conflict (user_id, id) do update set fee_mode = excluded.fee_mode,
+      version = excluded.version, last_operation_id = excluded.last_operation_id`, [OWNER_A]);
+    const preservedMode = await one(db, `select fee_mode from public.transfers
+      where user_id = $1 and id = 'included-to-included'`, [OWNER_A]);
+    assert.equal(preservedMode.fee_mode, 'destination-net',
+      'An older client omitting fee_mode must not change an existing transfer rule');
 
     await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_B]);
     const foreignCount = await one(db, `select count(*)::integer as count from public.transfers`);
@@ -3321,8 +3354,65 @@ console.log('[pass] legacy negative goal delete tombstones allocations atomicall
 
 await verifyServerResourceAbuseGuards();
 console.log('[pass] server-side text, numeric, and RLS-complete per-owner resource abuse guards');
+async function verifyNetCreditCapacity() {
+  const db = new PGlite();
+  try {
+    await bootstrapSupabaseAuth(db);
+    await db.exec(`insert into auth.users (id) values ('${OWNER_A}')`);
+    await db.exec(migrationSources.slice(0, netCreditMigrationIndex).join('\n\n'));
+    await db.exec('set role authenticated');
+    await db.query("select set_config('request.jwt.claim.sub', $1, false)", [OWNER_A]);
+    await db.query(`insert into public.accounts (
+      user_id, id, name, icon_type, icon_value, opening_balance,
+      include_in_total_assets, is_active, sort_order, version, updated_at, last_operation_id
+    ) values
+      ($1, 'net-source', '來源', 'vector', 'wallet', 1000, false, true, 1, 1, now(), 'source-op'),
+      ($1, 'net-destination', '目的', 'vector', 'wallet', 0, true, true, 2, 1, now(), 'destination-op'),
+      ($1, 'legacy-peer', '舊帳戶', 'vector', 'wallet', 0, true, true, 3, 1, now(), 'legacy-peer-op')`, [OWNER_A]);
+    await db.query(`insert into public.transfers (
+      user_id, id, amount, fee, source_account_id, source_account_name,
+      destination_account_id, destination_account_name, occurred_at,
+      version, updated_at, last_operation_id
+    ) values ($1, 'legacy-fee-transfer', 100, 15, 'net-destination', '目的',
+      'legacy-peer', '舊帳戶', '2026-09-19 10:00', 1, now(), 'legacy-transfer-op')`, [OWNER_A]);
+    await db.exec('reset role');
+    await db.exec(netCreditMigrationSql);
+    await db.exec('set role authenticated');
+    const historical = await one(db, `select amount, fee, fee_mode from public.transfers
+      where user_id = $1 and id = 'legacy-fee-transfer'`, [OWNER_A]);
+    assert.equal(numeric(historical.amount), 100);
+    assert.equal(numeric(historical.fee), 15);
+    assert.equal(historical.fee_mode, null, 'First application must preserve old fee semantics');
+    await db.query(`insert into public.transfers (
+      user_id, id, amount, fee, fee_mode, source_account_id, source_account_name,
+      destination_account_id, destination_account_name, occurred_at,
+      version, updated_at, last_operation_id
+    ) values ($1, 'net-transfer', 1000, 15, 'destination-net', 'net-source', '來源',
+      'net-destination', '目的', '2026-09-25 10:00', 1, now(), 'transfer-op')`, [OWNER_A]);
+    await db.query(`insert into public.goals (
+      user_id, id, name, target_amount, current_amount, unit, is_active,
+      version, updated_at, last_operation_id
+    ) values ($1, 'net-goal', '淨額容量', 1000, 0, '元', true, 1, now(), 'goal-op')`, [OWNER_A]);
+    await db.query(`insert into public.savings_allocations (
+      user_id, id, goal_id, amount_delta, occurred_at,
+      version, updated_at, last_operation_id
+    ) values ($1, 'net-capacity', 'net-goal', 970, '2026-09-25',
+      1, now(), 'capacity-op')`, [OWNER_A]);
+    await assert.rejects(db.query(`insert into public.savings_allocations (
+      user_id, id, goal_id, amount_delta, occurred_at,
+      version, updated_at, last_operation_id
+    ) values ($1, 'net-over', 'net-goal', 0.01, '2026-09-25',
+      1, now(), 'over-op')`, [OWNER_A]), /allocation_capacity|exceeds available assets/i,
+    'New destination credit 985 and preserved legacy fee 15 must leave capacity 970');
+  } finally {
+    await db.close();
+  }
+}
+
 await verifyAtomicTransfers();
 console.log('[pass] atomic transfer constraints, RLS, sync clock, and allocation capacity');
+await verifyNetCreditCapacity();
+console.log('[pass] destination-net transfer capacity uses the 985 credit');
 await verifyMinorUnitAllocationCapacityParity();
 console.log('[pass] client-parity minor-unit capacity across legacy midpoints and transfer boundaries');
 await verifyAuthoritativeBootstrapRevisions();

@@ -101,7 +101,7 @@ afterEach(() => {
 });
 
 describe('HomeView transfer interactions', () => {
-  it('creates one atomic transfer with an extra fee, previews debit, and resets the fee', async () => {
+  it('creates one atomic transfer with a net credit, previews debit, and resets the fee', async () => {
     const user = userEvent.setup();
     const data = dataWithTwoAccounts();
     const put = vi.fn(() => true);
@@ -113,11 +113,11 @@ describe('HomeView transfer interactions', () => {
       .getByRole('button', { name: data.accounts[0].name }));
     await user.click(within(screen.getByRole('group', { name: '要轉入哪個資產帳戶？' }))
       .getByRole('button', { name: data.accounts[1].name }));
-    expect(screen.getByText(/來源扣款/)).toHaveTextContent('1,015');
-    expect(screen.getByText(/來源扣款/)).toHaveTextContent('目的入帳');
+    expect(screen.getByText(/來源扣款/)).toHaveTextContent('來源扣款 NT$1,000');
+    expect(screen.getByText(/來源扣款/)).toHaveTextContent('目的入帳 NT$985');
     await user.click(screen.getByRole('button', { name: '記下這筆轉帳' }));
     expect(put).toHaveBeenCalledTimes(1);
-    expect(put).toHaveBeenCalledWith('transfers', expect.objectContaining({ amount: 1000, fee: 15 }));
+    expect(put).toHaveBeenCalledWith('transfers', expect.objectContaining({ amount: 1000, fee: 15, feeMode: 'destination-net' }));
     expect(screen.getByLabelText('手續費')).toHaveValue('');
   });
 

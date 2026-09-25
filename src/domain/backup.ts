@@ -2,6 +2,7 @@ import type { FinanceData, OwnerId } from './model';
 import { assertLifecycleTransition } from './lifecycle';
 import { isTutorialTransaction } from './tutorialRecord';
 import {
+  compareMoney,
   MAX_LEGACY_MONEY_DECIMAL_PLACES,
   MAX_SAFE_MONEY,
   moneyDecimalPlaces,
@@ -136,7 +137,7 @@ export function exportTransactionsCsv(data: FinanceData): string {
 const TRANSFER_CSV_HEADERS = [
   'id', 'owner_id', 'amount', 'occurred_at', 'source_account_id',
   'source_account_name', 'destination_account_id', 'destination_account_name',
-  'note', 'deleted_at', 'fee',
+  'note', 'deleted_at', 'fee', 'fee_mode',
 ] as const;
 
 /** Separate export preserves the established transaction CSV contract. */
@@ -154,6 +155,7 @@ export function exportTransfersCsv(data: FinanceData): string {
     csvCell(transfer.note),
     csvCell(transfer.deletedAt),
     csvCell(transfer.fee ?? 0, false),
+    csvCell(transfer.feeMode ?? 'source-extra'),
   ].join(','));
   return `${TRANSFER_CSV_HEADERS.join(',')}\r\n${rows.join('\r\n')}${rows.length > 0 ? '\r\n' : ''}`;
 }
@@ -470,6 +472,13 @@ export function validateFinanceData(value: unknown, path: string): asserts value
       assertMoneyAmount(transfer.fee, `${itemPath}.fee`);
       if (transfer.fee < 0) fail(`${itemPath}.fee`, 'must be nonnegative');
     }
+    if (transfer.feeMode !== undefined) {
+      assertOneOf(transfer.feeMode, ['source-extra', 'destination-net'] as const, `${itemPath}.feeMode`);
+    }
+    if (transfer.feeMode === 'destination-net'
+      && compareMoney(transfer.fee === undefined ? 0 : Number(transfer.fee), Number(transfer.amount)) >= 0) {
+      fail(`${itemPath}.fee`, 'must be less than amount for destination-net transfers');
+    }
     assertReference(transfer.sourceAccountId, accountIds, `${itemPath}.sourceAccountId`, 'account');
     assertString(transfer.sourceAccountName, `${itemPath}.sourceAccountName`);
     assertReference(
@@ -624,7 +633,7 @@ export function restoreFinanceBackup(
     categories: mergeById(current.categories, incoming.categories),
     transactions: mergeById(current.transactions, incoming.transactions),
     transfers: mergeById(current.transfers, incoming.transfers, (record) => ({
-      ...record, fee: record.fee ?? 0,
+      ...record, fee: record.fee ?? 0, feeMode: record.feeMode ?? 'source-extra',
     })),
     adjustments: mergeById(current.adjustments, incoming.adjustments),
     goals: mergeById(current.goals, incoming.goals),
