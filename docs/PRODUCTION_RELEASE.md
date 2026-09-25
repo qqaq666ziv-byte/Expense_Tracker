@@ -282,6 +282,53 @@ Do not stack speculative fixes across multiple layers at once.
 
 ---
 
+## Net-credit transfer-fee release record — 2026-09-25
+
+- PR #18: https://github.com/qqaq666ziv-byte/Expense_Tracker/pull/18
+- Application release commit: `75c126c3ea5e56ed61d970ff6c3d25585bfb92e8`;
+  reviewed implementation: `c2a682695a10f7a306844abfff9a99b92200166a`.
+- Production deployment: `dpl_7x3wCzPSHrb1hJnVkVFXjThWjyDZ`, canonical project
+  `prj_PDwYdTxA52vgkfRek2AzNofUJCHW`, Git `main`, `READY`. The project,
+  repository, commit and canonical alias were verified against live Vercel metadata.
+- Applied only `20260925000000_finance_transfer_fee_net_credit.sql` to
+  `rarkcgtgfvwymjuxgfkx` using Supabase CLI `db push --project-ref --skip-vault`.
+  No seeds, role changes, or financial-row rewrites were performed.
+- Before/after aggregate fingerprints matched: accounts 14
+  (`596d8168fe0b80cc3a0494f94d559bfc`), transactions 134
+  (`716f455f1ec459725cfb31769b01c70a`), transfers 0
+  (`d41d8cd98f00b204e9800998ecf8427e`), savings_allocations 1
+  (`3dec2ea4fb11b96a99fe57c556b47606`). Transfer comparison excludes the
+  additive `fee_mode` field. Owner RLS, denial of anonymous SELECT and
+  authenticated DELETE, and service-role-only historical import were retained.
+- Focused verification: 8 affected test files / 215 tests passed. The migration
+  verifier passed, including first application over a nonzero legacy fee,
+  repeated application, old-client mode preservation and net-credit capacity.
+  Existing lint, production/read-only builds and both PR CI checks passed.
+  Independent scoped code review found no blocking correctness/security issue.
+- Real Chromium interaction on local and canonical production pages used
+  isolated guest storage. A 2,000 starting balance and 1,000/15 transfer resulted
+  in source 1,000, destination 985, total 1,985 and expense 15; reload preserved
+  those values. Local editing fee to 20, clearing it, rejecting fee=amount and
+  deleting the transfer all produced the expected balances. The 390px form had
+  no horizontal overflow. No genuine cloud financial records were created.
+- Canonical production loaded `/assets/index-DlSLiwIU.js` and `/registerSW.js`;
+  `/sw.js` controlled the reloaded page. No blocking browser error or failed
+  resource response was captured. Evidence screenshots are outside Git in the
+  backup folder below. This is scoped browser verification, not a claim of
+  ordinary-ChatGPT review or full multi-device authenticated E2E.
+- Fresh independent backup: `C:\Users\USER\.codex\backups\Expense_Tracker\20260925-net-fee-release`.
+  `production.custom` SHA-256 `F60C2EA9A4E06DCA026BD553D3F04B5716FB97DC3CA6D89241C678D8C3055778`;
+  `roles.sql` SHA-256 `73A3E414A86473E0853DF72DCA4AB0BEFE4BA3496BD992D2A940E9FADE687C47`.
+  Archive listing and full decompression passed; an actual restore was not run.
+- Pre-release source checkpoint: `checkpoint/20260925-1105-before-net-fee-release`
+  at `c2a682695a10f7a306844abfff9a99b92200166a`.
+- Recovery: from application release commit `75c126c`, run
+  `npm ci` and `npm run build:transfer-read-only`, then release through the
+  canonical project. Preserve `fee_mode`, fees, records and tombstones. Do not
+  route users back to the prior `378324f` frontend after net-credit records may
+  exist; it cannot interpret that mode. The previous deployment
+  `dpl_3VDQqYG1Chbo9r6swnwU2g7nKX9h` is historical, not a safe general rollback.
+
 ## Transfer-fee release record — 2026-09-19
 
 - PR: https://github.com/qqaq666ziv-byte/Expense_Tracker/pull/16
