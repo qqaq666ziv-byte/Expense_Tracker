@@ -542,7 +542,28 @@ describe('Supabase remote adapter', () => {
     });
     expect(encoded).toMatchObject({
       source_account_id: 'bank', destination_account_id: 'cash', amount: 100, fee: 15,
+      fee_mode: 'source-extra',
     });
+  });
+
+  it('preserves the net-credit fee mode across remote pull and push', async () => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account({ id: 'bank', name: '銀行' })), accountRow(account())]);
+    client.tables.set('transfers', [transferRow('net-fee', { fee: 15, fee_mode: 'destination-net' })]);
+    const remote = createSupabaseRemoteAdapter(asSupabaseClient(client));
+    const pulled = await remote.pull('user-a') as RemotePullResult;
+    const record = pulled.records.find((entry) => entry.entity === 'transfers')!.record as Transfer;
+    expect(record.feeMode).toBe('destination-net');
+    let encoded: Record<string, unknown> | undefined;
+    client.applyResponse = (table, row) => {
+      if (table === 'transfers') encoded = row;
+      return row;
+    };
+    await remote.apply('user-a', {
+      id: record.lastOperationId, entity: 'transfers', recordId: record.id,
+      record, attempts: 0, queuedAt: NOW,
+    });
+    expect(encoded).toMatchObject({ fee_mode: 'destination-net' });
   });
 
   it.each([-1, null, 'NaN', 100000001, 0.0000001])('quarantines an invalid transfer fee %s', async (fee) => {
@@ -552,6 +573,18 @@ describe('Supabase remote adapter', () => {
     const pulled = await createSupabaseRemoteAdapter(asSupabaseClient(client)).pull('user-a') as RemotePullResult;
     expect(pulled.records.some((entry) => entry.entity === 'transfers')).toBe(false);
     expect(pulled.issues).toContainEqual(expect.objectContaining({ recordId: 'bad-fee' }));
+  });
+
+  it.each([
+    { fee: 15, fee_mode: 'unknown' },
+    { fee: 100, fee_mode: 'destination-net' },
+  ])('quarantines an invalid fee rule %j', async (override) => {
+    const client = new FakeSupabaseClient();
+    client.tables.set('accounts', [accountRow(account({ id: 'bank', name: '銀行' })), accountRow(account())]);
+    client.tables.set('transfers', [transferRow('bad-mode', override)]);
+    const pulled = await createSupabaseRemoteAdapter(asSupabaseClient(client)).pull('user-a') as RemotePullResult;
+    expect(pulled.records.some((entry) => entry.entity === 'transfers')).toBe(false);
+    expect(pulled.issues).toContainEqual(expect.objectContaining({ recordId: 'bad-mode' }));
   });
 
   it('quarantines fee precision that numeric JSON rounded away', async () => {

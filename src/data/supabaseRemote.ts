@@ -22,6 +22,7 @@ import type {
   SyncEntityRecord,
 } from '../domain/syncEngine';
 import {
+  compareMoney,
   MAX_LEGACY_MONEY_DECIMAL_PLACES,
   MAX_SAFE_MONEY,
   moneyDecimalPlaces,
@@ -486,6 +487,7 @@ function encodeRecord(entity: FinanceEntityName, record: SyncEntityRecord): Data
         ...common,
         amount: transfer.amount,
         fee: transfer.fee ?? 0,
+        fee_mode: transfer.feeMode ?? 'source-extra',
         source_account_id: transfer.sourceAccountId,
         source_account_name: transfer.sourceAccountName,
         destination_account_id: transfer.destinationAccountId,
@@ -998,6 +1000,14 @@ function decodeTransfer(row: DatabaseRow): Transfer {
     ...row, [MONEY_TEXT_ALIAS]: row.__finance_fee_text,
   }, 'fee');
   if (fee < 0) throw new Error('Supabase transfer fee must be nonnegative');
+  const feeMode = row.fee_mode ?? 'source-extra';
+  if (feeMode !== 'source-extra' && feeMode !== 'destination-net') {
+    throw new Error('Supabase transfer fee mode is invalid');
+  }
+  const amount = requiredPositiveNumber(row, 'amount');
+  if (feeMode === 'destination-net' && compareMoney(fee, amount) >= 0) {
+    throw new Error('Supabase destination-net fee must be less than amount');
+  }
   const sourceAccountId = requiredString(row, 'source_account_id');
   const destinationAccountId = requiredString(row, 'destination_account_id');
   if (sourceAccountId === destinationAccountId) {
@@ -1005,8 +1015,9 @@ function decodeTransfer(row: DatabaseRow): Transfer {
   }
   return {
     ...commonRecord(row),
-    amount: requiredPositiveNumber(row, 'amount'),
+    amount,
     ...(fee === 0 ? {} : { fee }),
+    ...(feeMode === 'source-extra' ? {} : { feeMode }),
     sourceAccountId,
     sourceAccountName: requiredString(row, 'source_account_name'),
     destinationAccountId,

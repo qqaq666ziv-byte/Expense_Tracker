@@ -538,7 +538,7 @@ describe('transaction CSV export', () => {
 
     expect(transactionCsv).not.toContain('transfer-withdrawal');
     expect(transferCsv.startsWith(
-      'id,owner_id,amount,occurred_at,source_account_id,source_account_name,destination_account_id,destination_account_name,note,deleted_at,fee\r\n',
+      'id,owner_id,amount,occurred_at,source_account_id,source_account_name,destination_account_id,destination_account_name,note,deleted_at,fee,fee_mode\r\n',
     )).toBe(true);
     expect(transferCsv).toContain('"transfer-withdrawal","guest","500"');
     expect(transferCsv).toContain('"account-bank","銀行","account-cash","現金"');
@@ -594,9 +594,26 @@ describe('transfer fee backups', () => {
     expect(exportTransfersCsv(data)).toContain(',"15.25"');
     expect(parseFinanceBackup(JSON.stringify(createFinanceBackup(fixture))).data.transfers[0].fee).toBeUndefined();
   });
+  it('round-trips the destination-net rule without changing legacy imports', () => {
+    const data = structuredClone(fixture);
+    data.transfers[0].fee = 15;
+    data.transfers[0].feeMode = 'destination-net';
+    const backup = createFinanceBackup(data);
+    expect(parseFinanceBackup(JSON.stringify(backup)).data.transfers[0].feeMode).toBe('destination-net');
+    expect(exportTransfersCsv(data)).toContain('"destination-net"');
+    expect(parseFinanceBackup(JSON.stringify(createFinanceBackup(fixture))).data.transfers[0].feeMode).toBeUndefined();
+  });
   it.each([-1, NaN, Infinity, 100000001, 0.0000001, null])('rejects invalid fee %s', (fee) => {
     const backup = createFinanceBackup(fixture);
     (backup.data.transfers[0] as unknown as Record<string, unknown>).fee = fee;
     expect(() => parseFinanceBackup(backup)).toThrow(/fee/);
+  });
+  it.each([
+    { feeMode: 'unknown', fee: 15 },
+    { feeMode: 'destination-net', fee: 500 },
+  ])('rejects an invalid net-credit rule %j', (override) => {
+    const backup = createFinanceBackup(fixture);
+    Object.assign(backup.data.transfers[0], override);
+    expect(() => parseFinanceBackup(backup)).toThrow(/fee/i);
   });
 });

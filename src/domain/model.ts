@@ -50,8 +50,9 @@ export interface Transaction extends SyncRecord {
 /** One atomic movement between two owner-scoped asset accounts. */
 export interface Transfer extends SyncRecord {
   amount: number;
-  /** Extra expense charged to the source account; absent on legacy records. */
+  /** Absent means the historical source-extra fee rule. */
   fee?: number;
+  feeMode?: 'source-extra' | 'destination-net';
   sourceAccountId: string;
   sourceAccountName: string;
   destinationAccountId: string;

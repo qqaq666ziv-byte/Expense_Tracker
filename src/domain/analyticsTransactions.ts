@@ -22,8 +22,10 @@ export function getAnalyticsTransactions(data: FinanceData): Transaction[] {
       type: 'expense',
       categoryId: feeCategoryId,
       categoryName: '手續費',
-      accountId: transfer.sourceAccountId,
-      accountName: transfer.sourceAccountName,
+      accountId: transfer.feeMode === 'destination-net'
+        ? transfer.destinationAccountId : transfer.sourceAccountId,
+      accountName: transfer.feeMode === 'destination-net'
+        ? transfer.destinationAccountName : transfer.sourceAccountName,
       occurredAt: transfer.occurredAt,
       note: `轉帳手續費：${transfer.sourceAccountName} → ${transfer.destinationAccountName}`,
     }));

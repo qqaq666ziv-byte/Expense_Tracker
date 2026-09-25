@@ -15,7 +15,8 @@ import { buildLedgerHistory, calculateInsights } from "../domain/financeEngine";
 import { sortByDisplayOrder } from "../domain/displayOrder";
 import { changedRecordMeta, newRecordMeta } from "../app/state";
 import { displayMoney } from "../app/presentation";
-import { addMoney } from "../domain/money";
+import { compareMoney, subtractMoney } from "../domain/money";
+import { transferDestinationCredit, transferSourceDebit } from "../domain/transfer";
 import {
   parseRequiredNumberInput,
   shortDate,
@@ -717,12 +718,20 @@ function OwnerScopedHomeView({
                 <MoneyInput aria-label="手續費" value={transferFee} placeholder="0"
                   onValueChange={(value) => { setTransferFee(value); setError(""); setSuccess(""); }} />
               </label>
-              <p className="muted">由來源帳戶額外扣除，並計入支出。</p>
+              <p className="muted">{editingTransfer && editingTransfer.feeMode !== 'destination-net'
+                ? '這筆舊轉帳沿用來源額外扣手續費的原始規則。'
+                : '來源扣轉帳總額，目的入帳扣除手續費後的金額；手續費計入支出。'}</p>
               {parseRequiredNumberInput(amount) !== null
-                && (transferFee.trim() === "" || parseRequiredNumberInput(transferFee) !== null) && (
+                && (transferFee.trim() === "" || parseRequiredNumberInput(transferFee) !== null)
+                && (Boolean(editingTransfer && editingTransfer.feeMode !== 'destination-net')
+                  || compareMoney(parseRequiredNumberInput(amount)!, parseRequiredNumberInput(transferFee) ?? 0) > 0) && (
                 <p aria-live="polite">
-                  來源扣款 {displayMoney(addMoney(parseRequiredNumberInput(amount)!, parseRequiredNumberInput(transferFee) ?? 0))}
-                  {" · "}目的入帳 {displayMoney(parseRequiredNumberInput(amount)!)}
+                  來源扣款 {displayMoney(editingTransfer && editingTransfer.feeMode !== 'destination-net'
+                    ? transferSourceDebit({ ...editingTransfer, amount: parseRequiredNumberInput(amount)!, fee: parseRequiredNumberInput(transferFee) ?? 0 })
+                    : parseRequiredNumberInput(amount)!)}
+                  {" · "}目的入帳 {displayMoney(editingTransfer && editingTransfer.feeMode !== 'destination-net'
+                    ? transferDestinationCredit({ ...editingTransfer, amount: parseRequiredNumberInput(amount)!, fee: parseRequiredNumberInput(transferFee) ?? 0 })
+                    : subtractMoney(parseRequiredNumberInput(amount)!, parseRequiredNumberInput(transferFee) ?? 0))}
                 </p>
               )}
             </div>
@@ -1203,7 +1212,7 @@ function OwnerScopedHomeView({
                         <small role="status">來源或目的帳戶有同步衝突：編輯與刪除已暫停。</small>
                       )}
                     </div>
-                    <b className="transfer">{displayMoney(transfer.amount)}</b>
+                    <b className="transfer">{displayMoney(transferSourceDebit(transfer))}</b>
                     <span className="row-actions">
                       <button
                         type="button"

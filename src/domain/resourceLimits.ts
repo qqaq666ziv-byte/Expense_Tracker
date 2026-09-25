@@ -1,5 +1,6 @@
 import type { FinanceData, FinanceEntityName, SyncRecord } from './model';
 import {
+  compareMoney,
   MAX_LEGACY_MONEY_DECIMAL_PLACES,
   MAX_SAFE_MONEY,
   moneyDecimalPlaces,
@@ -105,6 +106,14 @@ export function assertFinanceRecordWithinWriteLimits<E extends FinanceEntityName
       if (transfer.fee !== undefined) {
         assertMoneyWriteLimit('transfers.fee', transfer.fee);
         if (transfer.fee < 0) throw new Error('transfers.fee must be nonnegative');
+      }
+      if (transfer.feeMode !== undefined
+        && transfer.feeMode !== 'source-extra' && transfer.feeMode !== 'destination-net') {
+        throw new Error('transfers.feeMode is invalid');
+      }
+      if (transfer.feeMode === 'destination-net'
+        && compareMoney(transfer.fee ?? 0, transfer.amount) >= 0) {
+        throw new Error('transfers.fee must be less than transfers.amount');
       }
       break;
     }

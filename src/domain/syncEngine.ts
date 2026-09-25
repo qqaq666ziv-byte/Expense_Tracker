@@ -703,6 +703,9 @@ function normalizedRecord(entity: FinanceEntityName, record: SyncEntityRecord): 
   if (entity === 'transfers' && normalized.fee === undefined) {
     normalized.fee = 0;
   }
+  if (entity === 'transfers' && normalized.feeMode === undefined) {
+    normalized.feeMode = 'source-extra';
+  }
   return normalized;
 }
 

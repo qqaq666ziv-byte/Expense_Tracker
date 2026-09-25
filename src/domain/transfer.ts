@@ -1,9 +1,12 @@
 import { parseLocalDateTime } from './dateRange';
 import type { FinanceData, SyncRecord, Transfer } from './model';
 import {
+  addMoney,
+  compareMoney,
   MAX_LEGACY_MONEY_DECIMAL_PLACES,
   MAX_SAFE_MONEY,
   moneyDecimalPlaces,
+  subtractMoney,
 } from './money';
 
 export interface TransferDraft {
@@ -13,6 +16,16 @@ export interface TransferDraft {
   destinationAccountId: string;
   occurredAt: string;
   note?: string;
+}
+
+export function transferSourceDebit(transfer: Transfer): number {
+  return transfer.feeMode === 'destination-net'
+    ? transfer.amount : addMoney(transfer.amount, transfer.fee ?? 0);
+}
+
+export function transferDestinationCredit(transfer: Transfer): number {
+  return transfer.feeMode === 'destination-net'
+    ? subtractMoney(transfer.amount, transfer.fee ?? 0) : transfer.amount;
 }
 
 function resolveEndpoint(
@@ -60,6 +73,10 @@ export function buildTransferRecord(
     || moneyDecimalPlaces(draft.fee) > MAX_LEGACY_MONEY_DECIMAL_PLACES)) {
     throw new Error('手續費必須為安全金額範圍內的非負數，小數位最多 6 位');
   }
+  const feeMode = previous?.feeMode ?? (previous ? 'source-extra' : 'destination-net');
+  if (feeMode === 'destination-net' && compareMoney(draft.fee ?? 0, draft.amount) >= 0) {
+    throw new Error('手續費必須小於轉帳金額，目的帳戶入帳需大於零');
+  }
   try {
     parseLocalDateTime(draft.occurredAt);
   } catch {
@@ -85,6 +102,7 @@ export function buildTransferRecord(
     ...metadata,
     amount: draft.amount,
     ...(draft.fee !== undefined ? { fee: draft.fee } : {}),
+    feeMode,
     sourceAccountId: source.id,
     sourceAccountName: previous?.sourceAccountId === source.id
       ? previous.sourceAccountName
