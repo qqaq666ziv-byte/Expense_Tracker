@@ -136,7 +136,10 @@ test('refuses junction escape and hard-linked source', t => {
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, 'file.js'), 'outside\n');
   fs.symlinkSync(outside, path.join(f.root, 'linked'), 'junction');
-  assert.throws(() => captureSource({ ...f.options, files: ['linked/file.js'] }), /Links|junction/);
+  // Git traverses Windows junctions but lists a POSIX directory symlink itself.
+  // Include that platform's Git-visible path so this exercises the link guard.
+  const linkedSource = process.platform === 'win32' ? 'linked/file.js' : 'linked';
+  assert.throws(() => captureSource({ ...f.options, files: [linkedSource] }), /Links|junction/);
   fs.unlinkSync(path.join(f.root, 'linked'));
   fs.unlinkSync(path.join(f.root, 'example.js'));
   fs.linkSync(path.join(outside, 'file.js'), path.join(f.root, 'example.js'));
