@@ -118,10 +118,10 @@ export function validateShortcutPayload(value: unknown): ShortcutPayload {
   const body = value as Record<string, unknown>;
   const allowed = new Set(['version', 'source', 'eventId', 'occurredAt', 'title', 'text', 'test', 'amount', 'merchant', 'kind']);
   if (Object.keys(body).some((key) => !allowed.has(key)) || body.version !== 1 || body.source !== 'jkopay'
-    || (body.test !== undefined && typeof body.test !== 'boolean')
+    || typeof body.test !== 'boolean'
     || (body.kind !== undefined && body.kind !== 'expense')) throw new Error('invalid_body');
   const payload: ShortcutPayload = {
-    version: 1, source: 'jkopay', test: body.test === true,
+    version: 1, source: 'jkopay', test: body.test as boolean,
     title: boundedString(body.title, 'title', 256, 1024),
     text: boundedString(body.text, 'text', 2000, 6000, true),
   };

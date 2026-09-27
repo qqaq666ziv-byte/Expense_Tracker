@@ -41,6 +41,7 @@ export function reviewTimeIso(value: string, original: string | null = null): st
 
 const reasonLabels: Record<string, string> = {
   possible_duplicate: '可能與既有通知重複，請先比對帳本。',
+  cross_connection_duplicate: '其他連線已收到相同來源 ID 的通知，這筆不會自動入帳。請先比對收件匣與帳本，避免重複記帳。',
   no_timestamp: '通知缺少可確認的消費時間。',
   unrecognized_format: '目前無法可靠辨識這種通知格式。',
   structured_requires_review: '手動提供的欄位需要先確認。',

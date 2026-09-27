@@ -148,7 +148,7 @@ function OwnerShortcutsPanel({
           <div><p className="eyebrow">從通知開始，先確認再入帳</p><h2><Smartphone size={21} aria-hidden="true" /> iPhone 捷徑記帳</h2></div>
           <span className="shortcut-badge">街口支付</span>
         </div>
-        <p>把消費通知送進收件匣，確認實際扣款帳戶與金額。相容格式與來源穩定識別碼都完成實機確認後，才可開啟自動入帳。</p>
+        <p>把消費通知送進收件匣，確認實際扣款帳戶與金額。先核對含來源 ID 的相容通知，再自行於 iPhone 重送測試，確認同一通知的 ID 不變，才能開啟自動入帳。</p>
         <p className="shortcut-muted">目前仍需在你的 iPhone 驗證通知內容與背景執行。App 內的通知截圖，不能證明捷徑能取得同樣的文字。此連線確認的是通知文字格式，並非街口提供的交易簽章。</p>
         {guest && <div className="info-banner"><span>登入後才能將捷徑連接到你的雲端帳本；現在可先做本機通知測試。</span>{onSignIn && <button type="button" className="secondary-button" onClick={onSignIn}>前往登入</button>}</div>}
         {locked && !guest && <p className="warning-message">請先完成帳本同步或處理待確認的資料，再變更連線或入帳。</p>}
@@ -192,7 +192,8 @@ function OwnerShortcutsPanel({
       </section>}
       {section === 'connections' && <section className="card shortcut-stack">
         <div className="section-heading"><div><p className="eyebrow">每支手機各用一組金鑰</p><h2><ShieldCheck size={21} aria-hidden="true" /> 連線管理</h2></div><button type="button" className="secondary-button" disabled={guest || busy} onClick={() => void run(refreshData, false)}><RefreshCw size={16} aria-hidden="true" />重新整理</button></div>
-        {guest ? <p className="empty-state">請登入後建立連線。</p> : connections.length === 0 ? <p className="empty-state">{busy ? '正在讀取連線…' : '尚無可顯示的連線，可從「連接 iPhone」開始。'}</p> : connections.map((item) => <Fragment key={`${item.id}:${item.account_id}:${item.category_id}:${item.mode}:${item.verified_at}:${item.revoked_at}`}><ConnectionCard item={item} parents={parents} disabled={busy || locked} revokeDisabled={busy} onConfigure={configure} onRevoke={revoke} /></Fragment>)}
+        <p className="shortcut-muted">只可有一個啟用自動入帳的連線，其他連線使用待確認。要更換手機，請先把舊連線改為「先確認再入帳」，不會替你停用其他連線。</p>
+        {guest ? <p className="empty-state">請登入後建立連線。</p> : connections.length === 0 ? <p className="empty-state">{busy ? '正在讀取連線…' : '尚無可顯示的連線，可從「連接 iPhone」開始。'}</p> : connections.map((item) => <Fragment key={`${item.id}:${item.account_id}:${item.category_id}:${item.mode}:${item.verified_at}:${item.revoked_at}`}><ConnectionCard item={item} parents={parents} disabled={busy || locked} revokeDisabled={busy} anotherAutoConnection={connections.some((other) => other.id !== item.id && !other.revoked_at && other.mode === 'auto')} onConfigure={configure} onRevoke={revoke} /></Fragment>)}
       </section>}
     </div>
   );
@@ -210,31 +211,37 @@ function ParentFields({ parents, account, category, setAccount, setCategory, dis
   </div>;
 }
 
-function ConnectionCard({ item, parents, disabled, revokeDisabled, onConfigure, onRevoke }: {
-  item: ShortcutConnection; parents: Parents; disabled: boolean; revokeDisabled: boolean;
+function ConnectionCard({ item, parents, disabled, revokeDisabled, anotherAutoConnection, onConfigure, onRevoke }: {
+  item: ShortcutConnection; parents: Parents; disabled: boolean; revokeDisabled: boolean; anotherAutoConnection: boolean;
   onConfigure: (configuration: ShortcutConfiguration) => Promise<void>; onRevoke: (id: string) => Promise<void>;
 }) {
   const [account, setAccount] = useState(item.account_id ?? '');
   const [category, setCategory] = useState(item.category_id ?? '');
   const [mode, setMode] = useState(item.mode);
+  const [stableEventIdConfirmed, setStableEventIdConfirmed] = useState(false);
   const [error, setError] = useState('');
-  const canAuto = !!item.verified_at;
+  const canAuto = !!item.verified_at && !!item.verified_format;
   const validAccount = parents.accounts.some((row) => row.id === account);
   const validCategory = parents.categories.some((row) => row.id === category);
   const save = (event: FormEvent) => {
     event.preventDefault();
     if ((account && !validAccount) || (category && !validCategory)) { setError('帳戶或分類已不可用，請重新選擇。'); return; }
-    if (mode === 'auto' && (!canAuto || !validAccount || !validCategory)) { setError('自動入帳需要已驗證的通知格式、扣款帳戶與分類。'); return; }
+    if (mode === 'auto' && (!canAuto || !validAccount || !validCategory)) { setError('自動入帳需要已人工核對的相容通知、扣款帳戶與分類。'); return; }
+    if (mode === 'auto' && anotherAutoConnection) { setError('已有另一個啟用自動入帳的連線，請先將該連線改為待確認。'); return; }
+    if (mode === 'auto' && !stableEventIdConfirmed) { setError('請先在 iPhone 重送測試，確認同一通知的來源 ID 不變，並勾選確認。'); return; }
     setError('');
-    void onConfigure({ id: item.id, accountId: account || null, categoryId: category || null, mode });
+    setStableEventIdConfirmed(false);
+    void onConfigure({ id: item.id, accountId: account || null, categoryId: category || null, mode, stableEventIdConfirmed: mode === 'auto' && stableEventIdConfirmed });
   };
   return <article className="shortcut-item shortcut-stack">
     <div className="shortcut-item-title"><h3>{item.label}</h3><span className="shortcut-badge">{item.revoked_at ? '已停用' : item.mode === 'auto' ? '相容通知自動入帳' : '先確認再入帳'}</span></div>
     <p className="shortcut-muted">建立於 {shortDate(item.created_at)}</p>
     {!item.revoked_at && <form className="shortcut-stack" onSubmit={save}>
       <ParentFields parents={parents} account={account} category={category} setAccount={setAccount} setCategory={setCategory} disabled={disabled} />
-      <label className="field-label">入帳方式<select className="field" value={mode} disabled={disabled} onChange={(event) => setMode(event.target.value as 'review' | 'auto')}><option value="review">先確認再入帳</option><option value="auto" disabled={!canAuto}>相容通知自動入帳</option></select></label>
-      <p className="shortcut-muted">{canAuto ? '僅已確認的單筆扣款格式，且帶有來源穩定識別碼，才可自動入帳。缺少識別碼、不同格式、儲值、折抵或疑似重複仍會待確認；請定期比對支付明細。' : '尚未完成相容格式與來源穩定識別碼的實機確認。請先從 iPhone 傳入通知並在收件匣確認入帳；測試、多金額或沒有穩定識別碼的通知不會解鎖自動入帳。'}</p>
+      <label className="field-label">入帳方式<select className="field" value={mode} disabled={disabled} onChange={(event) => { setMode(event.target.value as 'review' | 'auto'); setStableEventIdConfirmed(false); }}><option value="review">先確認再入帳</option><option value="auto" disabled={!canAuto || anotherAutoConnection}>相容通知自動入帳</option></select></label>
+      <p className="shortcut-muted">{canAuto ? '你已核對含來源 ID 的相容通知。ID 重送時是否不變，仍需由你在 iPhone 測試確認；本網站無法替街口驗證來源 ID 的穩定性。缺少 ID、不同格式、儲值、折抵或疑似重複仍會待確認。' : '尚未從收件匣確認含來源 ID 的相容通知。請先從 iPhone 傳入通知並人工核對；測試、多金額或沒有來源 ID 的通知不會解鎖自動入帳。'}</p>
+      {anotherAutoConnection && <p className="warning-message">另一個連線正在自動入帳。目前連線可先使用待確認。</p>}
+      {mode === 'auto' && <label className="shortcut-confirmation"><input type="checkbox" checked={stableEventIdConfirmed} disabled={disabled || !canAuto || anotherAutoConnection} onChange={(event) => setStableEventIdConfirmed(event.target.checked)} /><span>我已在 iPhone 重送測試，確認同一通知的來源 ID 不變<small>每次儲存自動入帳設定都需重新勾選。這是你的實機確認，不代表街口或本網站已驗證 ID。</small></span></label>}
       {error && <p role="alert" className="error-message">{error}</p>}
       <div className="shortcut-actions"><button type="submit" className="primary-button" disabled={disabled}>儲存連線設定</button><button type="button" className="secondary-button" disabled={revokeDisabled} onClick={() => void onRevoke(item.id)}>停用此連線</button></div>
     </form>}

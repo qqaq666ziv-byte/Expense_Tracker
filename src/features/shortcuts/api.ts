@@ -2,14 +2,18 @@ import { isBrowserSafeSupabaseKey, supabase } from '../../lib/supabaseClient';
 import type { ShortcutApi, ShortcutConnection, ShortcutInboxItem, ShortcutInboxStatus } from './types';
 
 export class ShortcutApiError extends Error {
-  constructor(readonly kind: 'unavailable' | 'auth' | 'network' | 'request') {
+  constructor(readonly kind: 'unavailable' | 'auth' | 'network' | 'request' | 'stable-event-id-required' | 'active-auto-connection') {
     super(kind === 'unavailable'
       ? '此環境尚未啟用捷徑接收服務。仍可先測試通知文字。'
       : kind === 'auth'
         ? '登入狀態已變更，請重新登入後再試。'
         : kind === 'network'
           ? '目前無法連線。請恢復網路後重新整理，確認雲端結果再重試。'
-          : '這次操作未完成。請重新整理確認狀態，並檢查帳戶、分類及通知內容。');
+          : kind === 'stable-event-id-required'
+            ? '請先在 iPhone 重送測試，確認同一通知的來源 ID 不變，再勾選確認以儲存自動入帳設定。'
+            : kind === 'active-auto-connection'
+              ? '已有另一個啟用自動入帳的連線。請先將該連線改為待確認，再啟用目前連線；不會自動停用其他連線。'
+              : '這次操作未完成。請重新整理確認狀態，並檢查帳戶、分類及通知內容。');
     this.name = 'ShortcutApiError';
   }
 }
@@ -116,9 +120,11 @@ export function createShortcutApi(dependencies: ApiDependencies): ShortcutApi {
         cache: 'no-store', credentials: 'omit', redirect: 'error',
       });
       if (!response.ok) {
-        const error = await response.json().catch(() => ({})) as { code?: unknown };
+        const error = await response.json().catch(() => ({})) as { code?: unknown; message?: unknown };
         if (response.status === 401) throw new ShortcutApiError('auth');
         if (response.status === 404 || ['PGRST202', '42883', '42P01'].includes(String(error.code))) throw new ShortcutApiError('unavailable');
+        if (error.code === '23514' && error.message === 'stable_event_id_confirmation_required') throw new ShortcutApiError('stable-event-id-required');
+        if (error.code === '23514' && error.message === 'active_auto_connection_exists') throw new ShortcutApiError('active-auto-connection');
         throw new ShortcutApiError('request');
       }
       const body = await response.text();
@@ -137,10 +143,14 @@ export function createShortcutApi(dependencies: ApiDependencies): ShortcutApi {
     listInbox: async (ownerId) => rows(await call(ownerId, 'finance_shortcut_list_inbox'), inbox),
     create: async (ownerId, label, tokenHash) => connection(single(await call(ownerId, 'finance_shortcut_create', { p_label: label, p_token_hash: tokenHash }))),
     revoke: async (ownerId, id) => { await call(ownerId, 'finance_shortcut_revoke', { p_id: id }); },
-    configure: async (ownerId, configuration) => connection(single(await call(ownerId, 'finance_shortcut_configure', {
-      p_id: configuration.id, p_account_id: configuration.accountId,
-      p_category_id: configuration.categoryId, p_mode: configuration.mode,
-    }))),
+    configure: async (ownerId, configuration) => {
+      if (configuration.mode === 'auto' && configuration.stableEventIdConfirmed !== true) throw new ShortcutApiError('stable-event-id-required');
+      return connection(single(await call(ownerId, 'finance_shortcut_configure', {
+        p_id: configuration.id, p_account_id: configuration.accountId,
+        p_category_id: configuration.categoryId, p_mode: configuration.mode,
+        p_stable_event_id_confirmed: configuration.mode === 'auto' && configuration.stableEventIdConfirmed === true,
+      })));
+    },
     review: async (ownerId, review) => {
       const row = record(single(await call(ownerId, 'finance_shortcut_review', {
         p_id: review.id, p_action: review.action, p_account_id: review.accountId,

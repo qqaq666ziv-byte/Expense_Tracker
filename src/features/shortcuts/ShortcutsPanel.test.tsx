@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { webcrypto } from 'node:crypto';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialState } from '../../app/state';
@@ -175,7 +175,97 @@ describe('iPhone shortcuts panel', () => {
     const { user } = await openInbox();
     await user.click(screen.getByRole('button', { name: '連線管理' }));
     expect(screen.getByRole('option', { name: '相容通知自動入帳' })).toBeDisabled();
-    expect(screen.getByText(/尚未完成相容格式與來源穩定識別碼/)).toBeInTheDocument();
+    expect(screen.getByText(/尚未從收件匣確認含來源 ID 的相容通知/)).toBeInTheDocument();
+  });
+
+  it('requires a fresh explicit checkbox confirmation for every auto save', async () => {
+    const data = createInitialState('owner-a').data;
+    const eligible: ShortcutConnection = {
+      ...connection, account_id: data.accounts[0].id, category_id: data.categories.find((row) => row.kind === 'expense')!.id,
+      verified_at: '2026-01-02T00:00:00Z', verified_format: 'jkopay-single-debit-v1',
+    };
+    const api = makeApi([eligible], []);
+    api.configure.mockResolvedValue({ ...eligible, mode: 'auto' });
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    const mode = await screen.findByLabelText('入帳方式');
+    await user.selectOptions(mode, 'auto');
+    expect(screen.getByRole('checkbox', { name: /我已在 iPhone 重送測試/ })).not.toBeChecked();
+    await user.click(screen.getByRole('button', { name: '儲存連線設定' }));
+    expect(api.configure).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('勾選確認');
+    await user.click(screen.getByRole('checkbox', { name: /我已在 iPhone 重送測試/ }));
+    await user.click(screen.getByRole('button', { name: '儲存連線設定' }));
+    expect(api.configure).toHaveBeenCalledTimes(1);
+    expect(api.configure).toHaveBeenCalledWith('owner-a', {
+      id: eligible.id, accountId: eligible.account_id, categoryId: eligible.category_id, mode: 'auto', stableEventIdConfirmed: true,
+    });
+    await screen.findByText('連線設定已儲存。');
+    expect(screen.getByRole('checkbox', { name: /我已在 iPhone 重送測試/ })).not.toBeChecked();
+    await user.click(screen.getByRole('button', { name: '儲存連線設定' }));
+    expect(api.configure).toHaveBeenCalledTimes(1);
+    // Saving an already-auto connection keeps the same component key; it still consumes the confirmation.
+    await user.click(screen.getByRole('checkbox', { name: /我已在 iPhone 重送測試/ }));
+    await user.click(screen.getByRole('button', { name: '儲存連線設定' }));
+    expect(api.configure).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('checkbox', { name: /我已在 iPhone 重送測試/ })).not.toBeChecked();
+    await user.click(screen.getByRole('button', { name: '儲存連線設定' }));
+    expect(api.configure).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not require ID confirmation to return a connection to review mode', async () => {
+    const data = createInitialState('owner-a').data;
+    const automatic: ShortcutConnection = {
+      ...connection, mode: 'auto', account_id: data.accounts[0].id, category_id: data.categories.find((row) => row.kind === 'expense')!.id,
+      verified_at: '2026-01-02T00:00:00Z', verified_format: 'jkopay-single-debit-v1',
+    };
+    const api = makeApi([automatic], []);
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    await user.selectOptions(await screen.findByLabelText('入帳方式'), 'review');
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '儲存連線設定' }));
+    expect(api.configure).toHaveBeenCalledWith('owner-a', expect.objectContaining({ mode: 'review', stableEventIdConfirmed: false }));
+  });
+
+  it('clears stable-ID confirmation when switching owners', async () => {
+    const automatic: ShortcutConnection = {
+      ...connection, mode: 'auto', verified_at: '2026-01-02T00:00:00Z', verified_format: 'jkopay-single-debit-v1',
+    };
+    const api = makeApi([automatic], []);
+    const user = userEvent.setup();
+    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    const checkbox = await screen.findByRole('checkbox', { name: /我已在 iPhone 重送測試/ });
+    await user.click(checkbox);
+    expect(checkbox).toBeChecked();
+    view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    expect(await screen.findByRole('checkbox', { name: /我已在 iPhone 重送測試/ })).not.toBeChecked();
+    expect(api.configure).not.toHaveBeenCalled();
+  });
+
+  it('blocks a second active auto connection without reconfiguring or revoking the first', async () => {
+    const data = createInitialState('owner-a').data;
+    const eligible: ShortcutConnection = {
+      ...connection, account_id: data.accounts[0].id, category_id: data.categories.find((row) => row.kind === 'expense')!.id,
+      verified_at: '2026-01-02T00:00:00Z', verified_format: 'jkopay-single-debit-v1',
+    };
+    const api = makeApi([{ ...eligible, mode: 'auto', label: '主要手機' }, { ...eligible, id: 'connection-b', label: '第二支手機' }], []);
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    const second = (await screen.findByRole('heading', { name: '第二支手機' })).closest('article')!;
+    expect(within(second).getByRole('option', { name: '相容通知自動入帳' })).toBeDisabled();
+    expect(screen.getByText(/只可有一個啟用自動入帳的連線/)).toBeInTheDocument();
+    // The submit guard remains effective even if a synthetic event bypasses the disabled option.
+    fireEvent.change(within(second).getByLabelText('入帳方式'), { target: { value: 'auto' } });
+    await user.click(within(second).getByRole('button', { name: '儲存連線設定' }));
+    expect(within(second).getByRole('alert')).toHaveTextContent('已有另一個啟用自動入帳的連線');
+    expect(api.configure).not.toHaveBeenCalled();
+    expect(api.revoke).not.toHaveBeenCalled();
   });
 
   it('can revoke a credential during a financial lock while financial edits stay disabled', async () => {

@@ -37,8 +37,8 @@ async function as(role, owner, sql, parameters = []) {
 }
 const createConnection = (owner, tokenHash) => as('authenticated', owner,
   'select public.finance_shortcut_create($1, $2) as result', ['測試手機', tokenHash]);
-const configure = (owner, id, account = 'account-a', category = 'category-a', mode = 'review') => as('authenticated', owner,
-  'select public.finance_shortcut_configure($1, $2, $3, $4) as result', [id, account, category, mode]);
+const configure = (owner, id, account = 'account-a', category = 'category-a', mode = 'review', stableIdConfirmed = false) => as('authenticated', owner,
+  'select public.finance_shortcut_configure($1, $2, $3, $4, $5) as result', [id, account, category, mode, stableIdConfirmed]);
 const review = (owner, id, action = 'approve', account = 'account-a', category = 'category-a', amount = null, merchant = null, date = null) => as('authenticated', owner,
   'select public.finance_shortcut_review($1,$2,$3,$4,$5,$6,$7) as result', [id, action, account, category, amount, merchant, date]);
 const listConnections = (owner) => as('authenticated', owner, 'select public.finance_shortcut_list_connections() as result');
@@ -81,9 +81,12 @@ try {
     has_function_privilege('anon','public.finance_shortcut_create(text,text)','EXECUTE') as anonymous_create,
     has_function_privilege('authenticated','public.finance_shortcut_authenticate(text)','EXECUTE') as owner_authenticate,
     has_function_privilege('service_role','public.finance_shortcut_authenticate(text)','EXECUTE') as service_authenticate,
+    has_function_privilege('anon','public.finance_shortcut_configure(uuid,text,text,text,boolean)','EXECUTE') as anonymous_configure,
+    has_function_privilege('authenticated','public.finance_shortcut_configure(uuid,text,text,text,boolean)','EXECUTE') as owner_configure,
     has_function_privilege('authenticated','finance_private.shortcut_post(uuid,text,text,numeric,text,timestamp with time zone)','EXECUTE') as direct_post`);
   equal(permissions, { direct_connection_read: false, token_hash_read: false, direct_inbox_insert: false,
-    anonymous_create: false, owner_authenticate: false, service_authenticate: true, direct_post: false }, 'least privilege grants');
+    anonymous_create: false, owner_authenticate: false, service_authenticate: true, anonymous_configure: false,
+    owner_configure: true, direct_post: false }, 'least privilege grants');
 
   await db.query('insert into auth.users(id) values($1),($2)', [A, B]);
   await db.query(`insert into public.accounts(user_id,id,name,icon_type,icon_value,last_operation_id,requires_review)
@@ -144,10 +147,25 @@ try {
   const corrected = await receive(strictEvent('corrected'));
   await review(A, corrected.id, 'approve', 'account-a', 'category-a', '1300');
   equal((await listConnections(A))[0].verified_at, null, 'correcting parser output does not enable auto');
+  const noIdProof = await receive(strictEvent('no-id-proof', {
+    key: `fp:${sha('strict-without-source-id')}`, fingerprint: sha('strict-without-source-id'),
+  }));
+  await review(A, noIdProof.id);
+  equal((await listConnections(A))[0].verified_at, null, 'manual approval of a strict no-ID message never verifies auto');
+  equal((await listConnections(A))[0].verified_format, null, 'no-ID approval does not unlock the parser format');
+  await rejects(() => configure(A, connection.id, 'account-a', 'category-a', 'auto', true),
+    /verified_notification_required/, 'declaring ID stability cannot replace a reviewed source-ID event');
   const proof = await receive(strictEvent('proof'));
   await review(A, proof.id);
   equal((await listConnections(A))[0].verified_format, 'jkopay-single-debit-v1', 'real matching approval records exact parser version');
-  await configure(A, connection.id, 'account-a', 'category-a', 'auto');
+  await rejects(() => as('authenticated', A,
+    'select public.finance_shortcut_configure($1,$2,$3,$4) as result', [connection.id, 'account-a', 'category-a', 'auto']),
+  /stable_event_id_confirmation_required/, 'omitted stable-ID confirmation defaults to false');
+  await rejects(() => configure(A, connection.id, 'account-a', 'category-a', 'auto', false),
+    /stable_event_id_confirmation_required/, 'false confirmation cannot enable auto');
+  await rejects(() => configure(A, connection.id, 'account-a', 'category-a', 'auto', null),
+    /stable_event_id_confirmation_required/, 'null confirmation cannot enable auto');
+  await configure(A, connection.id, 'account-a', 'category-a', 'auto', true);
   const beforeAuto = await txCount();
   const auto = await receive(strictEvent('auto-1'));
   equal(auto.status, 'imported', 'proven format plus stable ID can auto post');
@@ -206,7 +224,7 @@ try {
   const secondConnection = await createConnection(A, sha('synthetic-second-credential'));
   const overlappingId = await receive(event('mixed', { hash: sha('synthetic-second-credential') }));
   equal(overlappingId.status, 'pending', 'same owner local event ID on a second connection is a separate proposal');
-  equal(overlappingId.duplicate, false, 'device-local ID is not silently deduped across connections');
+  equal(overlappingId.duplicate, true, 'cross-connection ID collision is flagged but never silently dropped');
   assert.notEqual(overlappingId.id, mixed.id); assertions += 1;
   equal((await receive(event('mixed', { hash: sha('synthetic-second-credential') }))).id, overlappingId.id,
     'second connection has its own stable replay identity');
@@ -224,6 +242,61 @@ try {
   await review(A, failing.id);
   equal(await txCount(), beforeFailure + 1, 'retry after a repaired failure posts once');
   equal((await listConnections(A)).find((row) => row.id === secondConnection.id).verified_at, null, 'unrecognized format remains unproven');
+
+  // Separate multi-feed safety scenario with a fresh rate-window fixture. The
+  // dedicated rate-limit cases below exercise both ceilings explicitly.
+  await db.query('delete from finance_private.shortcut_rate_limits where user_id=$1', [A]);
+  const secondHash = sha('synthetic-second-credential');
+  const switchHash = sha('synthetic-switch-credential');
+  const switchConnection = await createConnection(A, switchHash);
+  const secondProof = await receive(strictEvent('second-proof', { hash: secondHash }));
+  await review(A, secondProof.id);
+  await configure(A, secondConnection.id, 'account-a', 'category-a', 'auto', true);
+  const switchProof = await receive(strictEvent('switch-proof', { hash: switchHash }));
+  await review(A, switchProof.id);
+  await configure(A, switchConnection.id);
+  await rejects(() => configure(A, switchConnection.id, 'account-a', 'category-a', 'auto', true),
+    /active_auto_connection_exists/, 'second active auto feed for the same owner is rejected');
+  equal((await listConnections(A)).filter((row) => row.mode === 'auto').map((row) => row.id), [secondConnection.id],
+    'failed second-auto configuration retains the original feed');
+  await rejects(() => db.query("update public.finance_shortcut_connections set mode='auto' where id=$1", [switchConnection.id]),
+    /finance_shortcut_one_active_auto_idx/, 'partial unique index independently closes a concurrent activation race');
+  const firstFeedEvent = strictEvent('same-source-event-across-feeds', { hash: secondHash });
+  const firstFeedChangedEvent = strictEvent('changed-source-event-across-feeds', { hash: secondHash });
+  const beforeFeedEvents = await txCount();
+  const firstFeedPosted = await receive(firstFeedEvent);
+  const firstFeedChangedPosted = await receive(firstFeedChangedEvent);
+  equal([firstFeedPosted.status, firstFeedChangedPosted.status], ['imported', 'imported'], 'first auto feed posts its two distinct source events');
+  equal(await txCount(), beforeFeedEvents + 2, 'first feed creates one ledger row per source event');
+  await configure(A, secondConnection.id);
+  await configure(A, switchConnection.id, 'account-a', 'category-a', 'auto', true);
+  const secondFeedReplay = await receive({ ...firstFeedEvent, hash: switchHash });
+  equal(secondFeedReplay.status, 'pending', 'same source event stays pending after switching the auto feed');
+  equal(secondFeedReplay.duplicate, true, 'cross-feed retry is explicitly flagged');
+  equal(await txCount(), beforeFeedEvents + 2, 'switching feeds cannot auto-post an already seen source event');
+  equal(await one('select reason, ambiguous_of from public.finance_shortcut_inbox where id=$1', [secondFeedReplay.id]),
+    { reason: 'cross_connection_duplicate', ambiguous_of: firstFeedPosted.id }, 'cross-feed proposal identifies the previous event for review');
+  const secondFeedChanged = await receive({ ...firstFeedChangedEvent, hash: switchHash,
+    fingerprint: sha('different-payload-on-another-feed'), amount: '99.00',
+    payload: { ...firstFeedChangedEvent.payload, text: 'A different synthetic purchase sharing a source-local ID' },
+  });
+  equal(secondFeedChanged.status, 'pending', 'different payload sharing an ID across feeds is preserved for review');
+  equal(secondFeedChanged.duplicate, true, 'different cross-feed payload still signals ambiguity');
+  equal((await one('select reason from public.finance_shortcut_inbox where id=$1', [secondFeedChanged.id])).reason,
+    'cross_connection_duplicate', 'different cross-feed payload is never treated as a verified unique event');
+  equal(await txCount(), beforeFeedEvents + 2, 'different cross-feed payload also cannot auto-create finance');
+  equal((await receive({ ...firstFeedEvent, hash: switchHash })).id, secondFeedReplay.id,
+    'exact replay within the new connection returns its own prior pending proposal');
+  await rejects(() => receive({ ...firstFeedEvent, hash: switchHash, fingerprint: sha('changed-within-same-feed') }),
+    /event_id_payload_conflict/, 'same-connection changed payload remains a conflict rather than a new proposal');
+  const ambiguousProofHash = sha('synthetic-ambiguous-proof');
+  const ambiguousProofConnection = await createConnection(A, ambiguousProofHash);
+  const ambiguousProof = await receive({ ...firstFeedEvent, hash: ambiguousProofHash });
+  await review(A, ambiguousProof.id);
+  equal((await listConnections(A)).find((row) => row.id === ambiguousProofConnection.id).verified_at, null,
+    'manual approval of a cross-feed collision cannot establish format proof');
+  await rejects(() => configure(A, ambiguousProofConnection.id, 'account-a', 'category-a', 'auto', true),
+    /verified_notification_required/, 'ambiguous cross-feed approval cannot unlock automatic posting');
 
   // Resource bounds are shared across an owner's tokens and include retries.
   await db.query(`insert into finance_private.shortcut_rate_limits values($1,date_trunc('minute',clock_timestamp()),30,date_trunc('day',clock_timestamp()),30)
@@ -256,6 +329,8 @@ try {
   assert.match(reviewDef, /pg_advisory_xact_lock[\s\S]+for update/); assertions += 1;
   equal((postDef.match(/for share/g) ?? []).length, 2, 'both financial parents are locked against archive');
   equal((await one("select count(*)::integer count from pg_constraint where conrelid='public.finance_shortcut_inbox'::regclass and contype='u'")).count, 1, 'owner/connection/event unique constraint closes duplicate race');
+  equal((await one("select to_regprocedure('public.finance_shortcut_configure(uuid,text,text,text)') is null as absent")).absent,
+    true, 'old four-argument configure overload cannot bypass explicit confirmation');
   equal((await one(`select count(*)::integer count from pg_proc p join pg_namespace n on n.oid=p.pronamespace
     where n.nspname='public' and p.proname like 'finance_shortcut_%' and p.prosecdef`)).count, 0, 'all public wrappers are security invoker');
   console.log(`SHORTCUT_MIGRATION_OK: ${assertions} assertions; local PGlite only; no Production writes. Concurrent lock structure verified; no multi-session concurrency claim.`);

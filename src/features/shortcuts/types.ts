@@ -31,6 +31,7 @@ export interface ShortcutConfiguration {
   accountId: string | null;
   categoryId: string | null;
   mode: ShortcutMode;
+  stableEventIdConfirmed: boolean;
 }
 
 export interface ShortcutReview {

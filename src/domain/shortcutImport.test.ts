@@ -70,8 +70,11 @@ describe('shortcut notification proposals', () => {
     { merchant: 'x'.repeat(161) }, { occurredAt: '2026-02-30T00:00:00Z' }])('rejects an invalid or caller-directed field %j', (change) => {
     expect(() => validateShortcutPayload({ ...simple, ...change })).toThrow();
   });
-  it('normalizes optional fields and defaults to a real pending proposal', () => {
-    expect(validateShortcutPayload({ ...simple, test: undefined, amount: '12.5' })).toMatchObject({ test: false, amount: '12.50' });
+  it.each([undefined, null, 0, 1, 'true', 'false'])('requires an explicit boolean test flag instead of inferring intent from %j', (test) => {
+    expect(() => validateShortcutPayload({ ...simple, test })).toThrow();
+  });
+  it.each([true, false])('preserves explicit test=%s while normalizing optional fields', (test) => {
+    expect(validateShortcutPayload({ ...simple, test, amount: '12.5' })).toMatchObject({ test, amount: '12.50' });
   });
   it('stable source IDs distinguish real vs test and expose content changes separately', async () => {
     const first = await shortcutEventIdentity(validateShortcutPayload({ ...simple, eventId: 'source-event-1' }));
@@ -131,6 +134,13 @@ describe('shortcut HTTP boundary', () => {
     expect((await handleShortcutRequest(request(body), db)).status).toBe(400);
     expect(db.receive).not.toHaveBeenCalled();
   });
+  it.each([undefined, null, 'false'])('never calls receive when test is omitted or not boolean (%j)', async (test) => {
+    const db = dependencies();
+    const response = await handleShortcutRequest(request({ ...simple, test }), db);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'invalid_shortcut_payload' });
+    expect(db.receive).not.toHaveBeenCalled();
+  });
   it('enforces the streamed byte limit without relying on Content-Length', async () => {
     const db = dependencies();
     expect((await handleShortcutRequest(request(' '.repeat(8193)), db)).status).toBe(413);
@@ -152,9 +162,9 @@ describe('shortcut HTTP boundary', () => {
     db.receive.mockResolvedValue({ data: null, error: null });
     expect((await handleShortcutRequest(request(), db)).status).toBe(503);
   });
-  it('passes test intent without upgrading it to a real expense', async () => {
+  it.each([true, false])('passes explicit test=%s without changing the caller intent', async (test) => {
     const db = dependencies();
-    await handleShortcutRequest(request({ ...simple, test: true }), db);
-    expect(db.receive.mock.calls[0][0].p_payload.test).toBe(true);
+    expect((await handleShortcutRequest(request({ ...simple, test }), db)).status).toBe(200);
+    expect(db.receive.mock.calls[0][0].p_payload.test).toBe(test);
   });
 });

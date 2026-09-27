@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../../app/state';
-import { parseShortcutReviewAmount, reviewTimeInput, reviewTimeIso, shortcutParents, SHORTCUT_TEST_TEMPLATE } from './model';
+import { parseShortcutReviewAmount, reviewTimeInput, reviewTimeIso, shortcutParents, shortcutReason, SHORTCUT_TEST_TEMPLATE } from './model';
 
 describe('shortcut review safety', () => {
   it('keeps pasted decimal values exact and rejects coercion, ambiguous formatting and overflow', () => {
@@ -53,5 +53,10 @@ describe('shortcut review safety', () => {
     expect(template).not.toHaveProperty('eventId');
     expect(template).not.toHaveProperty('token');
     expect(template).not.toHaveProperty('occurredAt');
+  });
+
+  it('explains cross-connection duplicate notifications without promising automatic reconciliation', () => {
+    expect(shortcutReason('cross_connection_duplicate')).toContain('其他連線已收到相同來源 ID');
+    expect(shortcutReason('cross_connection_duplicate')).toContain('不會自動入帳');
   });
 });

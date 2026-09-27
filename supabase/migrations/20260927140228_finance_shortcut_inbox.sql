@@ -46,8 +46,13 @@ create table if not exists public.finance_shortcut_inbox (
 );
 
 create index if not exists finance_shortcut_connections_owner_idx on public.finance_shortcut_connections(user_id, created_at desc);
+-- The only supported source is jkopay. Extend this key with source if another
+-- provider is introduced; each owner currently has at most one live auto feed.
+create unique index if not exists finance_shortcut_one_active_auto_idx
+  on public.finance_shortcut_connections(user_id) where mode = 'auto' and revoked_at is null;
 create index if not exists finance_shortcut_inbox_owner_idx on public.finance_shortcut_inbox(user_id, created_at desc);
 create index if not exists finance_shortcut_inbox_fingerprint_idx on public.finance_shortcut_inbox(user_id, fingerprint);
+create index if not exists finance_shortcut_inbox_owner_event_idx on public.finance_shortcut_inbox(user_id, event_key);
 
 -- Bounded counters avoid scanning historical financial rows on each request.
 create table if not exists finance_private.shortcut_rate_limits (
@@ -113,7 +118,12 @@ begin
   if not found then raise exception 'connection_not_found' using errcode = '42501'; end if;
 end $$;
 
-create or replace function finance_private.shortcut_configure(p_id uuid, p_account_id text, p_category_id text, p_mode text)
+-- Remove the prior four-argument signature so it cannot bypass explicit owner
+-- confirmation. Omitted fifth arguments resolve to the fail-closed default.
+drop function if exists public.finance_shortcut_configure(uuid, text, text, text);
+drop function if exists finance_private.shortcut_configure(uuid, text, text, text);
+create or replace function finance_private.shortcut_configure(p_id uuid, p_account_id text, p_category_id text, p_mode text,
+  p_stable_event_id_confirmed boolean default false)
 returns jsonb language plpgsql security definer set search_path = ''
 as $$
 declare owner_id uuid := auth.uid(); connection public.finance_shortcut_connections;
@@ -133,6 +143,12 @@ begin
   end if;
   if p_mode = 'auto' and (connection.verified_at is null or connection.verified_format is null or p_account_id is null or p_category_id is null)
   then raise exception 'verified_notification_required' using errcode = '23514'; end if;
+  if p_mode = 'auto' and p_stable_event_id_confirmed is distinct from true
+  then raise exception 'stable_event_id_confirmation_required' using errcode = '23514'; end if;
+  if p_mode = 'auto' and exists (
+    select 1 from public.finance_shortcut_connections
+    where user_id = owner_id and id <> p_id and mode = 'auto' and revoked_at is null
+  ) then raise exception 'active_auto_connection_exists' using errcode = '23514'; end if;
   update public.finance_shortcut_connections set mode = p_mode, account_id = p_account_id, category_id = p_category_id
   where id = p_id returning * into connection;
   return finance_private.shortcut_connection_json(connection);
@@ -222,6 +238,7 @@ begin
   -- Manual corrections do not prove that the parser understood the notification.
   -- Tests, duplicates and revoked connections can never enable auto mode.
   if item.auto_eligible and item.parser_format = 'jkopay-single-debit-v1' and item.ambiguous_of is null
+    and item.event_key like 'id:%'
     and connection.revoked_at is null and item.payload ->> 'test' = 'false'
     and chosen_amount = item.amount and btrim(chosen_merchant) = item.merchant and chosen_time = item.occurred_at
   then
@@ -243,7 +260,7 @@ as $$
 declare owner_id uuid; connection public.finance_shortcut_connections; previous public.finance_shortcut_inbox;
   created public.finance_shortcut_inbox; rate finance_private.shortcut_rate_limits;
   received_time timestamptz := clock_timestamp(); key_to_insert text := p_event_key;
-  duplicate_id uuid; is_test boolean; is_duplicate boolean := false; posted_id text;
+  duplicate_id uuid; is_test boolean; is_duplicate boolean := false; cross_connection boolean := false; posted_id text;
 begin
   select user_id into owner_id from public.finance_shortcut_connections where token_hash = p_token_hash and revoked_at is null;
   if not found then raise exception 'invalid_shortcut_token' using errcode = '42501'; end if;
@@ -277,6 +294,13 @@ begin
       if previous.fingerprint <> p_fingerprint then raise exception 'event_id_payload_conflict' using errcode = '23505'; end if;
       return jsonb_build_object('status', previous.status, 'id', previous.id, 'duplicate', true);
     end if;
+    -- A source/device ID may collide across connections. Keep the new proposal
+    -- for manual comparison even when the payload differs; do not silently drop
+    -- a different purchase or auto-post an old event after switching feeds.
+    select id into duplicate_id from public.finance_shortcut_inbox
+    where user_id = owner_id and connection_id <> connection.id and event_key = p_event_key
+    order by created_at, id limit 1;
+    if found then is_duplicate := true; cross_connection := true; end if;
   else
     -- A content hash cannot distinguish a retry from two identical purchases.
     -- Preserve the additional arrival for explicit review instead of losing it.
@@ -292,7 +316,8 @@ begin
     amount, merchant, occurred_at, status, reason, parser_format, auto_eligible, ambiguous_of)
   values(owner_id, connection.id, key_to_insert, p_fingerprint, p_payload,
     p_amount, p_merchant, p_occurred_at, case when is_test then 'test' else 'pending' end,
-    case when is_test then 'test_only' when is_duplicate then 'possible_duplicate'
+    case when is_test then 'test_only' when cross_connection then 'cross_connection_duplicate'
+      when is_duplicate then 'possible_duplicate'
       when p_event_key like 'fp:%' and p_auto_eligible then 'missing_event_id' else p_reason end,
     p_format, p_auto_eligible, duplicate_id)
   returning * into created;
@@ -321,8 +346,9 @@ create or replace function public.finance_shortcut_create(p_label text, p_token_
 as $$ select finance_private.shortcut_create(p_label, p_token_hash) $$;
 create or replace function public.finance_shortcut_revoke(p_id uuid) returns void language sql security invoker set search_path = ''
 as $$ select finance_private.shortcut_revoke(p_id) $$;
-create or replace function public.finance_shortcut_configure(p_id uuid, p_account_id text, p_category_id text, p_mode text) returns jsonb language sql security invoker set search_path = ''
-as $$ select finance_private.shortcut_configure(p_id, p_account_id, p_category_id, p_mode) $$;
+create or replace function public.finance_shortcut_configure(p_id uuid, p_account_id text, p_category_id text, p_mode text,
+  p_stable_event_id_confirmed boolean default false) returns jsonb language sql security invoker set search_path = ''
+as $$ select finance_private.shortcut_configure(p_id, p_account_id, p_category_id, p_mode, p_stable_event_id_confirmed) $$;
 create or replace function public.finance_shortcut_list_inbox() returns jsonb language sql security invoker set search_path = ''
 as $$ select finance_private.shortcut_list_inbox() $$;
 create or replace function public.finance_shortcut_review(p_id uuid, p_action text, p_account_id text default null,

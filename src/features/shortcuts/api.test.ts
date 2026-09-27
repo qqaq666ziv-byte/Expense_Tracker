@@ -100,4 +100,32 @@ describe('shortcut API owner and credential boundaries', () => {
     expect(error).toMatchObject({ kind: 'network' });
     expect(error.message).not.toContain('private network details');
   });
+
+  it('requires an explicit stable-ID confirmation for auto and sends false in review mode', async () => {
+    const { api, fetcher } = setup();
+    const configuration = { id: connection.id, accountId: 'account-a', categoryId: 'category-a', mode: 'auto' as const, stableEventIdConfirmed: false };
+    await expect(api.configure('owner-a', configuration)).rejects.toMatchObject({ kind: 'stable-event-id-required' });
+    expect(fetcher).not.toHaveBeenCalled();
+    await api.configure('owner-a', { ...configuration, stableEventIdConfirmed: true });
+    const [, autoRequest] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(autoRequest.body))).toEqual({
+      p_id: connection.id, p_account_id: 'account-a', p_category_id: 'category-a', p_mode: 'auto', p_stable_event_id_confirmed: true,
+    });
+    await api.configure('owner-a', { ...configuration, mode: 'review', stableEventIdConfirmed: true });
+    const [, reviewRequest] = fetcher.mock.calls[1] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(reviewRequest.body))).toMatchObject({ p_mode: 'review', p_stable_event_id_confirmed: false });
+  });
+
+  it('maps only exact stable-ID and active-auto server errors to safe guidance', async () => {
+    const { api, fetcher } = setup();
+    const configuration = { id: connection.id, accountId: 'account-a', categoryId: 'category-a', mode: 'auto' as const, stableEventIdConfirmed: true };
+    fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ code: '23514', message: 'stable_event_id_confirmation_required' }), { status: 400 }));
+    await expect(api.configure('owner-a', configuration)).rejects.toMatchObject({ kind: 'stable-event-id-required', message: expect.stringContaining('iPhone 重送測試') });
+    fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ code: '23514', message: 'active_auto_connection_exists' }), { status: 400 }));
+    await expect(api.configure('owner-a', configuration)).rejects.toMatchObject({ kind: 'active-auto-connection', message: expect.stringContaining('不會自動停用其他連線') });
+    fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ code: '23514', message: 'active_auto_connection_exists private details' }), { status: 400 }));
+    const error = await api.configure('owner-a', configuration).catch((caught) => caught);
+    expect(error.kind).toBe('request');
+    expect(error.message).not.toContain('private details');
+  });
 });
