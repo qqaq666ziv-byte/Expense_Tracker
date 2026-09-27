@@ -356,6 +356,66 @@ describe('HomeView durable mutation feedback', () => {
 });
 
 describe('HomeView smart quick entry interactions', () => {
+  it('keeps the original parents when an income editor opens across types with other remembered picks', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    const [originalCategory, rememberedCategory] = data.categories.filter((item) => item.kind === 'income');
+    const [originalAccount, rememberedAccount] = data.accounts;
+    data.transactions = [{
+      ...data.transactions[0],
+      type: 'income',
+      categoryId: originalCategory.id,
+      categoryName: originalCategory.name,
+      accountId: originalAccount.id,
+      accountName: originalAccount.name,
+    }];
+    localStorage.setItem('shiba-finance:quick-picks:guest:income', JSON.stringify({
+      categoryId: rememberedCategory.id,
+      accountId: rememberedAccount.id,
+    }));
+    const put = vi.fn(() => true);
+    render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+
+    await user.click(screen.getByRole('button', { name: `編輯 ${originalCategory.name}` }));
+    const note = screen.getByRole('textbox', { name: '備註' });
+    await user.clear(note);
+    await user.type(note, '只更新備註');
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(put).toHaveBeenCalledWith('transactions', expect.objectContaining({
+      id: data.transactions[0].id,
+      type: 'income',
+      categoryId: originalCategory.id,
+      categoryName: originalCategory.name,
+      accountId: originalAccount.id,
+      accountName: originalAccount.name,
+      note: '只更新備註',
+    }));
+  });
+
+  it('continues restoring remembered category and account when entering income creation', async () => {
+    const user = userEvent.setup();
+    const data = dataWithTwoAccounts();
+    const category = data.categories.find((item) => item.kind === 'income')!;
+    const account = data.accounts[1];
+    localStorage.setItem('shiba-finance:quick-picks:guest:income', JSON.stringify({
+      categoryId: category.id,
+      accountId: account.id,
+    }));
+    const put = vi.fn(() => true);
+    render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+
+    await user.click(screen.getByRole('button', { name: '記收入' }));
+    expect(screen.getByRole('button', { name: category.name })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: account.name })).toHaveAttribute('aria-pressed', 'true');
+    await user.type(screen.getByRole('textbox', { name: '金額' }), '88');
+    await user.click(screen.getByRole('button', { name: '記下這筆收入' }));
+
+    expect(put).toHaveBeenCalledWith('transactions', expect.objectContaining({
+      type: 'income', amount: 88, categoryId: category.id, accountId: account.id,
+    }));
+  });
+
   it('rejects a transaction edit when background sync advances its version and preserves the form', async () => {
     const user = userEvent.setup();
     const data = dataWithQuickHistory();

@@ -31,6 +31,7 @@ import {
 import { calculateFinancials } from '../domain/financeEngine';
 import { compareMoney, subtractMoney } from '../domain/money';
 import { recurringRuleParentIssue } from '../domain/recurringSafety';
+import { planCategoryReorder } from './categoryOrder';
 
 export const LOCAL_STATE_PREFIX = 'shiba-finance:v3:';
 
@@ -975,22 +976,11 @@ export function putCategoryWithDependents(
   assertCategoryUpsert(state.data, category);
   const timestamp = now.toISOString();
   const existing = state.data.categories.find((candidate) => candidate.id === category.id);
-  const siblings = state.data.categories
-    .filter((candidate) => (
-      candidate.id !== category.id
-      && candidate.ownerId === category.ownerId
-      && candidate.kind === category.kind
-      && !candidate.deletedAt
-    ))
-    .sort((left, right) => left.sortOrder - right.sortOrder || left.id.localeCompare(right.id));
-  const desiredIndex = Math.max(0, Math.min(category.sortOrder, siblings.length));
-  const ordered = [...siblings];
-  ordered.splice(desiredIndex, 0, category);
   let next = state;
-  for (const [sortOrder, record] of ordered.entries()) {
+  for (const { record, sortOrder } of planCategoryReorder(state.data.categories, category)) {
     if (record.id === category.id) {
       next = putRecord(next, 'categories', { ...category, sortOrder }, batchId);
-    } else if (record.sortOrder !== sortOrder) {
+    } else {
       next = putRecord(next, 'categories', {
         ...record,
         version: record.version + 1,

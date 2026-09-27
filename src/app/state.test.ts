@@ -27,6 +27,7 @@ import {
 import { TUTORIAL_RECORD_NOTE } from '../domain/tutorialRecord';
 import type { FinanceData } from '../domain/model';
 import { activeOperationId, syncFinanceState, type RemoteRecord } from '../domain/syncEngine';
+import { planCategoryReorder } from './categoryOrder';
 
 function memoryStorage() {
   const values = new Map<string, string>();
@@ -307,6 +308,24 @@ describe('owner-scoped local state', () => {
 
     expect(next.data.categories.find((item) => item.id === target.id)?.sortOrder).toBe(0);
     expect(orders).toEqual(orders.map((_, index) => index));
+  });
+
+  it('plans category order with same-owner kind boundaries, archived siblings and stable ID ties', () => {
+    const base = createInitialState('guest').data.categories[0];
+    const target = { ...base, id: 'target', name: '編輯分類', sortOrder: 1 };
+    const categories = [
+      { ...base, id: 'b', name: 'A', sortOrder: 5 },
+      { ...base, id: 'a', name: 'Z', sortOrder: 5, isActive: false },
+      { ...target, sortOrder: 20 },
+      { ...base, id: 'foreign', ownerId: 'other-owner', sortOrder: 0 },
+      { ...base, id: 'income', kind: 'income' as const, sortOrder: 0 },
+      { ...base, id: 'deleted', deletedAt: '2026-09-27T00:00:00.000Z', sortOrder: 0 },
+    ];
+    const before = structuredClone(categories);
+
+    expect(planCategoryReorder(categories, target).map(({ record, sortOrder }) => [record.id, sortOrder]))
+      .toEqual([['a', 0], ['target', 1], ['b', 2]]);
+    expect(categories).toEqual(before);
   });
 
   it('gives tombstones a conflict-clock operation id that wins same-version legacy edits', () => {

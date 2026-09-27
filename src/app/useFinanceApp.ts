@@ -59,6 +59,7 @@ import {
   type FinancePersistence,
 } from './localDurability';
 import { assertCategoryUpsert, type CategoryAction } from '../domain/lifecycle';
+import { planCategoryReorder } from './categoryOrder';
 import {
   assertTransferCollectionMutationAllowed,
   assertTransferMutationAllowed,
@@ -260,16 +261,8 @@ export function syncMutationTargets<E extends FinanceEntityName>(
   if (entity === 'categories') {
     const category = record as Category;
     const existing = state.data.categories.find((candidate) => candidate.id === category.id);
-    const siblings = state.data.categories
-      .filter((candidate) => (
-        !candidate.deletedAt && candidate.kind === category.kind && candidate.id !== category.id
-      ))
-      .sort((left, right) => left.sortOrder - right.sortOrder || left.id.localeCompare(right.id));
-    const desiredIndex = Math.max(0, Math.min(category.sortOrder, siblings.length));
-    const ordered = [...siblings];
-    ordered.splice(desiredIndex, 0, category);
-    targets.push(...ordered.flatMap((candidate, sortOrder) => (
-      candidate.id !== category.id && candidate.sortOrder !== sortOrder
+    targets.push(...planCategoryReorder(state.data.categories, category).flatMap(({ record: candidate }) => (
+      candidate.id !== category.id
         ? [{ entity: 'categories' as const, recordId: candidate.id }]
         : []
     )));
@@ -1224,6 +1217,7 @@ export function useFinanceApp(
       setStorageError('訪客資料快照無法驗證，因此未匯入；原始內容仍保持不變。');
       return;
     }
+    const importFingerprint = guestSnapshotFingerprint(loadedGuest.state.data);
     const imported = remapOwner(loadedGuest.state.data, importOwnerId);
     if (!TRANSFER_MUTATIONS_ENABLED && imported.transfers.length > 0) {
       setGuestImportNotice('緊急 transfer read-only 模式下不會匯入新轉帳；訪客快照仍保持不變。');
@@ -1237,7 +1231,7 @@ export function useFinanceApp(
     if (!guestDecisionKey) return;
     let committedPlan = plan;
     const applied = await commitFinancialState(
-      `guest-import:${guestFingerprint}`,
+      `guest-import:${importFingerprint}`,
       (latest) => {
         const latestPlan = planGuestImport(latest, imported);
         if (latestPlan.conflicts.length > 0) {
@@ -1254,14 +1248,14 @@ export function useFinanceApp(
       return;
     }
     try {
-      localStorage.setItem(guestDecisionKey, guestFingerprint);
+      localStorage.setItem(guestDecisionKey, importFingerprint);
       setGuestPromptDismissed(true);
       setGuestImportNotice(`訪客資料匯入完成：新增 ${committedPlan.addedCount} 筆，略過 ${committedPlan.skippedCount} 筆內容相同的既有資料。`);
     } catch (error) {
       setStorageError(`訪客資料已匯入，但無法記住匯入決策：${error instanceof Error ? error.message : String(error)}`);
       setGuestImportNotice(`訪客資料已安全匯入：新增 ${committedPlan.addedCount} 筆，略過 ${committedPlan.skippedCount} 筆；但瀏覽器未能記住此決策，下次可能再次提示。`);
     }
-  }, [assertRenderedOwnerContext, commitFinancialState, financePersistence, guestDecisionKey, guestFingerprint, storageRecovery]);
+  }, [assertRenderedOwnerContext, commitFinancialState, financePersistence, guestDecisionKey, storageRecovery]);
 
   const decideLegacyBootstrap = useCallback(async (decision: LegacyBootstrapDecision) => {
     setLegacyBootstrapNotice(undefined);

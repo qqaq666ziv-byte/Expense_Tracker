@@ -27,6 +27,7 @@ import {
   type MutationApplication,
 } from "../app/mutationResult";
 import { resolveExplicitSelection } from "../app/explicitSelection";
+import { useCalendarReference } from "../app/useCalendarReference";
 import {
   TUTORIAL_RECORD_NOTE,
   isTutorialTransaction,
@@ -85,6 +86,7 @@ function OwnerScopedHomeView({
   confirmTransferAccounts,
   transferMutationsEnabled = true,
 }: HomeViewProps) {
+  const reference = useCalendarReference();
   const amountRef = useRef<HTMLInputElement>(null);
   const [type, setType] = useState<"expense" | "income">("expense");
   const [mode, setMode] = useState<"expense" | "income" | "transfer">("expense");
@@ -192,6 +194,8 @@ function OwnerScopedHomeView({
     resolvedCategoryId, tutorial, unresolvedSyncRecordKeys]);
 
   useEffect(() => {
+    // Remembered picks initialize new transactions, never an existing editor.
+    if (editing || editingTransfer || mode === "transfer") return;
     try {
       const saved = localStorage.getItem(
         `shiba-finance:quick-picks:${ownerId}:${type}`,
@@ -206,7 +210,7 @@ function OwnerScopedHomeView({
     } catch {
       /* Recent picks are a convenience, never financial state. */
     }
-  }, [ownerId, type]);
+  }, [editing, editingTransfer, mode, ownerId, type]);
 
   useEffect(() => {
     setPinnedNotePreference({
@@ -240,8 +244,8 @@ function OwnerScopedHomeView({
 
   const today = useMemo(
     () =>
-      calculateInsights(data, { period: "month", reference: new Date() }).today,
-    [data],
+      calculateInsights(data, { period: "month", reference }).today,
+    [data, reference],
   );
   const history = useMemo(() => {
     const normalHistory = buildLedgerHistory(data);
