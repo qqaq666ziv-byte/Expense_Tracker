@@ -1,4 +1,4 @@
-import { createElement, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { createElement, useEffect, useMemo, useReducer, useRef, useState, type FormEvent } from "react";
 import {
   CalendarClock,
   Check,
@@ -10,7 +10,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import type { AssetAccount, Category, FinanceData, Transaction, Transfer } from "../domain/model";
+import type { FinanceData, Transaction, Transfer } from "../domain/model";
 import { buildLedgerHistory, calculateInsights } from "../domain/financeEngine";
 import { sortByDisplayOrder } from "../domain/displayOrder";
 import { changedRecordMeta, newRecordMeta } from "../app/state";
@@ -36,6 +36,7 @@ import {
 } from "../app/tutorial";
 import { FinanceIcon } from "./FinanceIcon";
 import { MoneyInput } from "./MoneyInput";
+import { createHomeEditorState, homeEditorReducer, isTransferEditor } from "./homeEditorState";
 import { differingSyncRecordFields, syncRecordKey } from "../domain/syncEngine";
 import { buildTransferRecord } from "../domain/transfer";
 import { isEditorSnapshotStale } from "../domain/staleEditor";
@@ -88,37 +89,32 @@ function OwnerScopedHomeView({
 }: HomeViewProps) {
   const reference = useCalendarReference();
   const amountRef = useRef<HTMLInputElement>(null);
-  const [type, setType] = useState<"expense" | "income">("expense");
-  const [mode, setMode] = useState<"expense" | "income" | "transfer">("expense");
+  const [editor, dispatchEditor] = useReducer(homeEditorReducer, undefined, createHomeEditorState);
+  const transferEditor = isTransferEditor(editor) ? editor : null;
+  const type = isTransferEditor(editor) ? editor.previousTransactionType : editor.type;
+  const mode = transferEditor ? "transfer" : type;
+  const editing = editor.kind === "edit-transaction" ? editor.record : null;
+  const editingTransfer = editor.kind === "edit-transfer" ? editor.record : null;
+  const categoryId = isTransferEditor(editor) ? "" : editor.categoryId;
+  const accountId = isTransferEditor(editor) ? editor.previousAccountId : editor.accountId;
+  const sourceAccountId = transferEditor?.source.id ?? "";
+  const destinationAccountId = transferEditor?.destination.id ?? "";
+  const quickReentryParents = editor.kind === "create-transaction" ? editor.quickReentryParents : null;
   const [amount, setAmount] = useState("");
   const [transferFee, setTransferFee] = useState("");
-  const [categoryId, setCategoryId] = useState("");
-  const [accountId, setAccountId] = useState("");
   const [occurredAt, setOccurredAt] = useState(toLocalInput());
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-  const [editing, setEditing] = useState<Transaction | null>(null);
-  const [editingTransfer, setEditingTransfer] = useState<Transfer | null>(null);
-  const [sourceAccountId, setSourceAccountId] = useState("");
-  const [destinationAccountId, setDestinationAccountId] = useState("");
-  const [openedTransferAccounts, setOpenedTransferAccounts] = useState<{
-    source?: AssetAccount;
-    destination?: AssetAccount;
-  }>({});
-  const [quickReentryParents, setQuickReentryParents] = useState<{
-    category?: Category;
-    account?: AssetAccount;
-  } | null>(null);
   const [historyLimit, setHistoryLimit] = useState(ledgerPageSize);
   const [query, setQuery] = useState("");
   const [pinnedNotePreference, setPinnedNotePreference] = useState<{
     ownerId: string;
     shortcuts: string[];
   }>({ ownerId, shortcuts: [] });
-  const pinnedNoteShortcuts = pinnedNotePreference.ownerId === ownerId
-    ? pinnedNotePreference.shortcuts
-    : [];
+  const pinnedNoteShortcuts = useMemo(() => (
+    pinnedNotePreference.ownerId === ownerId ? pinnedNotePreference.shortcuts : []
+  ), [ownerId, pinnedNotePreference]);
   const [addingNoteShortcut, setAddingNoteShortcut] = useState(false);
   const [noteShortcutDraft, setNoteShortcutDraft] = useState("");
   const [noteShortcutError, setNoteShortcutError] = useState("");
@@ -205,8 +201,10 @@ function OwnerScopedHomeView({
         categoryId?: string;
         accountId?: string;
       };
-      if (picks.categoryId) setCategoryId(picks.categoryId);
-      if (picks.accountId) setAccountId(picks.accountId);
+      dispatchEditor({
+        type: "restore-picks", transactionType: type,
+        categoryId: picks.categoryId, accountId: picks.accountId,
+      });
     } catch {
       /* Recent picks are a convenience, never financial state. */
     }
@@ -298,37 +296,21 @@ function OwnerScopedHomeView({
     setTransferFee("");
     setNote("");
     setOccurredAt(toLocalInput());
-    setEditing(null);
-    setEditingTransfer(null);
-    setQuickReentryParents(null);
-    setOpenedTransferAccounts({
-      source: data.accounts.find((account) => account.id === sourceAccountId),
-      destination: data.accounts.find((account) => account.id === destinationAccountId),
-    });
+    dispatchEditor({ type: "reset", accounts: data.accounts });
     setError("");
     requestAnimationFrame(() => amountRef.current?.focus());
   };
 
   const switchType = (next: "expense" | "income") => {
     setTransferFee("");
-    setMode(next);
-    setType(next);
-    setEditingTransfer(null);
-    setQuickReentryParents(null);
-    setOpenedTransferAccounts({});
-    setSourceAccountId("");
-    setDestinationAccountId("");
-    setCategoryId("");
+    dispatchEditor({ type: "switch-transaction", transactionType: next });
     setError("");
     setSuccess("");
     requestAnimationFrame(() => amountRef.current?.focus());
   };
 
   const switchToTransfer = () => {
-    setMode("transfer");
-    setEditing(null);
-    setQuickReentryParents(null);
-    setCategoryId("");
+    dispatchEditor({ type: "switch-transfer" });
     setError("");
     setSuccess("");
     requestAnimationFrame(() => amountRef.current?.focus());
@@ -336,7 +318,7 @@ function OwnerScopedHomeView({
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (mode === "transfer") {
+    if (transferEditor) {
       const numericAmount = parseRequiredNumberInput(amount);
       const numericFee = transferFee.trim() === "" ? 0 : parseRequiredNumberInput(transferFee);
       if (numericFee === null || numericFee < 0) {
@@ -382,8 +364,8 @@ function OwnerScopedHomeView({
         return;
       }
       for (const [label, openedAccount] of [
-        ["來源帳戶", openedTransferAccounts.source],
-        ["目的帳戶", openedTransferAccounts.destination],
+        ["來源帳戶", transferEditor.source.snapshot],
+        ["目的帳戶", transferEditor.destination.snapshot],
       ] as const) {
         if (!openedAccount) continue;
         const currentAccount = data.accounts.find((account) => account.id === openedAccount.id);
@@ -556,18 +538,9 @@ function OwnerScopedHomeView({
   };
 
   const beginEdit = (transaction: Transaction) => {
-    setMode(transaction.type);
-    setEditing(transaction);
-    setEditingTransfer(null);
-    setOpenedTransferAccounts({});
-    setQuickReentryParents(null);
-    setSourceAccountId("");
-    setDestinationAccountId("");
-    setType(transaction.type);
+    dispatchEditor({ type: "edit-transaction", record: transaction });
     setAmount(String(transaction.amount));
     setTransferFee("");
-    setCategoryId(transaction.categoryId);
-    setAccountId(transaction.accountId);
     setOccurredAt(transaction.occurredAt.slice(0, 16).replace(" ", "T"));
     setNote(isTutorialTransaction(transaction) ? "" : (transaction.note ?? ""));
     setSuccess("");
@@ -577,20 +550,11 @@ function OwnerScopedHomeView({
   };
 
   const beginEditTransfer = (transfer: Transfer) => {
-    setMode("transfer");
-    setEditing(null);
-    setEditingTransfer(transfer);
-    setQuickReentryParents(null);
+    dispatchEditor({ type: "edit-transfer", record: transfer, accounts: data.accounts });
     setAmount(String(transfer.amount));
     setTransferFee(String(transfer.fee ?? 0));
-    setSourceAccountId(transfer.sourceAccountId);
-    setDestinationAccountId(transfer.destinationAccountId);
     setOccurredAt(transfer.occurredAt.slice(0, 16).replace(" ", "T"));
     setNote(transfer.note ?? "");
-    setOpenedTransferAccounts({
-      source: data.accounts.find((account) => account.id === transfer.sourceAccountId),
-      destination: data.accounts.find((account) => account.id === transfer.destinationAccountId),
-    });
     setSuccess("");
     setError("");
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -669,9 +633,7 @@ function OwnerScopedHomeView({
                       if (!category || !account) return;
                       setAmount(String(candidate.amount));
                       setNote(candidate.note);
-                      setCategoryId(candidate.categoryId);
-                      setAccountId(candidate.accountId);
-                      setQuickReentryParents({ category, account });
+                      dispatchEditor({ type: "quick-reentry", category, account });
                       setError("");
                       setSuccess("");
                       requestAnimationFrame(() => amountRef.current?.focus());
@@ -755,10 +717,7 @@ function OwnerScopedHomeView({
                     ? "此分類有未解同步衝突，暫時無法用於新交易。"
                     : undefined}
                   onClick={() => {
-                    setCategoryId(category.id);
-                    setQuickReentryParents((current) => current?.account
-                      ? { account: current.account }
-                      : null);
+                    dispatchEditor({ type: "select-category", categoryId: category.id });
                     onTutorialEvent?.({ type: "category-selected" });
                   }}
                 >
@@ -790,10 +749,7 @@ function OwnerScopedHomeView({
                     ? "此帳戶有未解同步衝突，暫時無法用於新交易。"
                     : undefined}
                   onClick={() => {
-                    setAccountId(account.id);
-                    setQuickReentryParents((current) => current?.category
-                      ? { category: current.category }
-                      : null);
+                    dispatchEditor({ type: "select-account", accountId: account.id });
                     onTutorialEvent?.({ type: "account-selected" });
                   }}
                 >
@@ -822,8 +778,7 @@ function OwnerScopedHomeView({
                         aria-pressed={resolvedSourceAccountId === account.id}
                         disabled={locked || Boolean(account.deletedAt)}
                         onClick={() => {
-                          setSourceAccountId(account.id);
-                          setOpenedTransferAccounts((current) => ({ ...current, source: account }));
+                          dispatchEditor({ type: "select-transfer-account", side: "source", account });
                           setError("");
                         }}
                       >
@@ -839,12 +794,7 @@ function OwnerScopedHomeView({
                 className="secondary-button transfer-swap"
                 aria-label="交換來源與目的帳戶"
                 onClick={() => {
-                  setSourceAccountId(destinationAccountId);
-                  setDestinationAccountId(sourceAccountId);
-                  setOpenedTransferAccounts((current) => ({
-                    source: current.destination,
-                    destination: current.source,
-                  }));
+                  dispatchEditor({ type: "swap-transfer-accounts" });
                   setError("");
                 }}
               >
@@ -864,8 +814,7 @@ function OwnerScopedHomeView({
                         aria-pressed={resolvedDestinationAccountId === account.id}
                         disabled={locked || Boolean(account.deletedAt)}
                         onClick={() => {
-                          setDestinationAccountId(account.id);
-                          setOpenedTransferAccounts((current) => ({ ...current, destination: account }));
+                          dispatchEditor({ type: "select-transfer-account", side: "destination", account });
                           setError("");
                         }}
                       >

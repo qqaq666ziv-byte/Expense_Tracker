@@ -751,7 +751,8 @@ function validateRemoteGraph(records: readonly RemoteRecord[]): RemotePullResult
         break;
       case 'budgets':
         if (entry.record.scope === 'category'
-          && categories.get(entry.record.categoryId)?.kind !== 'expense') {
+          && (entry.record.categoryId === undefined
+            || categories.get(entry.record.categoryId)?.kind !== 'expense')) {
           reason = 'references a missing or non-expense category';
         }
         break;

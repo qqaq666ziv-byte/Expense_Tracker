@@ -233,6 +233,72 @@ describe('HomeView transfer interactions', () => {
     expect(put).not.toHaveBeenCalled();
   });
 
+  it('swaps endpoint snapshots with their IDs and refreshes them when cancelling into transfer creation', async () => {
+    const user = userEvent.setup();
+    const data = dataWithTwoAccounts();
+    const existing = transferFor(data);
+    data.transfers = [existing];
+    const put = vi.fn(() => true);
+    const view = render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+    await user.click(screen.getByRole('button', { name: /編輯轉帳/ }));
+
+    const updatedSource = {
+      ...data.accounts[0],
+      version: data.accounts[0].version + 1,
+      lastOperationId: 'source-background-update',
+    };
+    view.rerender(<HomeView
+      data={{ ...data, accounts: [updatedSource, data.accounts[1]] }}
+      ownerId="guest" put={put} deleteTransaction={() => true}
+    />);
+    await user.click(screen.getByRole('button', { name: '交換來源與目的帳戶' }));
+    await user.click(screen.getByRole('button', { name: '儲存轉帳修改' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('目的帳戶已在背景更新');
+    expect(put).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: '取消' }));
+    expect(screen.getByRole('heading', { name: '極速記帳' })).toBeInTheDocument();
+    await user.type(screen.getByRole('textbox', { name: '金額' }), '50');
+    await user.click(screen.getByRole('button', { name: '記下這筆轉帳' }));
+
+    expect(put).toHaveBeenCalledWith('transfers', expect.objectContaining({
+      sourceAccountId: data.accounts[1].id,
+      destinationAccountId: updatedSource.id,
+      amount: 50, version: 1,
+    }));
+    expect((put.mock.calls as unknown as Array<[string, Transfer]>)[0][1].id).not.toBe(existing.id);
+  });
+
+  it('returns from a transfer editor to income creation with the prior transaction account and draft', async () => {
+    const user = userEvent.setup();
+    const data = dataWithTwoAccounts();
+    const existing = transferFor(data);
+    data.transfers = [existing];
+    const category = data.categories.find((item) => item.kind === 'income')!;
+    const account = data.accounts[1];
+    const put = vi.fn(() => true);
+    render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+
+    await user.click(screen.getByRole('button', { name: '記收入' }));
+    await user.click(screen.getByRole('button', { name: account.name }));
+    await user.click(screen.getByRole('button', { name: /編輯轉帳/ }));
+    await user.click(screen.getByRole('button', { name: '記收入' }));
+
+    expect(screen.getByRole('heading', { name: '極速記帳' })).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '金額' })).toHaveValue(String(existing.amount));
+    expect(screen.getByRole('textbox', { name: '備註' })).toHaveValue(existing.note);
+    expect(screen.getByRole('button', { name: account.name })).toHaveAttribute('aria-pressed', 'true');
+    await user.click(screen.getByRole('button', { name: category.name }));
+    await user.click(screen.getByRole('button', { name: '記下這筆收入' }));
+
+    expect(put).toHaveBeenCalledWith('transactions', expect.objectContaining({
+      type: 'income', amount: existing.amount, note: existing.note,
+      accountId: account.id, categoryId: category.id, version: 1,
+    }));
+    expect((put.mock.calls as unknown as Array<[string, Transaction]>)[0][1].id).not.toBe(existing.id);
+  });
+
   it('finds a transfer by note and performs explicit edit/delete actions', async () => {
     const user = userEvent.setup();
     const data = dataWithTwoAccounts();
@@ -356,6 +422,33 @@ describe('HomeView durable mutation feedback', () => {
 });
 
 describe('HomeView smart quick entry interactions', () => {
+  it('keeps editing the same transaction when changing its income or expense type', async () => {
+    const user = userEvent.setup();
+    const data = dataWithQuickHistory();
+    const original = data.transactions[1];
+    const category = data.categories.find((item) => item.kind === 'income')!;
+    localStorage.setItem('shiba-finance:quick-picks:guest:income', JSON.stringify({
+      categoryId: category.id,
+      accountId: data.accounts[1].id,
+    }));
+    const put = vi.fn(() => true);
+    render(<HomeView data={data} ownerId="guest" put={put} deleteTransaction={() => true} />);
+
+    await user.click(screen.getAllByRole('button', { name: `編輯 ${original.categoryName}` })[0]);
+    await user.click(screen.getByRole('button', { name: '記收入' }));
+    expect(screen.getByRole('button', { name: '儲存修改' })).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '金額' })).toHaveValue(String(original.amount));
+    expect(screen.getByRole('button', { name: original.accountName })).toHaveAttribute('aria-pressed', 'true');
+    await user.click(screen.getByRole('button', { name: category.name }));
+    await user.click(screen.getByRole('button', { name: '儲存修改' }));
+
+    expect(put).toHaveBeenCalledWith('transactions', expect.objectContaining({
+      id: original.id, version: original.version + 1, type: 'income',
+      categoryId: category.id, accountId: original.accountId,
+      amount: original.amount, note: original.note,
+    }));
+  });
+
   it('keeps the original parents when an income editor opens across types with other remembered picks', async () => {
     const user = userEvent.setup();
     const data = dataWithQuickHistory();

@@ -43,6 +43,8 @@ import {
   guestSnapshotFingerprint,
   hasUserContent,
   loadFinanceStateWithRecovery,
+  legacyStorageKeys,
+  storageKey,
   type LoadedFinanceState,
   planGuestImport,
   type LocalStateRecovery,
@@ -60,6 +62,7 @@ import {
 } from './localDurability';
 import { assertCategoryUpsert, type CategoryAction } from '../domain/lifecycle';
 import { planCategoryReorder } from './categoryOrder';
+import { assertOrdinaryMutationWritable, getOrdinaryMutationBlock } from './ordinaryMutationPolicy';
 import {
   assertTransferCollectionMutationAllowed,
   assertTransferMutationAllowed,
@@ -565,16 +568,58 @@ export function useFinanceApp(
   useEffect(() => {
     if (state.ownerId === 'guest') {
       setGuestLedger({ state, ...(storageRecovery ? { recovery: storageRecovery } : {}) });
-      return;
     }
+  }, [state, storageRecovery]);
+
+  useEffect(() => {
+    const ownerId = state.ownerId;
+    const generation = renderedOwnerGeneration;
+    if (ownerId === 'guest') return;
     let active = true;
-    void financePersistence.load('guest').then((loaded) => {
-      if (active) setGuestLedger(loaded);
-    }).catch((error) => {
-      if (active) setStorageError(`無法讀取訪客 durable ledger：${error instanceof Error ? error.message : String(error)}`);
-    });
-    return () => { active = false; };
-  }, [financePersistence, state, storageRecovery]);
+    let reading = false;
+    let refreshRequested = false;
+    const isCurrentOwner = () => active
+      && activeOwnerRef.current === ownerId
+      && ownerGenerationRef.current === generation;
+    const refresh = async () => {
+      refreshRequested = true;
+      if (reading) return;
+      reading = true;
+      try {
+        while (isCurrentOwner() && refreshRequested) {
+          refreshRequested = false;
+          try {
+            const loaded = await financePersistence.load('guest');
+            if (isCurrentOwner() && !refreshRequested) setGuestLedger(loaded);
+          } catch (error) {
+            if (isCurrentOwner() && !refreshRequested) {
+              setStorageError(`無法讀取訪客 durable ledger：${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+        }
+      } finally {
+        reading = false;
+      }
+    };
+    const refreshPrompt = () => { void refresh(); };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') refreshPrompt();
+    };
+    const guestKeys = new Set([storageKey('guest'), ...legacyStorageKeys('guest')]);
+    const refreshOnStorage = (event: StorageEvent) => {
+      if (event.key === null || guestKeys.has(event.key)) refreshPrompt();
+    };
+    refreshPrompt();
+    window.addEventListener('focus', refreshPrompt);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    window.addEventListener('storage', refreshOnStorage);
+    return () => {
+      active = false;
+      window.removeEventListener('focus', refreshPrompt);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      window.removeEventListener('storage', refreshOnStorage);
+    };
+  }, [financePersistence, renderedOwnerGeneration, state.ownerId]);
 
   useEffect(() => {
     const refreshDay = () => setCalendarDay(localDateString());
@@ -613,7 +658,8 @@ export function useFinanceApp(
   }, [activateOwner]);
 
   const syncNow = useCallback(async () => {
-    if (!supabase) return;
+    const client = supabase;
+    if (!client) return;
     const started = stateRef.current;
     const generation = ownerGenerationRef.current;
     const ownerId = activeOwnerRef.current;
@@ -628,7 +674,7 @@ export function useFinanceApp(
         ownerId,
         storageRecoveryRef.current,
         () => {
-          const remote = createSupabaseRemoteAdapter(supabase);
+          const remote = createSupabaseRemoteAdapter(client);
           return TRANSFER_MUTATIONS_ENABLED
             ? remote
             : createTransferReadOnlyRemoteAdapter(remote);
@@ -666,8 +712,7 @@ export function useFinanceApp(
     window.addEventListener('online', onOnline);
     return () => window.removeEventListener('online', onOnline);
     // A first pull is required after every owner switch. Retries thereafter use the online/manual triggers.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.ownerId, authLoading, durabilityLoading]);
+  }, [state.ownerId, authLoading, durabilityLoading, syncNow]);
 
   const outboxKey = state.outbox.map((operation) => operation.id).join('|');
   useEffect(() => {
@@ -675,8 +720,15 @@ export function useFinanceApp(
     const timer = window.setTimeout(() => { void syncNow(); }, 350);
     return () => window.clearTimeout(timer);
     // Attempts do not change this key, so a persistent failure waits for reconnect/manual retry.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.ownerId, outboxKey]);
+  }, [state.ownerId, outboxKey, syncNow]);
+
+  const reportOrdinaryMutationBlock = useCallback((action: 'write' | 'delete'): boolean => {
+    const block = getOrdinaryMutationBlock(stateRef.current, storageRecoveryRef.current, action);
+    if (!block) return false;
+    if (block.reason === 'legacy-pending') setLegacyBootstrapNotice(block.message);
+    else setSafetyNotice(block.message);
+    return true;
+  }, []);
 
   const put = useCallback(async <E extends FinanceEntityName>(
     entity: E,
@@ -688,18 +740,7 @@ export function useFinanceApp(
       setSafetyNotice(error instanceof Error ? error.message : String(error));
       return false;
     }
-    if (stateRef.current.legacyBootstrap?.status === 'pending') {
-      setLegacyBootstrapNotice('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
-      return false;
-    }
-    if (stateRef.current.initialBootstrap) {
-      setSafetyNotice('正在先讀取雲端帳本；完成前本次修改未執行。');
-      return false;
-    }
-    if (storageRecoveryRef.current) {
-      setSafetyNotice('本機快照仍在復原保護中；完成有效備份還原前，本次帳本修改未執行。');
-      return false;
-    }
+    if (reportOrdinaryMutationBlock('write')) return false;
     try {
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
       assertTransferMutationAllowed(entity, TRANSFER_MUTATIONS_ENABLED);
@@ -731,19 +772,14 @@ export function useFinanceApp(
       setSafetyNotice(`資料未儲存：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-  }, [assertRenderedOwnerContext, commitFinancialState]);
+  }, [assertRenderedOwnerContext, commitFinancialState, reportOrdinaryMutationBlock]);
 
   const confirmTransferAccounts = useCallback(async (record: Transfer): Promise<boolean> => {
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
       assertTransferMutationAllowed('transfers', TRANSFER_MUTATIONS_ENABLED);
-      if (stateRef.current.legacyBootstrap?.status === 'pending' || stateRef.current.initialBootstrap) {
-        throw new Error('雲端帳本尚在安全讀取；完成前無法重新確認轉帳帳戶。');
-      }
-      if (storageRecoveryRef.current) {
-        throw new Error('本機快照仍在復原保護中；無法重新確認轉帳帳戶。');
-      }
+      assertOrdinaryMutationWritable(stateRef.current, storageRecoveryRef.current, 'confirm-transfer');
       const committed = await commitFinancialState(
         record.lastOperationId,
         (current) => confirmTransferDependencyConflict(current, record),
@@ -761,15 +797,7 @@ export function useFinanceApp(
     try {
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
-      if (stateRef.current.legacyBootstrap?.status === 'pending') {
-        throw new Error('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
-      }
-      if (stateRef.current.initialBootstrap) {
-        throw new Error('正在先讀取雲端帳本；完成前本次修改未執行。');
-      }
-      if (storageRecoveryRef.current) {
-        throw new Error('本機快照仍在復原保護中；完成有效備份還原前，本次帳本修改未執行。');
-      }
+      assertOrdinaryMutationWritable(stateRef.current, storageRecoveryRef.current, 'write');
       const targets = [
         { entity: 'categories' as const, recordId: record.id },
         ...(action === 'archive'
@@ -824,12 +852,7 @@ export function useFinanceApp(
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
       const current = stateRef.current;
-      if (current.legacyBootstrap?.status === 'pending' || current.initialBootstrap) {
-        throw new Error('雲端帳本尚在安全讀取；完成前本次封存未執行。');
-      }
-      if (storageRecoveryRef.current) {
-        throw new Error('本機快照仍在復原保護中；本次封存未執行。');
-      }
+      assertOrdinaryMutationWritable(current, storageRecoveryRef.current, 'archive');
       const targets = [
         { entity: 'accounts' as const, recordId: record.id },
         ...current.data.recurringRules
@@ -876,12 +899,7 @@ export function useFinanceApp(
       assertRenderedOwnerContext();
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
       const current = stateRef.current;
-      if (current.legacyBootstrap?.status === 'pending' || current.initialBootstrap) {
-        throw new Error('雲端帳本尚在安全讀取；完成前本次釋放未執行。');
-      }
-      if (storageRecoveryRef.current) {
-        throw new Error('本機快照仍在復原保護中；本次釋放未執行。');
-      }
+      assertOrdinaryMutationWritable(current, storageRecoveryRef.current, 'release');
       const targets = [
         { entity: 'goals' as const, recordId: goal.id },
         ...current.data.allocations
@@ -933,18 +951,7 @@ export function useFinanceApp(
       setSafetyNotice(error instanceof Error ? error.message : String(error));
       return false;
     }
-    if (stateRef.current.legacyBootstrap?.status === 'pending') {
-      setLegacyBootstrapNotice('舊版本機資料尚在先讀取雲端；完成前已停止所有帳本修改。');
-      return false;
-    }
-    if (stateRef.current.initialBootstrap) {
-      setSafetyNotice('正在先讀取雲端帳本；完成前本次刪除未執行。');
-      return false;
-    }
-    if (storageRecoveryRef.current) {
-      setSafetyNotice('本機快照仍在復原保護中；完成有效備份還原前，本次刪除未執行。');
-      return false;
-    }
+    if (reportOrdinaryMutationBlock('delete')) return false;
     try {
       assertFinanceMutationNotSyncing(syncTokenRef.current !== null);
       assertTransferMutationAllowed(entity, TRANSFER_MUTATIONS_ENABLED);
@@ -979,7 +986,7 @@ export function useFinanceApp(
       setSafetyNotice(`資料未刪除：${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-  }, [assertRenderedOwnerContext, commitFinancialState]);
+  }, [assertRenderedOwnerContext, commitFinancialState, reportOrdinaryMutationBlock]);
 
   const setData = useCallback(async (data: FinanceData): Promise<void> => {
     const restorePreviewBase = structuredClone(stateRef.current);
@@ -1128,13 +1135,14 @@ export function useFinanceApp(
     }
   }, [assertRenderedOwnerContext, commitState]);
 
+  const awaitingInitialBootstrap = Boolean(state.initialBootstrap);
   useEffect(() => {
     if (storageRecovery
       || durabilityLoading
       || syncBusy
       || syncTokenRef.current !== null
       || state.legacyBootstrap?.status === 'pending'
-      || state.initialBootstrap) return;
+      || awaitingInitialBootstrap) return;
     void commitState(`recurrence:${state.ownerId}:${calendarDay}:${recurrenceCursorKey}`, (current) => {
       if (syncTokenRef.current !== null) return current;
       return materializeRecurringTransactionsUnlessSyncing(
@@ -1144,7 +1152,7 @@ export function useFinanceApp(
         () => syncTokenRef.current !== null,
       );
     });
-  }, [state.ownerId, state.legacyBootstrap?.status, state.initialBootstrap?.status, recurrenceCursorKey, calendarDay, commitState, durabilityLoading, storageRecovery, syncBusy]);
+  }, [state.ownerId, state.legacyBootstrap?.status, awaitingInitialBootstrap, recurrenceCursorKey, calendarDay, commitState, durabilityLoading, storageRecovery, syncBusy]);
 
   const guestLoad = guestLedger;
   const guestFingerprint = guestSnapshotFingerprint(guestLoad.state.data);

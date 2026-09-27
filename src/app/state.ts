@@ -32,6 +32,7 @@ import { calculateFinancials } from '../domain/financeEngine';
 import { compareMoney, subtractMoney } from '../domain/money';
 import { recurringRuleParentIssue } from '../domain/recurringSafety';
 import { planCategoryReorder } from './categoryOrder';
+import { readPendingSyncConflict } from '../domain/syncConflict';
 
 export const LOCAL_STATE_PREFIX = 'shiba-finance:v3:';
 
@@ -276,6 +277,7 @@ export function loadFinanceStateWithRecovery(
         throw new Error('outbox does not match the current local record');
       }
       validateBatchBeforeRecord(parsed.data, operation, 'local outbox batch before-record');
+      readPendingSyncConflict(operation);
     }
     if (parsed.unresolvedSyncRecordKeys !== undefined) {
       if (!Array.isArray(parsed.unresolvedSyncRecordKeys)) {
@@ -340,6 +342,7 @@ export function loadFinanceStateWithRecovery(
           operation,
           'authenticated initial bootstrap batch before-record',
         );
+        readPendingSyncConflict(operation);
         pendingKeys.add(key);
       }
     }
@@ -1271,6 +1274,23 @@ export function remapOwner(data: FinanceData, ownerId: string): FinanceData {
   };
 }
 
+function syncConflictContent(state: PersistedFinanceState): string {
+  const conflicts = state.outbox.flatMap((operation) => {
+    const conflict = readPendingSyncConflict(operation);
+    return conflict === null ? [] : [{
+      key: `${operation.entity}:${operation.recordId}`,
+      operationId: operation.id,
+      conflict: conflict.kind === 'transfer-dependency'
+        ? { ...conflict, accountIds: [...conflict.accountIds].sort() }
+        : conflict,
+    }];
+  }).sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+  return JSON.stringify({
+    conflicts,
+    unresolvedKeys: [...(state.unresolvedSyncRecordKeys ?? [])].sort(),
+  });
+}
+
 /**
  * Preserve mutations made while an async sync was in flight. Remote/pulled data
  * forms the base; records and outbox operations whose clock changed after the
@@ -1283,6 +1303,12 @@ export function mergeConcurrentSync(
 ): PersistedFinanceState {
   if (started.ownerId !== latest.ownerId || latest.ownerId !== synced.ownerId) {
     throw new Error('Cannot merge concurrent sync snapshots for different owners');
+  }
+  if (syncConflictContent(started) !== syncConflictContent(latest)) {
+    // Another context persisted or explicitly resolved a conflict while this
+    // response was in flight. Keep its complete graph/outbox together; a later
+    // idempotent sync can acknowledge remote writes without reviving an old lock.
+    return latest;
   }
   const operationKey = (operation: PersistedFinanceState['outbox'][number]) => `${operation.entity}:${operation.recordId}`;
   const startedByRecord = new Map(started.outbox.map((operation) => [operationKey(operation), operation]));
@@ -1356,11 +1382,12 @@ export function applySyncCompletion(
 }
 
 function bootstrapDurableContent(state: PersistedFinanceState): string {
-  const operationContent = ({
-    attempts: _attempts,
-    lastError: _lastError,
-    ...operation
-  }: PendingOperation) => operation;
+  const operationContent = (pending: PendingOperation) => {
+    const { attempts: _attempts, lastError: _lastError, conflict: _conflict, ...operation } = pending;
+    // Display/retry metadata may change independently of an authoritative pull.
+    // A newly persisted conflict still changes behavior and must retain its lock.
+    return { ...operation, conflict: readPendingSyncConflict(pending) };
+  };
   return JSON.stringify({
     data: state.data,
     outbox: state.outbox.map(operationContent),

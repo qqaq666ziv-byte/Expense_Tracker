@@ -4,12 +4,20 @@ import type {
   FinanceEntityName,
   OwnerId,
   PendingOperation,
+  PendingSyncConflict,
   PersistedFinanceState,
 } from './model';
 import { validateFinanceData } from './backup';
 import { hasSameBudgetSemantics } from './budgetEngine';
 import { assertLifecycleTransition } from './lifecycle';
 import { assertFinanceRecordWithinWriteLimits } from './resourceLimits';
+import {
+  readPendingSyncConflict,
+  TRANSFER_DEPENDENCY_CONFLICT_PREFIX,
+  UNRESOLVED_PAYLOAD_CONFLICT_PREFIX,
+} from './syncConflict';
+
+export { TRANSFER_DEPENDENCY_CONFLICT_PREFIX, UNRESOLVED_PAYLOAD_CONFLICT_PREFIX } from './syncConflict';
 
 export type SyncEntityRecord = FinanceData[FinanceEntityName][number];
 
@@ -25,29 +33,17 @@ export function activeOperationId(operationId: string = crypto.randomUUID()): st
 }
 
 const BUDGET_CONFLICT_ROLLBACK_MARKER = 'budget-conflict-rollback:';
-export const UNRESOLVED_PAYLOAD_CONFLICT_PREFIX = 'unresolved same-clock payload conflict';
-export const TRANSFER_DEPENDENCY_CONFLICT_PREFIX = 'transfer selected account changed before cloud write';
 
 export function hasTransferDependencyConflict(
   operation: PendingOperation,
 ): boolean {
   return operation.entity === 'transfers'
-    && operation.lastError?.startsWith(TRANSFER_DEPENDENCY_CONFLICT_PREFIX) === true;
+    && readPendingSyncConflict(operation)?.kind === 'transfer-dependency';
 }
 
 function transferDependencyAccountIds(operation: PendingOperation): ReadonlySet<string> {
-  if (!hasTransferDependencyConflict(operation) || !operation.lastError) return new Set();
-  const marker = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: accounts=`;
-  if (!operation.lastError.startsWith(marker)) return new Set();
-  const serialized = operation.lastError.slice(marker.length).split(';', 1)[0];
-  try {
-    return new Set(serialized
-      .split(',')
-      .filter(Boolean)
-      .map((accountId) => decodeURIComponent(accountId)));
-  } catch {
-    return new Set();
-  }
+  const conflict = readPendingSyncConflict(operation);
+  return new Set(conflict?.kind === 'transfer-dependency' ? conflict.accountIds : []);
 }
 
 function budgetConflictRollbackOperationId(): string {
@@ -83,9 +79,10 @@ async function batchCompensationOperation(
   remoteRecord: SyncEntityRecord,
   timestamp: string,
 ): Promise<PendingOperation | undefined> {
+  const before = operation.batchBeforeRecord;
+  if (before === undefined) return undefined;
   const operationId = await batchCompensationOperationId(operation);
   if (!operationId) return undefined;
-  const before = operation.batchBeforeRecord;
   const record = before === null
     ? {
         ...operation.record,
@@ -107,6 +104,7 @@ async function batchCompensationOperation(
     record,
     attempts: 0,
     queuedAt: timestamp,
+    conflict: null,
     lastError: '批次遇到同步衝突；已將先完成的成員安全補償回操作前狀態，等待整批採用雲端版本。',
   };
 }
@@ -131,6 +129,7 @@ function batchRetryOperation(
     attempts: 0,
     queuedAt: timestamp,
     batchBeforeRecord: structuredClone(compensation.record),
+    conflict: null,
     lastError: '批次尚未完整套用；遠端已回復前態，本機完整意圖會在下次同步整批重試。',
   };
 }
@@ -140,11 +139,13 @@ async function recoveredBatchRetryOperation(
   remoteRecord: RemoteRecord,
   timestamp: string,
 ): Promise<PendingOperation | undefined> {
+  const before = operation.batchBeforeRecord;
+  if (before === undefined) return undefined;
   const expectedCompensationId = await batchCompensationOperationId(operation);
   if (!expectedCompensationId
     || remoteRecord.record.lastOperationId !== expectedCompensationId
     || remoteRecord.record.version <= operation.record.version) return undefined;
-  const expectedPayload = operation.batchBeforeRecord === null
+  const expectedPayload = before === null
     ? {
         ...operation.record,
         version: remoteRecord.record.version,
@@ -154,7 +155,7 @@ async function recoveredBatchRetryOperation(
         ...('isActive' in operation.record ? { isActive: false } : {}),
       }
     : {
-        ...operation.batchBeforeRecord,
+        ...before,
         version: remoteRecord.record.version,
         updatedAt: remoteRecord.record.updatedAt,
         lastOperationId: remoteRecord.record.lastOperationId,
@@ -361,6 +362,7 @@ export function confirmTransferDependencyConflict(
           record: confirmedReplacement,
           attempts: 0,
           queuedAt: confirmedReplacement.updatedAt,
+          conflict: null,
           lastError: undefined,
         }
       : operation
@@ -392,7 +394,7 @@ export function hasUnresolvedPayloadConflict(
   const directlyLocked = new Set([
     ...persistedKeys,
     ...operations
-      .filter((operation) => operation.lastError?.startsWith(UNRESOLVED_PAYLOAD_CONFLICT_PREFIX))
+      .filter((operation) => readPendingSyncConflict(operation) !== null)
       .map((operation) => syncRecordKey(operation.entity, operation.recordId)),
   ]);
   if (directlyLocked.has(key)) return true;
@@ -416,7 +418,7 @@ export function unresolvedPayloadConflictKeys(
   const keys = new Set([
     ...persistedKeys,
     ...operations
-      .filter((operation) => operation.lastError?.startsWith(UNRESOLVED_PAYLOAD_CONFLICT_PREFIX))
+      .filter((operation) => readPendingSyncConflict(operation) !== null)
       .map((operation) => syncRecordKey(operation.entity, operation.recordId)),
     ...conflicts
       .filter((conflict) => conflict.winner === 'unresolved')
@@ -586,6 +588,7 @@ export function acceptRemoteConflictRecord(
     const pending = outbox.find((candidate) => (
       candidate.entity === operation.entity && candidate.recordId === operation.recordId
     )) ?? operation;
+    const retainedConflict = readPendingSyncConflict(pending);
     outbox = [
       ...outbox.filter((candidate) => (
         candidate.entity !== operation.entity || candidate.recordId !== operation.recordId
@@ -598,6 +601,9 @@ export function acceptRemoteConflictRecord(
         queuedAt: preservedBefore || acceptedRelatedRecord ? record.updatedAt : pending.queuedAt,
         batchId: undefined,
         batchBeforeRecord: undefined,
+        conflict: preservedBefore || acceptedRelatedRecord
+          ? null
+          : retainedConflict?.kind === 'batch' ? { kind: 'unresolved' } : retainedConflict,
         lastError: preservedBefore
           ? '已採用批次的雲端版本；批次前已排隊的獨立修改仍保留等待同步。'
           : pending.lastError,
@@ -640,6 +646,21 @@ const ENTITY_NAMES: readonly FinanceEntityName[] = [
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function pendingConflictValidationFailure(operation: PendingOperation): SyncFailure | undefined {
+  try {
+    readPendingSyncConflict(operation);
+    return undefined;
+  } catch (error) {
+    return {
+      stage: 'validation',
+      message: errorMessage(error),
+      operationId: operation.id,
+      entity: operation.entity,
+      recordId: operation.recordId,
+    };
+  }
 }
 
 function replaceRecord(data: FinanceData, { entity, record }: RemoteRecord): FinanceData {
@@ -900,6 +921,8 @@ function validateOwnership(
   }
 
   for (const operation of state.outbox) {
+    const conflictFailure = pendingConflictValidationFailure(operation);
+    if (conflictFailure) failures.push(conflictFailure);
     if (operation.record.ownerId !== state.ownerId) {
       failures.push({
         stage: 'validation',
@@ -1017,6 +1040,8 @@ function validateOwnership(
     }
     const operationKeys = new Set<string>();
     for (const operation of initialBootstrap.pendingOperations) {
+      const conflictFailure = pendingConflictValidationFailure(operation);
+      if (conflictFailure) failures.push(conflictFailure);
       const key = recordKey(operation.entity, operation.recordId);
       if (operation.record.ownerId !== state.ownerId
         || operation.recordId !== operation.record.id
@@ -1333,6 +1358,7 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
     record: syncRecord,
     attempts: 0,
     queuedAt,
+    conflict: null,
     ...(effectiveBatchId ? {
       batchId: effectiveBatchId,
       batchBeforeRecord: existingOperation?.batchBeforeRecord
@@ -1353,62 +1379,58 @@ export function enqueueSyncRecord<E extends FinanceEntityName>(
   };
 }
 
-export async function syncFinanceState(
+interface SyncWritePlan {
+  readonly unresolvedKeys: ReadonlySet<string>;
+  readonly unresolvedBatchIds: ReadonlySet<string>;
+  readonly blockedKeys: ReadonlySet<string>;
+  readonly blockedReasons: ReadonlyMap<string, string>;
+  readonly conflicts: ReadonlyMap<string, PendingSyncConflict>;
+  readonly deactivatedBudgetKeys: ReadonlySet<string>;
+  readonly budgetOverrides: ReadonlyMap<string, PendingOperation>;
+  readonly applyOverrides: ReadonlyMap<string, PendingOperation>;
+  readonly optimisticBudgets: ReadonlyMap<string, Budget>;
+  readonly optimisticRecords: ReadonlyMap<string, RemoteRecord>;
+}
+
+type SyncWritePlanningResult =
+  | { status: 'ready'; plan: SyncWritePlan }
+  | { status: 'failed'; result: SyncResult };
+
+/** Build decisions before any apply and expose read-only plan collections to later phases. */
+async function planSyncWrites(
   state: PersistedFinanceState,
   authenticatedOwnerId: string,
   remote: RemoteAdapter,
-  now: () => string = () => new Date().toISOString(),
-): Promise<SyncResult> {
-  const validationFailures = validateOwnership(state, authenticatedOwnerId);
-  if (validationFailures.length > 0) {
-    return {
-      state,
-      report: {
-        ownerId: state.ownerId,
-        status: 'rejected',
-        applied: 0,
-        pulled: 0,
-        pending: pendingReport(state.outbox),
-        failures: validationFailures,
-        conflicts: [],
-      },
-    };
-  }
-  if (state.legacyBootstrap?.status === 'pending') {
-    return syncAuthenticatedLegacyBootstrap(state, authenticatedOwnerId, remote, now);
-  }
-  if (state.initialBootstrap?.status === 'pending') {
-    return syncInitialAuthenticatedBootstrap(state, authenticatedOwnerId, remote, now);
-  }
-
-  let failures: SyncFailure[] = [];
-  const conflicts: SyncConflict[] = [];
-  const remaining: PendingOperation[] = [];
-  const appliedActiveBudgetOperations: PendingOperation[] = [];
-  const unresolvedKeys = new Set(state.unresolvedSyncRecordKeys ?? []);
+  now: () => string,
+): Promise<SyncWritePlanningResult> {
+  const unresolvedKeys = new Set([
+    ...(state.unresolvedSyncRecordKeys ?? []),
+    ...state.outbox.filter((operation) => readPendingSyncConflict(operation) !== null)
+      .map((operation) => recordKey(operation.entity, operation.recordId)),
+  ]);
   const unresolvedBatchIds = new Set(state.outbox.flatMap((operation) => (
     operation.batchId && unresolvedKeys.has(recordKey(operation.entity, operation.recordId))
       ? [operation.batchId]
       : []
   )));
-  let applied = 0;
 
   // Pull before active writes to resolve known tombstones and legacy semantic
   // budget conflicts. The low active-operation prefix separately closes the
   // race where a legacy UUID tombstone arrives after this preflight.
-  let preflightBlockedKeys = new Set<string>();
-  const preflightBlockedReasons = new Map<string, string>();
-  const preflightDeactivatedBudgetKeys = new Set<string>();
-  const preflightBudgetOverrides = new Map<string, PendingOperation>();
-  const preflightApplyOverrides = new Map<string, PendingOperation>();
-  const preflightOptimisticBudgets = new Map<string, Budget>();
-  const preflightOptimisticRecords = new Map<string, RemoteRecord>();
+  let blockedKeys = new Set<string>();
+  const blockedReasons = new Map<string, string>();
+  const conflicts = new Map<string, PendingSyncConflict>();
+  const deactivatedBudgetKeys = new Set<string>();
+  const budgetOverrides = new Map<string, PendingOperation>();
+  const applyOverrides = new Map<string, PendingOperation>();
+  const optimisticBudgets = new Map<string, Budget>();
+  const optimisticRecords = new Map<string, RemoteRecord>();
   if (state.outbox.length > 0) {
     try {
       const preflight = normalizePullResponse(await remote.pull(authenticatedOwnerId));
       const blockEveryActiveWrite = preflight.issues.some((issue) => !issue.recordId)
         || preflight.records.some((entry) => entry.record.ownerId !== authenticatedOwnerId);
-      preflightBlockedKeys = new Set([
+      blockedKeys = new Set([
         ...preflight.records
           .filter((entry) => entry.record.ownerId === authenticatedOwnerId && Boolean(entry.record.deletedAt))
           .map((entry) => recordKey(entry.entity, entry.record.id)),
@@ -1421,14 +1443,14 @@ export async function syncFinanceState(
       ]);
       for (const issue of preflight.issues) {
         if (!issue.recordId) continue;
-        preflightBlockedReasons.set(
+        blockedReasons.set(
           recordKey(issue.entity, issue.recordId),
           issue.message,
         );
       }
       if (blockEveryActiveWrite) {
         for (const operation of state.outbox) {
-          preflightBlockedReasons.set(
+          blockedReasons.set(
             recordKey(operation.entity, operation.recordId),
             '雲端回應未通過擁有者或資料完整性驗證；待同步資料未上傳。',
           );
@@ -1453,7 +1475,7 @@ export async function syncFinanceState(
           // Direct transfer conflicts retain the normal accept-cloud path.
           if (transferComparison < 0 || divergentSameClock) continue;
         }
-        const selectedEndpoints = [
+        const endpointSnapshots: [string, string | undefined, string][] = [
           [
             transfer.sourceAccountId,
             remoteTransfer?.sourceAccountId,
@@ -1464,7 +1486,8 @@ export async function syncFinanceState(
             remoteTransfer?.destinationAccountId,
             transfer.destinationAccountName,
           ],
-        ].filter(([accountId, historicalAccountId]) => historicalAccountId !== accountId);
+        ];
+        const selectedEndpoints = endpointSnapshots.filter(([accountId, historicalAccountId]) => historicalAccountId !== accountId);
         const mismatchedEndpoints = selectedEndpoints.flatMap(([accountId, , accountName]) => {
             const accountKey = recordKey('accounts', accountId);
             const localAccount = state.data.accounts.find((account) => account.id === accountId);
@@ -1488,7 +1511,7 @@ export async function syncFinanceState(
               && parentOperation
               && parentOperationIndex < transferIndex
               && !unresolvedKeys.has(accountKey)
-              && !preflightBlockedKeys.has(accountKey)
+              && !blockedKeys.has(accountKey)
               && differingSyncRecordFields('accounts', parentOperation.record, localAccount).length === 0
               && (!remoteAccount || compareSyncRecords(parentOperation.record, remoteAccount.record) > 0),
             );
@@ -1503,7 +1526,7 @@ export async function syncFinanceState(
               && !historicalAccount.deletedAt
               && historicalAccount.name === accountName
               && !unresolvedKeys.has(accountKey)
-              && !preflightBlockedKeys.has(accountKey)
+              && !blockedKeys.has(accountKey)
               && differingSyncRecordFields(
                 'accounts',
                 historicalAccount,
@@ -1518,13 +1541,15 @@ export async function syncFinanceState(
         // Once any selected dependency changes, remember every endpoint newly
         // selected by this mutation. A sibling endpoint may change remotely
         // while the user is deciding, and first creates must refresh both.
-        const dependencyIds = [...new Set(selectedEndpoints.map(([accountId]) => accountId))]
+        const accountIds = [...new Set(selectedEndpoints.map(([accountId]) => accountId))];
+        const dependencyIds = accountIds
           .map(encodeURIComponent)
           .join(',');
         const reason = `${TRANSFER_DEPENDENCY_CONFLICT_PREFIX}: accounts=${dependencyIds}; `
           + '請重新開啟轉帳並明確確認來源與目的帳戶。';
-        preflightBlockedKeys.add(transferKey);
-        preflightBlockedReasons.set(transferKey, reason);
+        blockedKeys.add(transferKey);
+        blockedReasons.set(transferKey, reason);
+        conflicts.set(transferKey, { kind: 'transfer-dependency', accountIds });
       }
       for (const operation of state.outbox.filter((candidate) => candidate.batchId)) {
         const key = recordKey(operation.entity, operation.recordId);
@@ -1532,10 +1557,11 @@ export async function syncFinanceState(
         if (!remoteRecord) continue;
         const recoveredRetry = await recoveredBatchRetryOperation(operation, remoteRecord, now());
         if (recoveredRetry) {
-          preflightBlockedKeys.delete(key);
-          preflightBlockedReasons.delete(key);
-          preflightApplyOverrides.set(key, recoveredRetry);
-          preflightOptimisticRecords.set(key, {
+          blockedKeys.delete(key);
+          blockedReasons.delete(key);
+          conflicts.delete(key);
+          applyOverrides.set(key, recoveredRetry);
+          optimisticRecords.set(key, {
             entity: recoveredRetry.entity,
             record: recoveredRetry.record,
           } as RemoteRecord);
@@ -1548,8 +1574,8 @@ export async function syncFinanceState(
           remoteRecord.record,
         ).length > 0;
         if (comparison < 0 || divergentSameClock) {
-          preflightBlockedKeys.add(key);
-          preflightBlockedReasons.set(
+          blockedKeys.add(key);
+          blockedReasons.set(
             key,
             `同一批次的 ${operation.entity}/${operation.recordId} 與雲端版本衝突；整批未上傳。`,
           );
@@ -1610,8 +1636,8 @@ export async function syncFinanceState(
               attempts: 0,
               queuedAt: timestamp,
             };
-            preflightApplyOverrides.set(key, exact);
-            preflightOptimisticBudgets.set(key, sameRemoteRecord);
+            applyOverrides.set(key, exact);
+            optimisticBudgets.set(key, sameRemoteRecord);
             continue;
           }
           const rollbackId = budgetConflictRollbackOperationId();
@@ -1622,7 +1648,7 @@ export async function syncFinanceState(
             lastOperationId: rollbackId,
             isActive: false,
           };
-          preflightApplyOverrides.set(key, {
+          applyOverrides.set(key, {
             id: rollbackId,
             entity: 'budgets',
             recordId: archived.id,
@@ -1630,15 +1656,15 @@ export async function syncFinanceState(
             attempts: 0,
             queuedAt: timestamp,
           });
-          preflightOptimisticBudgets.set(key, archived);
+          optimisticBudgets.set(key, archived);
           continue;
         }
         const conflict = remoteActiveBudgets.find((budget) => (
           budget.id !== candidate.id && hasSameBudgetSemantics(budget, candidate)
         ));
         if (!conflict) continue;
-        preflightBlockedKeys.add(key);
-        preflightBlockedReasons.set(
+        blockedKeys.add(key);
+        blockedReasons.set(
           key,
           `雲端有效預算 ${conflict.id} 已使用相同範圍、週期與分類；本機預算未啟用。`,
         );
@@ -1647,7 +1673,7 @@ export async function syncFinanceState(
           // This local create has never reached the server. Reject only the
           // attempted activation and preserve its fields as an archived,
           // retryable record; never alter an existing remote duplicate here.
-          preflightDeactivatedBudgetKeys.add(key);
+          deactivatedBudgetKeys.add(key);
         } else if (
           sameRemoteRecord.version === candidate.version
           && sameRemoteRecord.lastOperationId === operation.id
@@ -1664,22 +1690,23 @@ export async function syncFinanceState(
             lastOperationId: rollbackId,
             isActive: false,
           };
-          preflightDeactivatedBudgetKeys.add(key);
-          preflightBudgetOverrides.set(key, {
+          deactivatedBudgetKeys.add(key);
+          budgetOverrides.set(key, {
             id: rollbackId,
             entity: 'budgets',
             recordId: archived.id,
             record: archived,
             attempts: 0,
             queuedAt: timestamp,
-            lastError: preflightBlockedReasons.get(key),
+            conflict: null,
+            lastError: blockedReasons.get(key),
           });
         }
       }
       const preflightBlockedBatchIds = new Set(state.outbox.flatMap((operation) => {
         const key = recordKey(operation.entity, operation.recordId);
-        const blocksThisOperation = preflightBlockedKeys.has(key)
-          && (!operation.record.deletedAt || preflightBlockedReasons.has(key));
+        const blocksThisOperation = blockedKeys.has(key)
+          && (!operation.record.deletedAt || blockedReasons.has(key));
         return operation.batchId && blocksThisOperation
           ? [operation.batchId]
           : [];
@@ -1687,35 +1714,93 @@ export async function syncFinanceState(
       for (const operation of state.outbox) {
         if (!operation.batchId || !preflightBlockedBatchIds.has(operation.batchId)) continue;
         const key = recordKey(operation.entity, operation.recordId);
-        preflightBlockedKeys.add(key);
-        if (!preflightBlockedReasons.has(key)) {
-          preflightBlockedReasons.set(key, '同一批次的另一筆資料有同步衝突；為避免部分套用，整批未上傳。');
+        blockedKeys.add(key);
+        if (!blockedReasons.has(key)) {
+          blockedReasons.set(key, '同一批次的另一筆資料有同步衝突；為避免部分套用，整批未上傳。');
         }
       }
     } catch (error) {
       return {
-        state: {
-          ...state,
-          lastSyncError: `preflight pull failed; no pending writes were sent: ${errorMessage(error)}`,
-        },
-        report: {
-          ownerId: state.ownerId,
-          status: 'partial',
-          applied: 0,
-          pulled: 0,
-          pending: pendingReport(state.outbox),
-          failures: [{ stage: 'pull', message: `preflight pull failed; no pending writes were sent: ${errorMessage(error)}` }],
-          conflicts: [],
+        status: 'failed',
+        result: {
+          state: {
+            ...state,
+            lastSyncError: `preflight pull failed; no pending writes were sent: ${errorMessage(error)}`,
+          },
+          report: {
+            ownerId: state.ownerId,
+            status: 'partial',
+            applied: 0,
+            pulled: 0,
+            pending: pendingReport(state.outbox),
+            failures: [{ stage: 'pull', message: `preflight pull failed; no pending writes were sent: ${errorMessage(error)}` }],
+            conflicts: [],
+          },
         },
       };
     }
   }
 
+  return {
+    status: 'ready',
+    plan: {
+      unresolvedKeys,
+      unresolvedBatchIds,
+      blockedKeys,
+      blockedReasons,
+      conflicts,
+      deactivatedBudgetKeys,
+      budgetOverrides,
+      applyOverrides,
+      optimisticBudgets,
+      optimisticRecords,
+    },
+  };
+}
+
+export async function syncFinanceState(
+  state: PersistedFinanceState,
+  authenticatedOwnerId: string,
+  remote: RemoteAdapter,
+  now: () => string = () => new Date().toISOString(),
+): Promise<SyncResult> {
+  const validationFailures = validateOwnership(state, authenticatedOwnerId);
+  if (validationFailures.length > 0) {
+    return {
+      state,
+      report: {
+        ownerId: state.ownerId,
+        status: 'rejected',
+        applied: 0,
+        pulled: 0,
+        pending: pendingReport(state.outbox),
+        failures: validationFailures,
+        conflicts: [],
+      },
+    };
+  }
+  if (state.legacyBootstrap?.status === 'pending') {
+    return syncAuthenticatedLegacyBootstrap(state, authenticatedOwnerId, remote, now);
+  }
+  if (state.initialBootstrap?.status === 'pending') {
+    return syncInitialAuthenticatedBootstrap(state, authenticatedOwnerId, remote, now);
+  }
+
+  let failures: SyncFailure[] = [];
+  const conflicts: SyncConflict[] = [];
+  const remaining: PendingOperation[] = [];
+  const appliedActiveBudgetOperations: PendingOperation[] = [];
+  const planning = await planSyncWrites(state, authenticatedOwnerId, remote, now);
+  if (planning.status === 'failed') return planning.result;
+  const plan = planning.plan;
+  let applied = 0;
+
   const completedHistoricalImportKeys = new Set<string>();
   const visitedHistoricalImportBatchIds = new Set<string>();
+  const applyHistoricalImportBatch = remote.applyHistoricalImportBatch?.bind(remote);
   for (const queuedOperation of state.outbox) {
     const key = recordKey(queuedOperation.entity, queuedOperation.recordId);
-    const operation = preflightApplyOverrides.get(key) ?? queuedOperation;
+    const operation = plan.applyOverrides.get(key) ?? queuedOperation;
     if (queuedOperation.historicalImportBatchId) {
       const batchId = queuedOperation.historicalImportBatchId;
       if (visitedHistoricalImportBatchIds.has(batchId)) continue;
@@ -1731,12 +1816,12 @@ export async function syncFinanceState(
       const endpointAccounts = state.data.accounts.filter((account) => endpointIds.has(account.id));
       const blockedEndpointKey = [...endpointIds]
         .map((accountId) => recordKey('accounts', accountId))
-        .find((accountKey) => unresolvedKeys.has(accountKey) || preflightBlockedReasons.has(accountKey));
+        .find((accountKey) => plan.unresolvedKeys.has(accountKey) || plan.blockedReasons.has(accountKey));
       const blockedOperation = batchOperations.find((candidate) => {
         const candidateKey = recordKey(candidate.entity, candidate.recordId);
-        return unresolvedKeys.has(candidateKey)
-          || (preflightBlockedKeys.has(candidateKey)
-            && (!candidate.record.deletedAt || preflightBlockedReasons.has(candidateKey)));
+        return plan.unresolvedKeys.has(candidateKey)
+          || (plan.blockedKeys.has(candidateKey)
+            && (!candidate.record.deletedAt || plan.blockedReasons.has(candidateKey)));
       });
       const failureReason = endpointAccounts.length !== endpointIds.size
         ? '歷史轉帳匯入批次缺少完整的端點帳戶快照。'
@@ -1744,15 +1829,14 @@ export async function syncFinanceState(
           ? `歷史轉帳匯入端點 ${blockedEndpointKey} 尚未完成衝突確認。`
           : blockedOperation
             ? '歷史轉帳匯入批次包含未解衝突；本次未上傳任何批次成員。'
-            : !remote.applyHistoricalImportBatch
-              ? '遠端不支援原子歷史轉帳匯入；本次未上傳任何批次成員。'
-              : undefined;
-      if (failureReason) {
+            : undefined;
+      if (failureReason || !applyHistoricalImportBatch) {
+        const message = failureReason ?? '遠端不支援原子歷史轉帳匯入；本次未上傳任何批次成員。';
         for (const candidate of batchOperations) {
-          remaining.push({ ...candidate, lastError: failureReason });
+          remaining.push({ ...candidate, conflict: readPendingSyncConflict(candidate), lastError: message });
           failures.push({
-            stage: unresolvedKeys.has(recordKey(candidate.entity, candidate.recordId)) ? 'conflict' : 'apply',
-            message: failureReason,
+            stage: plan.unresolvedKeys.has(recordKey(candidate.entity, candidate.recordId)) ? 'conflict' : 'apply',
+            message,
             operationId: candidate.id,
             entity: candidate.entity,
             recordId: candidate.recordId,
@@ -1761,7 +1845,7 @@ export async function syncFinanceState(
         continue;
       }
       try {
-        await remote.applyHistoricalImportBatch(authenticatedOwnerId, {
+        await applyHistoricalImportBatch(authenticatedOwnerId, {
           id: batchId,
           operations: batchOperations,
           endpointAccounts,
@@ -1776,6 +1860,7 @@ export async function syncFinanceState(
           remaining.push({
             ...candidate,
             attempts: candidate.attempts + 1,
+            conflict: readPendingSyncConflict(candidate),
             lastError: message,
           });
           failures.push({
@@ -1790,13 +1875,14 @@ export async function syncFinanceState(
       continue;
     }
     if (
-      unresolvedKeys.has(key)
-      || (queuedOperation.batchId !== undefined && unresolvedBatchIds.has(queuedOperation.batchId))
+      plan.unresolvedKeys.has(key)
+      || (queuedOperation.batchId !== undefined && plan.unresolvedBatchIds.has(queuedOperation.batchId))
     ) {
-      const message = hasTransferDependencyConflict(queuedOperation)
-        ? queuedOperation.lastError!
+      const conflict = readPendingSyncConflict(queuedOperation) ?? { kind: 'unresolved' as const };
+      const message = conflict.kind === 'transfer-dependency'
+        ? queuedOperation.lastError ?? '請重新開啟轉帳並明確確認來源與目的帳戶。'
         : `unresolved sync conflict for ${operation.entity}/${operation.recordId}; pending write was not sent`;
-      remaining.push({ ...operation, lastError: message });
+      remaining.push({ ...operation, conflict, lastError: message });
       failures.push({
         stage: 'conflict',
         message,
@@ -1807,21 +1893,22 @@ export async function syncFinanceState(
       continue;
     }
     if (
-      preflightBlockedKeys.has(key)
-      && (!operation.record.deletedAt || preflightBlockedReasons.has(key))
+      plan.blockedKeys.has(key)
+      && (!operation.record.deletedAt || plan.blockedReasons.has(key))
     ) {
-      const reason = preflightBlockedReasons.get(key);
+      const reason = plan.blockedReasons.get(key);
       if (reason === undefined) {
         remaining.push(operation);
       } else {
-        const override = preflightBudgetOverrides.get(key);
-        const safeRecord = preflightDeactivatedBudgetKeys.has(key)
+        const override = plan.budgetOverrides.get(key);
+        const safeRecord = plan.deactivatedBudgetKeys.has(key)
           ? { ...operation.record, isActive: false }
           : operation.record;
         remaining.push(override ?? {
           ...operation,
           record: safeRecord,
           attempts: operation.attempts + 1,
+          conflict: plan.conflicts.get(key) ?? readPendingSyncConflict(operation),
           lastError: reason,
         });
       }
@@ -1851,6 +1938,7 @@ export async function syncFinanceState(
       remaining.push({
         ...operation,
         attempts: operation.attempts + 1,
+        conflict: readPendingSyncConflict(operation),
         lastError: message,
       });
       failures.push({
@@ -1864,11 +1952,11 @@ export async function syncFinanceState(
   }
 
   let data = state.data;
-  for (const [key, budget] of preflightOptimisticBudgets) {
+  for (const [key, budget] of plan.optimisticBudgets) {
     if (!state.outbox.some((operation) => recordKey(operation.entity, operation.recordId) === key)) continue;
     data = replaceRecord(data, { entity: 'budgets', record: budget });
   }
-  for (const [key, record] of preflightOptimisticRecords) {
+  for (const [key, record] of plan.optimisticRecords) {
     if (!state.outbox.some((operation) => recordKey(operation.entity, operation.recordId) === key)) continue;
     data = replaceRecord(data, record);
   }
@@ -1888,9 +1976,10 @@ export async function syncFinanceState(
       if (!operation.batchId || !incompleteBatchIds.has(operation.batchId)) continue;
       const key = recordKey(operation.entity, operation.recordId);
       if (!retainedByKey.has(key)) {
-        const retryableOperation = preflightApplyOverrides.get(key) ?? operation;
+        const retryableOperation = plan.applyOverrides.get(key) ?? operation;
         retainedByKey.set(key, {
           ...retryableOperation,
+          conflict: readPendingSyncConflict(retryableOperation),
           lastError: '同一批次的另一筆資料尚未完成；本筆將安全重試。',
         });
         applied = Math.max(0, applied - 1);
@@ -1903,7 +1992,7 @@ export async function syncFinanceState(
   }
   for (const operation of remaining) {
     const key = recordKey(operation.entity, operation.recordId);
-    if (!preflightDeactivatedBudgetKeys.has(key) || operation.entity !== 'budgets') continue;
+    if (!plan.deactivatedBudgetKeys.has(key) || operation.entity !== 'budgets') continue;
     data = replaceRecord(data, { entity: 'budgets', record: operation.record as Budget });
   }
   let finalRemaining = remaining;
@@ -1963,6 +2052,9 @@ export async function syncFinanceState(
         retainedByKey.set(key, {
           ...(retained ?? operation),
           attempts: retained?.attempts ?? operation.attempts + 1,
+          conflict: conflict?.reason === 'payload'
+            ? { kind: 'payload' }
+            : batchConflict ? { kind: 'batch' } : { kind: 'unresolved' },
           lastError,
         });
         if (!retained) requeuedSuccessful += 1;
@@ -2008,7 +2100,7 @@ export async function syncFinanceState(
       for (const operation of state.outbox) {
         if (!operation.batchId || !batchesRequiringCompensation.has(operation.batchId)) continue;
         const key = recordKey(operation.entity, operation.recordId);
-        const effectiveOperation = preflightApplyOverrides.get(key) ?? operation;
+        const effectiveOperation = plan.applyOverrides.get(key) ?? operation;
         if (effectiveOperation.record.lastOperationId.includes(':batch-compensation:')) continue;
         const currentRemote = remoteByKey.get(key);
         if (!currentRemote) continue;
@@ -2095,6 +2187,7 @@ export async function syncFinanceState(
       if (!completedAtomicWrite || retainedByKey.has(recordKey(operation.entity, operation.recordId))) continue;
       retainedByKey.set(recordKey(operation.entity, operation.recordId), {
         ...operation,
+        conflict: readPendingSyncConflict(operation),
         lastError: '批次寫入後尚未完成雲端確認；本筆將安全重試。',
       });
       applied = Math.max(0, applied - 1);
@@ -2112,6 +2205,7 @@ export async function syncFinanceState(
     for (const operation of appliedActiveBudgetOperations) {
       retained.set(recordKey(operation.entity, operation.recordId), {
         ...operation,
+        conflict: readPendingSyncConflict(operation),
         lastError: '有效預算已寫入，但尚未完成雲端語義衝突確認。',
       });
     }
@@ -2170,7 +2264,7 @@ export async function syncFinanceState(
           ...finalRemaining.filter((pending) => (
             pending.entity !== 'budgets' || pending.recordId !== archived.id
           )),
-          { ...rollback, attempts: 1, lastError: message },
+          { ...rollback, attempts: 1, conflict: null, lastError: message },
         ];
         failures.push({
           stage: 'apply',
@@ -2222,7 +2316,7 @@ export async function syncFinanceState(
   for (const operation of state.outbox) {
     if (!operation.batchId || !finalRemaining.some((pending) => (
       pending.batchId === operation.batchId
-      && pending.lastError?.includes('batch conflict')
+      && readPendingSyncConflict(pending)?.kind === 'batch'
     ))) continue;
     const conflict = conflicts.find((candidate) => (
       candidate.entity === operation.entity && candidate.recordId === operation.recordId
@@ -2230,7 +2324,7 @@ export async function syncFinanceState(
     ));
     if (conflict) currentUnresolvedKeys.add(recordKey(operation.entity, operation.recordId));
   }
-  const unresolvedSyncRecordKeys = new Set(state.unresolvedSyncRecordKeys ?? []);
+  const unresolvedSyncRecordKeys = new Set(plan.unresolvedKeys);
   // A later pull can change the conflict shape without proving which payload
   // the user intended to keep. Persist the lock until the explicit
   // accept-remote resolution path clears it.

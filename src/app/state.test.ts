@@ -25,8 +25,9 @@ import {
   tombstoneRecordMeta,
 } from './state';
 import { TUTORIAL_RECORD_NOTE } from '../domain/tutorialRecord';
-import type { FinanceData } from '../domain/model';
+import type { FinanceData, PendingOperation } from '../domain/model';
 import { activeOperationId, syncFinanceState, type RemoteRecord } from '../domain/syncEngine';
+import { readPendingSyncConflict, UNRESOLVED_PAYLOAD_CONFLICT_PREFIX } from '../domain/syncConflict';
 import { planCategoryReorder } from './categoryOrder';
 
 function memoryStorage() {
@@ -104,6 +105,58 @@ describe('owner-scoped local state', () => {
     expect(loaded.recovery?.message).toMatch(/unresolved sync record keys/);
     expect(loaded.recovery?.raw).toContain('unresolvedSyncRecordKeys');
     expect(loaded.state.unresolvedSyncRecordKeys).toBeUndefined();
+  });
+
+  it.each([
+    { name: 'legacy', conflict: undefined, expected: { kind: 'payload' } },
+    { name: 'typed', conflict: { kind: 'unresolved' }, expected: { kind: 'unresolved' } },
+    { name: 'explicitly clear', conflict: null, expected: null },
+  ] as const)('preserves $name conflict behavior through local storage reload', ({ conflict, expected }) => {
+    const storage = memoryStorage();
+    const initial = readyAuthenticatedState();
+    const pending = putRecord(initial, 'accounts', {
+      ...initial.data.accounts[0], name: '本機修改', version: 2, lastOperationId: 'local-account-edit',
+    });
+    pending.outbox[0] = {
+      ...pending.outbox[0], conflict, lastError: UNRESOLVED_PAYLOAD_CONFLICT_PREFIX,
+    };
+    saveFinanceState(pending, storage);
+
+    const loaded = loadFinanceStateWithRecovery('user-a', storage);
+
+    expect(loaded.recovery).toBeUndefined();
+    expect(readPendingSyncConflict(loaded.state.outbox[0])).toEqual(expected);
+    expect(loaded.state.outbox).toEqual(JSON.parse(JSON.stringify(pending.outbox)));
+  });
+
+  it.each(['outbox', 'bootstrap'] as const)('preserves raw recovery for malformed typed conflict in %s', (location) => {
+    const initial = readyAuthenticatedState();
+    const pending = putRecord(initial, 'accounts', {
+      ...initial.data.accounts[0], name: '本機修改', version: 2, lastOperationId: 'local-account-edit',
+    });
+    const malformed = {
+      ...pending.outbox[0],
+      conflict: { kind: 'future-kind' },
+      lastError: UNRESOLVED_PAYLOAD_CONFLICT_PREFIX,
+    } as unknown as PendingOperation;
+    if (location === 'outbox') {
+      pending.outbox = [malformed];
+    } else {
+      pending.outbox = [];
+      pending.initialBootstrap = {
+        status: 'pending', candidate: structuredClone(initial.data), pendingOperations: [malformed],
+      };
+    }
+    const raw = JSON.stringify(pending);
+    const storage = memoryStorage();
+    storage.setItem(storageKey('user-a'), raw);
+
+    const loaded = loadFinanceStateWithRecovery('user-a', storage);
+
+    expect(loaded.recovery?.message).toMatch(/Invalid persisted sync conflict metadata/);
+    expect(loaded.recovery?.raw).toBe(raw);
+    expect(storage.getItem(storageKey('user-a'))).toBe(raw);
+    expect(loaded.state.outbox).toEqual([]);
   });
 
   it('archives an account and pauses its active recurring rules atomically', () => {
@@ -1068,6 +1121,74 @@ describe('owner-scoped local state', () => {
     expect(result.lastSyncedAt).toBe('2026-08-21T10:00:00.000Z');
   });
 
+  it.each(['typed', 'persisted-key'] as const)('preserves the complete durable %s conflict when an older sync completion arrives', (source) => {
+    const initial = readyAuthenticatedState();
+    const account = {
+      ...initial.data.accounts[0], name: 'Local pending intent', version: 2, lastOperationId: 'pending-intent',
+    };
+    const started = putRecord(initial, 'accounts', account);
+    const latest = structuredClone(started);
+    if (source === 'typed') {
+      latest.outbox[0].conflict = { kind: 'payload' };
+      latest.outbox[0].lastError = '較新的同步已辨識衝突';
+    } else {
+      latest.unresolvedSyncRecordKeys = [`accounts:${account.id}`];
+    }
+    const synced = {
+      ...started,
+      data: {
+        ...started.data,
+        accounts: started.data.accounts.map((record) => record.id === account.id
+          ? { ...account, version: 3, lastOperationId: 'remote-ack', name: 'Older response cloud value' }
+          : record),
+      },
+      outbox: [],
+      lastSyncedAt: '2026-09-01T00:00:00.000Z',
+    };
+
+    const result = applySyncCompletion(started, latest, synced, 'user-a');
+
+    expect(result).toEqual(latest);
+    const storage = memoryStorage();
+    saveFinanceState(result, storage);
+    expect(loadFinanceStateWithRecovery('user-a', storage).recovery).toBeUndefined();
+  });
+
+  it('does not resurrect a conflict explicitly resolved while another sync was in flight', () => {
+    const initial = readyAuthenticatedState();
+    const account = {
+      ...initial.data.accounts[0], name: 'Local pending intent', version: 2, lastOperationId: 'pending-intent',
+    };
+    const started = putRecord(initial, 'accounts', account);
+    started.outbox[0].conflict = { kind: 'payload' };
+    started.unresolvedSyncRecordKeys = [`accounts:${account.id}`];
+    const latest = {
+      ...started, outbox: [], unresolvedSyncRecordKeys: undefined,
+      data: {
+        ...started.data,
+        accounts: started.data.accounts.map((record) => record.id === account.id
+          ? { ...account, version: 3, lastOperationId: 'accepted-cloud', name: 'Explicit cloud choice' }
+          : record),
+      },
+    };
+
+    expect(applySyncCompletion(started, latest, started, 'user-a')).toEqual(latest);
+  });
+
+  it('accepts a completed ordinary sync when only diagnostic and retry metadata changed', () => {
+    const initial = readyAuthenticatedState();
+    const account = {
+      ...initial.data.accounts[0], name: 'Local pending intent', version: 2, lastOperationId: 'pending-intent',
+    };
+    const started = putRecord(initial, 'accounts', account);
+    const latest = structuredClone(started);
+    latest.outbox[0].attempts = 2;
+    latest.outbox[0].lastError = UNRESOLVED_PAYLOAD_CONFLICT_PREFIX;
+    const synced = { ...started, outbox: [], lastSyncedAt: '2026-09-01T00:00:00.000Z' };
+
+    expect(applySyncCompletion(started, latest, synced, 'user-a')).toEqual(synced);
+  });
+
   it('keeps one complete authoritative bootstrap snapshot across same-owner contexts', () => {
     const started = createInitialState('user-a');
     const remoteBase = structuredClone(started.initialBootstrap!.candidate);
@@ -1167,6 +1288,56 @@ describe('owner-scoped local state', () => {
     const result = applySyncCompletion(started, failedElsewhere, successful, 'user-a');
 
     expect(result).toEqual(successful);
+  });
+
+  it('treats equivalent legacy and explicit conflict metadata as the same bootstrap content', () => {
+    const initial = createInitialState('user-a');
+    const account = initial.data.accounts[0];
+    const operation: PendingOperation = {
+      id: account.lastOperationId, entity: 'accounts', recordId: account.id, record: account,
+      attempts: 0, queuedAt: account.updatedAt,
+    };
+    const started = {
+      ...initial,
+      initialBootstrap: {
+        status: 'pending' as const, candidate: structuredClone(initial.data), pendingOperations: [operation],
+      },
+    };
+    const latest = {
+      ...started,
+      initialBootstrap: {
+        ...started.initialBootstrap,
+        pendingOperations: [{ ...operation, attempts: 1, conflict: null, lastError: 'offline' }],
+      },
+    };
+    const completed = { ...started, initialBootstrap: undefined, lastSyncedAt: '2026-09-01T00:00:00.000Z' };
+
+    expect(applySyncCompletion(started, latest, completed, 'user-a')).toEqual(completed);
+  });
+
+  it('preserves a newly persisted typed conflict when an older bootstrap completion arrives', () => {
+    const initial = createInitialState('user-a');
+    const account = initial.data.accounts[0];
+    const operation: PendingOperation = {
+      id: account.lastOperationId, entity: 'accounts', recordId: account.id, record: account,
+      attempts: 0, queuedAt: account.updatedAt, conflict: null,
+    };
+    const started = {
+      ...initial,
+      initialBootstrap: {
+        status: 'pending' as const, candidate: structuredClone(initial.data), pendingOperations: [operation],
+      },
+    };
+    const latest = {
+      ...started,
+      initialBootstrap: {
+        ...started.initialBootstrap,
+        pendingOperations: [{ ...operation, conflict: { kind: 'payload' as const }, lastError: '需要明確選擇' }],
+      },
+    };
+    const completed = { ...started, initialBootstrap: undefined, lastSyncedAt: '2026-09-01T00:00:00.000Z' };
+
+    expect(applySyncCompletion(started, latest, completed, 'user-a')).toEqual(latest);
   });
 
   it('does not let an older same-owner sync completion overwrite a newer conflict clock', () => {
