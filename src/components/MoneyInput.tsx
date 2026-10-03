@@ -21,8 +21,9 @@ interface MoneyInputProps extends Omit<
 
 /**
  * A native text input tuned for mobile money entry. The integer keypad is the
- * default; uncommon decimal and negative values are explicit opt-in actions,
- * while the existing domain parser remains the final validation seam.
+ * default; a decimal keyboard and negative values have explicit actions.
+ * Typed or pasted decimals are accepted whenever the field allows them, while
+ * the existing domain parser remains the final validation seam.
  */
 export const MoneyInput = forwardRef<HTMLInputElement, MoneyInputProps>(
   function MoneyInput(
@@ -77,7 +78,7 @@ export const MoneyInput = forwardRef<HTMLInputElement, MoneyInputProps>(
           onChange={(event) =>
             onValueChange(
               sanitizeMoneyInput(event.target.value, {
-                allowDecimal: decimalActive,
+                allowDecimal,
                 allowNegative,
               }),
             )
