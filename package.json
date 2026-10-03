@@ -13,7 +13,10 @@
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "verify:migration": "node scripts/verify-supabase-migration.mjs"
+    "verify:migration": "node scripts/verify-supabase-migration.mjs",
+    "verify:shortcuts": "node scripts/verify-shortcut-migration.mjs",
+    "test:review-packet": "node --test scripts/create-review-packet.node-tests.mjs",
+    "review:packet": "node scripts/create-review-packet.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.112.3",

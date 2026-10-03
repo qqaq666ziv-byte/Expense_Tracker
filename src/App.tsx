@@ -21,6 +21,7 @@ import {
   PieChart,
   RefreshCw,
   Settings,
+  Smartphone,
   Target,
   X,
 } from "lucide-react";
@@ -52,6 +53,8 @@ import { HomeView } from "./components/HomeView";
 import { BrandMark } from "./components/BrandMark";
 import { Onboarding } from "./components/Onboarding";
 import { ContextHint } from "./components/ContextHint";
+import { ShortcutImportDialog } from "./components/ShortcutImportDialog";
+import { syncRecordKey } from "./domain/syncEngine";
 
 const InsightsView = lazy(() =>
   import("./components/InsightsView").then((module) => ({
@@ -317,6 +320,7 @@ function OwnerScopedApp({
 }) {
   const data = app.state.data;
   const [authMessage, setAuthMessage] = useState("");
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const [tutorial, setTutorial] = useState<TutorialProgress | null>(
     () => initialTutorialProgress(app.state.ownerId),
   );
@@ -442,6 +446,17 @@ function OwnerScopedApp({
     + (initialBootstrap?.pendingOperations.length ?? 0);
   const legacyBootstrap = app.state.legacyBootstrap;
   const legacyPending = legacyBootstrap?.status === "pending";
+  // The receiver writes to the cloud. Never approve against an unsynced local
+  // view of accounts/categories or while a recovery decision is outstanding.
+  const shortcutWritesLocked = !online || !app.cloudEnabled || app.authLoading
+    || app.syncBusy || !!initialBootstrap || legacyPending || pending > 0
+    || !!app.storageError || !!app.storageRecovery || !!app.state.lastSyncError;
+  const shortcutLockedAccounts = new Set(data.accounts
+    .filter((account) => app.mutationLockedRecordKeys.has(syncRecordKey("accounts", account.id)))
+    .map((account) => account.id));
+  const shortcutLockedCategories = new Set(data.categories
+    .filter((category) => app.mutationLockedRecordKeys.has(syncRecordKey("categories", category.id)))
+    .map((category) => category.id));
   const syncLabel =
     app.state.ownerId === "guest"
       ? "只存在這台裝置"
@@ -939,6 +954,16 @@ function OwnerScopedApp({
               <button
                 type="button"
                 onClick={() => {
+                  setShowSystem(false);
+                  setShowShortcuts(true);
+                }}
+              >
+                <Smartphone />
+                iPhone 捷徑記帳<small>連接消費通知、測試格式與確認入帳</small>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
                   toggleTheme();
                 }}
               >
@@ -959,6 +984,19 @@ function OwnerScopedApp({
             </div>
           </aside>
         </div>
+      )}
+
+      {showShortcuts && (
+        <ShortcutImportDialog
+          ownerId={app.state.ownerId}
+          data={data}
+          onSync={app.syncNow}
+          onSignIn={() => { setShowShortcuts(false); setShowSystem(true); }}
+          locked={shortcutWritesLocked}
+          lockedAccountIds={shortcutLockedAccounts}
+          lockedCategoryIds={shortcutLockedCategories}
+          onClose={() => setShowShortcuts(false)}
+        />
       )}
 
       {showSettings && (

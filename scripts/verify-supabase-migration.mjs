@@ -45,6 +45,8 @@ const EXPECTED_TABLES = [
   'adjustments',
   'budgets',
   'categories',
+  'finance_shortcut_connections',
+  'finance_shortcut_inbox',
   'goals',
   'recurring_rules',
   'savings_allocations',
