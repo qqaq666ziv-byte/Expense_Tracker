@@ -308,10 +308,30 @@ try {
   for (let i = 0; i < 4; i += 1) await createConnection(B, sha(`synthetic-b-${i}`));
   await rejects(() => createConnection(B, sha('synthetic-over-limit')), /connection_limit/, 'active connection quota enforced');
 
-  await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason)
-    select $1,$2,'fixture:' || n,repeat('a',64),'{"test":true}'::jsonb,'test','test_only' from generate_series(1,10000) n`, [B, connectionB.id]);
+  await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
+    select $1,$2,'fixture:' || n,repeat('a',64),'{"test":true}'::jsonb,'pending','pending_fixture',
+      clock_timestamp() - (10001 - n) * interval '1 second' from generate_series(1,10000) n`, [B, connectionB.id]);
   await rejects(() => receive(event('inbox-quota', { hash: hashB })), /shortcut_inbox_limit/, 'inbox quota includes retained tests and history');
   equal((await as('authenticated', B, 'select public.finance_shortcut_list_inbox() as result')).length, 100, 'list result is bounded to one hundred rows');
+  await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
+    values($1,$2,'fixture:new-imported',repeat('b',64),'{"test":true}'::jsonb,'pending','imported_fixture',clock_timestamp() + interval '1 day'),
+      ($1,$2,'fixture:new-pending-tie-a',repeat('c',64),'{"test":true}'::jsonb,'pending','pending_fixture',timestamp '2099-01-01 00:00:00+00'),
+      ($1,$2,'fixture:new-imported-tie',repeat('d',64),'{"test":true}'::jsonb,'pending','imported_fixture',timestamp '2099-01-01 00:00:00+00'),
+      ($1,$2,'fixture:new-pending-tie-z',repeat('e',64),'{"test":true}'::jsonb,'pending','pending_fixture',timestamp '2099-01-01 00:00:00+00')`, [B, connectionB.id]);
+  await db.query(`update public.finance_shortcut_inbox set status='imported', transaction_id='synthetic-transaction'
+    where user_id=$1 and connection_id=$2 and event_key='fixture:new-imported'`, [B, connectionB.id]);
+  await db.query(`update public.finance_shortcut_inbox set status='imported', transaction_id='synthetic-tied-transaction'
+    where user_id=$1 and connection_id=$2 and event_key='fixture:new-imported-tie'`, [B, connectionB.id]);
+  await db.query(`update public.finance_shortcut_inbox set created_at=$3
+    where user_id=$1 and connection_id=$2 and event_key in ('fixture:new-pending-tie-a','fixture:new-imported-tie','fixture:new-pending-tie-z')`,
+  [B, connectionB.id, '2099-01-01T00:00:00Z']);
+  const newestInbox = await as('authenticated', B, 'select public.finance_shortcut_list_inbox() as result');
+  equal(newestInbox.length, 100, 'list remains bounded when newer results exist');
+  const newestTieIds = newestInbox.slice(0, 3).map((item) => item.id);
+  const repeatedInbox = await as('authenticated', B, 'select public.finance_shortcut_list_inbox() as result');
+  equal(repeatedInbox.slice(0, 3).map((item) => item.id), newestTieIds, 'same-time mixed-status rows have deterministic ordering');
+  equal(newestInbox.some((item) => item.reason === 'imported_fixture' && item.status === 'imported'), true,
+    'newer imported result remains visible with more than one hundred older pending rows');
   const directlyRead = () => as('authenticated', A,
     'select count(*) as result from public.finance_shortcut_connections');
   await rejects(directlyRead, /permission denied/, 'table access remains unavailable outside safe RPCs');
@@ -323,9 +343,12 @@ try {
   await db.exec('revoke select(id,user_id) on public.finance_shortcut_inbox from authenticated');
 
   const intakeDef = (await one("select pg_get_functiondef('finance_private.shortcut_receive(text,text,text,jsonb,numeric,text,timestamptz,text,boolean,text)'::regprocedure) as body")).body;
+  const listInboxDef = (await one("select pg_get_functiondef('finance_private.shortcut_list_inbox()'::regprocedure) as body")).body;
   const reviewDef = (await one("select pg_get_functiondef('finance_private.shortcut_review(uuid,text,text,text,numeric,text,timestamptz)'::regprocedure) as body")).body;
   const postDef = (await one("select pg_get_functiondef('finance_private.shortcut_post(uuid,text,text,numeric,text,timestamptz)'::regprocedure) as body")).body;
   assert.match(intakeDef, /pg_advisory_xact_lock[\s\S]+revoked_at is null for update/); assertions += 1;
+  assert.match(listInboxDef, /order by created_at desc, id desc limit 100/); assertions += 1;
+  assert.match(listInboxDef, /jsonb_agg[\s\S]+order by i\.created_at desc, i\.id desc/); assertions += 1;
   assert.match(reviewDef, /pg_advisory_xact_lock[\s\S]+for update/); assertions += 1;
   equal((postDef.match(/for share/g) ?? []).length, 2, 'both financial parents are locked against archive');
   equal((await one("select count(*)::integer count from pg_constraint where conrelid='public.finance_shortcut_inbox'::regclass and contype='u'")).count, 1, 'owner/connection/event unique constraint closes duplicate race');

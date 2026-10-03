@@ -160,10 +160,10 @@ as $$
 declare owner_id uuid := auth.uid(); result jsonb;
 begin
   if owner_id is null then raise exception 'authentication_required' using errcode = '42501'; end if;
-  select coalesce(jsonb_agg(to_jsonb(i) - 'user_id' - 'fingerprint' - 'event_key' order by i.created_at desc), '[]'::jsonb)
+  select coalesce(jsonb_agg(to_jsonb(i) - 'user_id' - 'fingerprint' - 'event_key' order by i.created_at desc, i.id desc), '[]'::jsonb)
   into result from (
     select * from public.finance_shortcut_inbox where user_id = owner_id
-    order by (status = 'pending') desc, created_at desc, id limit 100
+    order by created_at desc, id desc limit 100
   ) i;
   return result;
 end $$;
