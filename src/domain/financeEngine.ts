@@ -121,7 +121,6 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
   const transactions = data.transactions.filter(isFinancialTransaction);
   const transfers = data.transfers.filter(isPresent);
   const adjustments = data.adjustments.filter(isPresent);
-  const categoriesById = new Map(data.categories.filter(isPresent).map((category) => [category.id, category]));
 
   const accountBalances = sortByDisplayOrder(data.accounts.filter(isPresent))
     .map((account) => {
@@ -145,19 +144,6 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
       };
     });
 
-  const income = sumMoney(transactions
-    .filter((transaction) => transaction.type === 'income')
-    .map((transaction) => transaction.amount));
-  const expenseTransactions = getAnalyticsTransactions(data).filter((transaction) => transaction.type === 'expense');
-  const expense = sumMoney(expenseTransactions.map((transaction) => transaction.amount));
-  const expenseByCategoryMap = new Map<string, number>();
-  for (const transaction of expenseTransactions) {
-    expenseByCategoryMap.set(
-      transaction.categoryId,
-      addMoney(expenseByCategoryMap.get(transaction.categoryId) ?? 0, transaction.amount),
-    );
-  }
-
   const totalAssets = sumMoney(accountBalances
     .filter((account) => account.isActive && account.includeInTotalAssets)
     .map((account) => account.balance));
@@ -170,60 +156,29 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
     totalAssets,
     allocatedSavings,
     availableAssets: subtractMoney(totalAssets, allocatedSavings),
-    allTime: {
-      income,
-      expense,
-      net: subtractMoney(income, expense),
-      expenseByCategory: [...expenseByCategoryMap.entries()]
-        .map(([categoryId, amount]) => ({
-          categoryId,
-          name: categoriesById.get(categoryId)?.name
-            ?? expenseTransactions.find((transaction) => transaction.categoryId === categoryId)?.categoryName
-            ?? '未知分類',
-          amount,
-        }))
-        .sort((left, right) => compareMoney(right.amount, left.amount)),
-    },
+    allTime: summarizeCashFlow(getAnalyticsTransactions(data), data.categories),
   };
 }
 
 export function calculateInsights(data: FinanceData, options: InsightsOptions): InsightsSummary {
+  const transactions = getAnalyticsTransactions(data);
   const todayRange = getTodayRange(options.reference);
-  const todayTransactions = getAnalyticsTransactions(data).filter(
-    (transaction) => isFinancialTransaction(transaction) && isWithinRange(transaction.occurredAt, todayRange),
+  const today = summarizeCashFlow(
+    transactions.filter((transaction) => isWithinRange(transaction.occurredAt, todayRange)),
+    data.categories,
   );
-  const income = sumMoney(todayTransactions
-    .filter((transaction) => transaction.type === 'income')
-    .map((transaction) => transaction.amount));
-  const expenses = todayTransactions.filter((transaction) => transaction.type === 'expense');
-  const expense = sumMoney(expenses.map((transaction) => transaction.amount));
-  const categoriesById = new Map(data.categories.filter(isPresent).map((category) => [category.id, category]));
-  const byCategory = new Map<string, number>();
-  for (const transaction of expenses) {
-    byCategory.set(transaction.categoryId, addMoney(byCategory.get(transaction.categoryId) ?? 0, transaction.amount));
-  }
-  const topEntry = [...byCategory.entries()].sort((left, right) => compareMoney(right[1], left[1]))[0];
-  const topTransaction = topEntry
-    ? expenses.find((transaction) => transaction.categoryId === topEntry[0])
-    : undefined;
 
   const currentRange = getPeriodRange(options.period, options.reference, options.custom);
   const previousRange = getEquivalentPreviousPeriodRange(options.period, options.reference, options.custom);
-  const period = summarizePeriod(data, currentRange, options.reference);
-  const previousPeriod = summarizePeriod(data, previousRange, options.reference);
+  const period = summarizePeriod(transactions, data.categories, currentRange, options.reference);
+  const previousPeriod = summarizePeriod(transactions, data.categories, previousRange, options.reference);
 
   return {
     today: {
-      income,
-      expense,
-      net: subtractMoney(income, expense),
-      topExpenseCategory: topEntry
-        ? {
-            categoryId: topEntry[0],
-            name: categoriesById.get(topEntry[0])?.name ?? topTransaction?.categoryName ?? '未知分類',
-            amount: topEntry[1],
-          }
-        : null,
+      income: today.income,
+      expense: today.expense,
+      net: today.net,
+      topExpenseCategory: today.expenseByCategory[0] ?? null,
     },
     period,
     previousPeriod,
@@ -235,42 +190,53 @@ export function calculateInsights(data: FinanceData, options: InsightsOptions): 
   };
 }
 
-function summarizePeriod(data: FinanceData, range: DateRange, reference: Date): PeriodAnalytics {
-  const transactions = getAnalyticsTransactions(data).filter(
-    (transaction) => isFinancialTransaction(transaction) && isWithinRange(transaction.occurredAt, range),
-  );
+/** Share monetary and category rules across all-time, daily and period analytics. */
+function summarizeCashFlow(
+  transactions: readonly Transaction[],
+  categories: FinanceData['categories'],
+): CashFlowSummary {
   const income = sumMoney(transactions
     .filter((transaction) => transaction.type === 'income')
     .map((transaction) => transaction.amount));
   const expenses = transactions.filter((transaction) => transaction.type === 'expense');
   const expense = sumMoney(expenses.map((transaction) => transaction.amount));
-  const categoriesById = new Map(data.categories.filter(isPresent).map((category) => [category.id, category]));
-  const categoryTotals = new Map<string, number>();
+  const categoriesById = new Map(categories.filter(isPresent).map((category) => [category.id, category]));
+  const categoryTotals = new Map<string, CategoryAmount>();
   for (const transaction of expenses) {
-    categoryTotals.set(
-      transaction.categoryId,
-      addMoney(categoryTotals.get(transaction.categoryId) ?? 0, transaction.amount),
-    );
+    const total = categoryTotals.get(transaction.categoryId) ?? {
+      categoryId: transaction.categoryId,
+      name: categoriesById.get(transaction.categoryId)?.name ?? transaction.categoryName ?? '未知分類',
+      amount: 0,
+    };
+    total.amount = addMoney(total.amount, transaction.amount);
+    categoryTotals.set(transaction.categoryId, total);
   }
-  const expenseByCategory = [...categoryTotals.entries()]
-    .map(([categoryId, amount]) => ({
-      categoryId,
-      name: categoriesById.get(categoryId)?.name
-        ?? expenses.find((transaction) => transaction.categoryId === categoryId)?.categoryName
-        ?? '未知分類',
-      amount,
-    }))
+  const expenseByCategory = [...categoryTotals.values()]
     .sort((left, right) => compareMoney(right.amount, left.amount));
-  const elapsedDays = countElapsedDays(range, reference);
-
   return {
-    range,
     income,
     expense,
     net: subtractMoney(income, expense),
     expenseByCategory,
-    averageDailyExpense: elapsedDays > 0 ? expense / elapsedDays : 0,
-    savingsRate: income > 0 ? subtractMoney(income, expense) / income : null,
+  };
+}
+
+function summarizePeriod(
+  analyticsTransactions: readonly Transaction[],
+  categories: FinanceData['categories'],
+  range: DateRange,
+  reference: Date,
+): PeriodAnalytics {
+  const transactions = analyticsTransactions.filter((transaction) => isWithinRange(transaction.occurredAt, range));
+  const cashFlow = summarizeCashFlow(transactions, categories);
+  const expenses = transactions.filter((transaction) => transaction.type === 'expense');
+  const elapsedDays = countElapsedDays(range, reference);
+
+  return {
+    ...cashFlow,
+    range,
+    averageDailyExpense: elapsedDays > 0 ? cashFlow.expense / elapsedDays : 0,
+    savingsRate: cashFlow.income > 0 ? cashFlow.net / cashFlow.income : null,
     largestExpense: expenses.reduce<Transaction | null>(
       (largest, transaction) => !largest || compareMoney(transaction.amount, largest.amount) > 0
         ? transaction

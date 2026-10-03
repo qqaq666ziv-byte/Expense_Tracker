@@ -118,23 +118,22 @@ export function InsightsView({
   const customError =
     "message" in customValidation ? customValidation.message : undefined;
   const periodReady = period !== "custom" || customValidation.valid;
-  const options =
-    period === "day"
+  const customRangeValid = customValidation.valid;
+  const insights = useMemo(() => {
+    const options = period === "day"
       ? {
           period: "custom" as const,
           reference,
           custom: { start: localDate(reference), end: localDate(reference) },
         }
-      : period === "custom" && customValidation.valid
-        ? { period, reference, custom: customRange }
+      : period === "custom" && customRangeValid
+        ? { period, reference, custom: { start: customStart, end: customEnd } }
         : {
             period: period === "custom" ? ("month" as const) : period,
             reference,
           };
-  const insights = useMemo(
-    () => calculateInsights(data, options),
-    [data, period, customStart, customEnd, reference],
-  );
+    return calculateInsights(data, options);
+  }, [data, period, customStart, customEnd, customRangeValid, reference]);
   const budgets = useMemo(
     () => calculateBudgetUsage(data, reference),
     [data, reference],
