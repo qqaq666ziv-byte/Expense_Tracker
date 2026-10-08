@@ -50,18 +50,39 @@ function credentialUri(value) {
   // Encoded delimiters are conservative: an ambiguous match aborts the packet.
   // Consume each complete authority once; requiring @ in the main expression
   // would repeatedly rescan nested encoded scheme prefixes with no userinfo.
-  const pattern = /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*(?::|%3a)(?:\/|%2f){2}([^\s/?#"<>`\\]*)/gi;
-  let view = value;
-  for (let depth = 0; depth < 3; depth++) {
-    for (const [, authority] of view.matchAll(pattern)) {
+  // A retained percent octet can also separate a scheme (for example an
+  // encoded JSON opening quote). Do not restart at arbitrary scheme suffixes.
+  const pattern = /(?:(?<![a-z0-9+.-])|(?<=%[a-f0-9]{2}))[a-z][a-z0-9+.-]*(?::|%3a)(?:\/|%2f){2}([^\s/?#"<>`\\]*)/gi;
+  const hasUserinfo = text => {
+    for (const [, authority] of text.matchAll(pattern)) {
       if (/@|%40/i.test(authority)) return true;
     }
+    return false;
+  };
+  const authorityBoundary = /[\s/?#"<>`\\\p{Cc}]/u;
+  let view = value;
+  for (let depth = 0; depth < 3; depth++) {
+    if (hasUserinfo(view)) return true;
     if (depth === 2) break;
-    view = view.replace(/\\(?:\\|\/|[!$&'()*+,;=]|u([a-f0-9]{4})|x([a-f0-9]{2}))/gi,
-      (match, unicode, hex) => unicode || hex ? String.fromCharCode(parseInt(unicode ?? hex, 16)) : match.slice(1));
-    // Keep escaped path/query/fragment delimiters inside userinfo intact.
-    // A malformed, unrelated percent escape cannot disable the whole scan.
-    view = view.replace(/%([a-f0-9]{2})/gi, (match, hex) => /^(?:2f|3f|23)$/i.test(hex) ? match : String.fromCharCode(parseInt(hex, 16)));
+    // Normalize escape tokens in either encoding order. Percent-origin escape
+    // boundaries remain encoded, so an encoded slash/space inside userinfo
+    // cannot become an authority terminator. Raw JSON paths retain boundaries.
+    view = view.replace(/(\\|%5c)(\\|%5c|\/|%2f|[!$&'()*+,;=]|u([a-f0-9]{4})|x([a-f0-9]{2}))/gi,
+      (_match, introducer, token, unicode, hex) => {
+        const decoded = unicode || hex ? String.fromCharCode(parseInt(unicode ?? hex, 16))
+          : token.startsWith('%') ? String.fromCharCode(parseInt(token.slice(1), 16)) : token;
+        return (introducer.startsWith('%') || token.startsWith('%')) && authorityBoundary.test(decoded)
+          ? encodeURIComponent(decoded) : decoded;
+      });
+    // Inspect every normalization phase, before a later phase can change it.
+    if (hasUserinfo(view)) return true;
+    // Decode unreserved ASCII, scheme/userinfo syntax and nested percent only.
+    // Every other octet stays opaque: controls, whitespace, quotes and URI
+    // delimiters must never truncate userinfo. Malformed escapes stay intact.
+    view = view.replace(/%([a-f0-9]{2})/gi, (match, hex) => {
+      const decoded = String.fromCharCode(parseInt(hex, 16));
+      return /^[a-z0-9._~+%:@-]$/i.test(decoded) ? decoded : match;
+    });
   }
   return false;
 }

@@ -118,6 +118,8 @@ index 的 stage-0 內容必須與封包中已完整掃描的 pinned baseline 或
 
 credential URI 檢查涵蓋一般 scheme 的 authority userinfo，包含 database protocols、JSON slash／ASCII escape、文字中的 escaped apostrophe／userinfo sub-delims 與最多兩層 percent／JSON 混合編碼。不只檢查 DATABASE_URL 名称；HTTP、PEM、npm 等既有檢查仍適用。username-only userinfo 或 encoded authority 有歧義時保守中止整包，可能誤攔截公開使用者名稱；不刪掉片段後繼續輸出。未編碼的 path／query／fragment 不被當成 authority。秘密偵測仍不能取代人工核對，也不保證任意層數或任意程式組裝的秘密可被辨識。
 
+URI 偵測在每輪 JSON escape 與 percent 正規化之間先掃描。percent 只解出 unreserved ASCII、scheme／userinfo 識別字元與下一層 percent；其餘 octets 保留編碼，避免空白、控制字元、引號、backslash 或 URI delimiters 在 userinfo 中变成截斷點。percent 包住 JSON escape 時也按 escape token 處理，帶 percent 來源的邊界仍保留編碼；原始 JSON path delimiter 可以還原。偵測視圖最多正規化兩輪，不改寫原始證據；有歧義的編碼內容仍可能保守中止。
+
 拒絕漏列的非保護路徑變更、秘密格式（含 `POSTGRES_PASSWORD` 等前綴 credential key）、保護路徑、junction／symlink／hardlink、越界、二進位、無效 UTF-8、過大資料與 stale checks。一般來源與 check log 上限仍是 256 KiB；只有 repo 根目錄的 `package-lock.json` 可在 UTF-8／秘密檢查與 npm v2/v3 JSON 結構核對後使用 512 KiB 上限，完整來源、diff、雜湊與 4 MiB 總封包上限照常適用，不因 lockfile 過大而漏列它。被 Git 忽略或受保護的私人檔案內容完全不讀，其內容變化不在 scopeDigest 的保證內；若此限制使必要驗收無法成立，狀態是缺證據。
 
 ## INIT → PLAN → EXECUTED → REVIEW → 修正／交付

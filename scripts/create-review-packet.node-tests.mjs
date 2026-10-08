@@ -287,6 +287,118 @@ function credentialUris() {
   ] };
 }
 
+function mixedUri(intro, encodedPassword, encodedAt = '@', encodedUsername = '') {
+  return `{"DATABASE_URL":"${intro}fixture${encodedUsername}-user:synthetic${encodedPassword}password${encodedAt}db.example.invalid/fixture"}`;
+}
+
+const escapedUriIntros = [String.raw`postgresql:\/\/`, String.raw`postgresql\u003a\u002f\u002f`,
+  // The URI remains invisible after JSON unescaping, requiring the percent
+  // phase to expose its scheme while preserving every userinfo octet.
+  [...'postgresql'].map(character => `%${character.charCodeAt(0).toString(16)}`).join('') + String.raw`:\/\/`];
+
+test('withholds mixed JSON escapes and percent-space credentials in source and baseline', t => {
+  const f = fixture(t);
+  for (const intro of escapedUriIntros) {
+    const value = mixedUri(intro, '%20');
+    fs.writeFileSync(path.join(f.root, 'example.js'), value);
+    assert.throws(() => createPacket(f.options), error => /Suspected secret in selected source/.test(error.message)
+      && !error.message.includes('synthetic') && !error.message.includes('fixture-user'));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+  f.git(['commit', '-am', 'synthetic mixed JSON and percent-space baseline']);
+  const base = f.git(['rev-parse', 'HEAD']).trim();
+  fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
+  assert.throws(() => createPacket({ ...f.options, base }), error => /Suspected secret in baseline source/.test(error.message)
+    && !error.message.includes('synthetic') && !error.message.includes('fixture-user'));
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('withholds every percent octet in userinfo after JSON slash or ASCII unescaping', t => {
+  const f = fixture(t);
+  for (const [introIndex, intro] of escapedUriIntros.entries()) {
+    // Includes C0/C1 controls, all whitespace and authority delimiters, plus
+    // printable and opaque octets. Decoding an octet must never hide userinfo.
+    for (let octet = 0; octet <= 255; octet++) {
+      const encoded = `%${octet.toString(16).padStart(2, '0')}`;
+      for (const position of ['username', 'password']) {
+        fs.writeFileSync(path.join(f.root, 'example.js'), mixedUri(intro, position === 'password' ? encoded : '', '@', position === 'username' ? encoded : ''));
+        assert.throws(() => captureSource(f.options), error => /Suspected secret/.test(error.message)
+          && !error.message.includes('synthetic') && !error.message.includes('fixture'),
+        `synthetic percent-octet ${octet}, intro ${introIndex}, ${position}`);
+      }
+    }
+  }
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('withholds mixed encoded controls and delimiters in JSON logs and metadata', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  const boundaries = ['%00', '%09', '%0a', '%0b', '%0c', '%0d', '%1f', '%20', '%22', '%23',
+    '%2f', '%3c', '%3e', '%3f', '%5c', '%60', '%7f', '%85', '%a0', '%c2%a0', '%e2%80%a8'];
+  for (const intro of escapedUriIntros) {
+    for (const encoded of boundaries) {
+      for (const layer of [1, 2]) {
+        const password = layer === 1 ? encoded : encoded.replaceAll('%', '%25');
+        const value = mixedUri(intro, password, layer === 1 ? '%40' : '%2540');
+        // An additional JSON wrapper also exercises escaped backslashes. The
+        // synthetic log and metadata each use the production checkText path.
+        fs.writeFileSync(metadata.outputFile, JSON.stringify({ database: value, unrelated: '%zz' }));
+        assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected secret in check output/.test(error.message)
+          && !error.message.includes('synthetic') && !error.message.includes('fixture-user'));
+        assert.equal(fs.existsSync(f.options.out), false);
+        fs.writeFileSync(metadata.outputFile, 'safe synthetic check output\n');
+        fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, command: value }));
+        assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected secret in check metadata/.test(error.message)
+          && !error.message.includes('synthetic') && !error.message.includes('fixture-user'));
+        assert.equal(fs.existsSync(f.options.out), false);
+        fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+      }
+    }
+  }
+});
+
+test('keeps real JSON URI path query and fragment boundaries separate from userinfo', t => {
+  const f = fixture(t);
+  for (const uri of [String.raw`https:\/\/docs.example.invalid\/synthetic%20path/contact@example.invalid`,
+    String.raw`https:\/\/docs.example.invalid\/path?email=contact%40example.invalid`,
+    String.raw`https\u003a\u002f\u002fdocs.example.invalid/path#contact%40example.invalid`,
+    String.raw`postgresql:\/\/db.example.invalid/fixture?note=synthetic%0apassword%40example.invalid`]) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `{"DATABASE_URL":"${uri}"}`);
+    assert.doesNotThrow(() => captureSource(f.options));
+  }
+  fs.writeFileSync(path.join(f.root, 'example.js'), '%5cuD800 %5cuDC00 %5cud800%5cudc00\n');
+  assert.doesNotThrow(() => captureSource(f.options));
+});
+
+test('retains percent outside JSON escape coverage without decoding userinfo boundaries', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  for (const intro of escapedUriIntros) {
+    for (const encoded of ['%20', '%00', '%22', '%2f', '%3f', '%5c']) {
+      const value = encodeURIComponent(mixedUri(intro, encoded));
+      fs.writeFileSync(path.join(f.root, 'example.js'), value);
+      assert.throws(() => createPacket(f.options), error => /Suspected secret in selected source/.test(error.message)
+        && !error.message.includes('synthetic') && !error.message.includes('fixture'));
+      assert.equal(fs.existsSync(f.options.out), false);
+      fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
+      fs.writeFileSync(metadata.outputFile, value);
+      assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected secret in check output/);
+      assert.equal(fs.existsSync(f.options.out), false);
+    }
+  }
+  for (const token of ['%5C%2F', '%5Cu002f', '%5C%75%30%30%32%66']) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), mixedUri(`postgresql:${token}${token}`, '%20', '%40'));
+    assert.throws(() => captureSource(f.options), /Suspected secret/);
+  }
+  for (const token of ['%5C%2F', '%5Cu002f', '%5Cu0020', '%5Cu00a0', '%5Cu2028']) {
+    for (const position of ['username', 'password']) {
+      fs.writeFileSync(path.join(f.root, 'example.js'), mixedUri(escapedUriIntros[0], position === 'password' ? token : '', '%40', position === 'username' ? token : ''));
+      assert.throws(() => captureSource(f.options), /Suspected secret/);
+    }
+  }
+});
+
 test('withholds credential-bearing URIs across protocols and userinfo encodings', t => {
   const f = fixture(t);
   const { credential, values } = credentialUris();
@@ -359,7 +471,8 @@ test('allows credential-free URIs and fails closed on ambiguous encoded userinfo
 
 test('scans bounded long scheme-like text without repeated suffix backtracking', { timeout: 10000 }, t => {
   const f = fixture(t);
-  for (const value of ['x'.repeat(250000), 'a+.-'.repeat(62500), 'x%3a%2f%2f_'.repeat(20000)]) {
+  for (const value of ['x'.repeat(250000), 'a+.-'.repeat(62500), 'x%3a%2f%2f_'.repeat(20000),
+    'x%3a%5c%2f%5c%2f_'.repeat(14000)]) {
     fs.writeFileSync(path.join(f.root, 'example.js'), value);
     assert.doesNotThrow(() => captureSource(f.options));
   }
