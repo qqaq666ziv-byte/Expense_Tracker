@@ -57,7 +57,7 @@ function credentialUri(value) {
       if (/@|%40/i.test(authority)) return true;
     }
     if (depth === 2) break;
-    view = view.replace(/\\(?:\\|\/|u([a-f0-9]{4})|x([a-f0-9]{2}))/gi,
+    view = view.replace(/\\(?:\\|\/|[!$&'()*+,;=]|u([a-f0-9]{4})|x([a-f0-9]{2}))/gi,
       (match, unicode, hex) => unicode || hex ? String.fromCharCode(parseInt(unicode ?? hex, 16)) : match.slice(1));
     // Keep escaped path/query/fragment delimiters inside userinfo intact.
     // A malformed, unrelated percent escape cannot disable the whole scan.

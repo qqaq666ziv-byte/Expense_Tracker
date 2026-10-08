@@ -282,6 +282,8 @@ function credentialUris() {
     ['postgresql', '://fixture-user:', credential, '%zz@db.example.invalid/fixture'].join(''),
     ['unrelated%zz ', uri].join(''),
     ['postgresql', '://fixture-user:', credential, "!$&'()*+,;=@[::1]/fixture"].join(''),
+    ['postgresql', '://fixture-user:', credential, "\\!\\$\\&\\'\\(\\)\\*\\+\\,\\;\\=@db.example.invalid/fixture"].join(''),
+    ["const connection = 'postgresql", '://fixture-user:', credential, "\\'part@db.example.invalid/fixture';"].join(''),
   ] };
 }
 
