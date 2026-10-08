@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState, type FormEvent } fr
 import { Copy, Inbox, RefreshCw, ShieldCheck, Smartphone } from 'lucide-react';
 import { money, shortDate } from '../../app/format';
 import type { FinanceData } from '../../domain/model';
+import type { FinanceSyncOutcome } from '../../app/useFinanceApp';
 import { parseShortcutNotification } from '../../../supabase/functions/_shared/shortcutNotification';
 import { createShortcutSecret, shortcutApi, ShortcutApiError } from './api';
 import { parseShortcutReviewAmount, reviewTimeInput, reviewTimeIso, shortcutParents, shortcutReason, SHORTCUT_TEST_TEMPLATE } from './model';
@@ -11,7 +12,7 @@ import './shortcuts.css';
 export interface ShortcutsPanelProps {
   ownerId: string;
   data: FinanceData;
-  onSync: () => Promise<void>;
+  onSync: (transactionIds?: readonly string[]) => Promise<FinanceSyncOutcome>;
   onSignIn?: () => void;
   locked?: boolean;
   lockedAccountIds?: ReadonlySet<string>;
@@ -67,8 +68,10 @@ function OwnerShortcutsPanel({
     if (!transactionIds.length) return;
     transactionIds.forEach((id) => syncingImportsRef.current.add(id));
     try {
-      await onSync();
-      transactionIds.forEach((id) => syncedImportsRef.current.add(id));
+      const outcome = await onSync(transactionIds);
+      const confirmed = new Set(outcome.status === 'synced' ? outcome.confirmedTransactionIds : []);
+      transactionIds.filter((id) => confirmed.has(id)).forEach((id) => syncedImportsRef.current.add(id));
+      if (transactionIds.some((id) => !confirmed.has(id))) throw new Error('finance_sync_not_confirmed');
     } finally {
       transactionIds.forEach((id) => syncingImportsRef.current.delete(id));
     }
@@ -165,7 +168,10 @@ function OwnerShortcutsPanel({
     setInbox((previous) => previous.map((item) => item.id === draft.id ? { ...item, ...result } : item));
     if (result.status === 'imported') {
       try {
-        await onSync();
+        const outcome = await onSync(result.transaction_id ? [result.transaction_id] : []);
+        if (result.transaction_id && (outcome.status !== 'synced' || !outcome.confirmedTransactionIds.includes(result.transaction_id))) {
+          throw new Error('finance_sync_not_confirmed');
+        }
         if (result.transaction_id) syncedImportsRef.current.add(result.transaction_id);
       } catch {
         if (alive.current) setMessage('此筆已在雲端入帳；本機帳本尚未更新，請恢復連線後同步，勿另行新增同一筆。');

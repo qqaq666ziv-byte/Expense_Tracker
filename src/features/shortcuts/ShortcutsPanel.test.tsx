@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialState } from '../../app/state';
+import type { FinanceSyncOutcome } from '../../app/useFinanceApp';
 import type { ShortcutApi, ShortcutConnection, ShortcutInboxItem } from './types';
 import { ShortcutsPanel } from './ShortcutsPanel';
 
@@ -12,6 +13,8 @@ vi.mock('../../lib/supabaseClient', () => ({
   supabase: null,
   isBrowserSafeSupabaseKey: (key: string | undefined) => !!key && !key.startsWith('sb_secret_'),
 }));
+
+const successfulSync = (...ids: string[]) => vi.fn(async (): Promise<FinanceSyncOutcome> => ({ status: 'synced', confirmedTransactionIds: ids }));
 
 const connection: ShortcutConnection = {
   id: 'connection-a', label: '測試手機', mode: 'review', account_id: null, category_id: null,
@@ -54,7 +57,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function openInbox(api = makeApi(), onSync = vi.fn(async () => undefined)) {
+async function openInbox(api = makeApi(), onSync = successfulSync('transaction-a')) {
   const data = createInitialState('owner-a').data;
   const user = userEvent.setup();
   const view = render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={onSync} />);
@@ -68,7 +71,7 @@ describe('iPhone shortcuts panel', () => {
   it('lets guests diagnose mixed-amount notices locally without network or persistence', async () => {
     const api = makeApi();
     const user = userEvent.setup();
-    render(<ShortcutsPanel ownerId="guest" data={createInitialState('guest').data} api={api} onSync={vi.fn()} />);
+    render(<ShortcutsPanel ownerId="guest" data={createInitialState('guest').data} api={api} onSync={successfulSync()} />);
     expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: '通知測試' }));
     await user.type(screen.getByLabelText('通知標題'), '扣款通知');
@@ -86,7 +89,7 @@ describe('iPhone shortcuts panel', () => {
   it('creates a transient secret, sends only its hash and clears it synchronously on an owner switch', async () => {
     const api = makeApi([], []);
     const user = userEvent.setup();
-    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} />);
+    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
     await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
     const field = await screen.findByLabelText('一次性顯示的捷徑金鑰');
@@ -95,7 +98,7 @@ describe('iPhone shortcuts panel', () => {
     expect(api.create).toHaveBeenCalledWith('owner-a', '我的 iPhone', expect.stringMatching(/^[a-f0-9]{64}$/));
     expect(JSON.stringify(api.create.mock.calls)).not.toContain(secret);
     expect(localStorage.length).toBe(0);
-    view.rerender(<ShortcutsPanel ownerId="guest" data={createInitialState('guest').data} api={api} onSync={vi.fn()} />);
+    view.rerender(<ShortcutsPanel ownerId="guest" data={createInitialState('guest').data} api={api} onSync={successfulSync()} />);
     expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain(secret);
   });
@@ -106,8 +109,8 @@ describe('iPhone shortcuts panel', () => {
     api.listInbox.mockImplementationOnce(() => first.promise).mockResolvedValue([]);
     api.listPending.mockResolvedValue({ items: [], pending_count: 0, has_more: false, next_created_at: null, next_id: null });
     const user = userEvent.setup();
-    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} />);
-    view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={vi.fn()} />);
+    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={successfulSync()} />);
     await act(async () => first.resolve([{ ...notice, merchant: 'A 的私人資料' }]));
     await user.click(screen.getByRole('button', { name: /通知收件匣/ }));
     expect(screen.queryByText('A 的私人資料')).not.toBeInTheDocument();
@@ -119,11 +122,11 @@ describe('iPhone shortcuts panel', () => {
     const api = makeApi([], []);
     api.create.mockImplementation(() => pending.promise);
     const user = userEvent.setup();
-    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} />);
+    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
     await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
     await waitFor(() => expect(api.create).toHaveBeenCalledTimes(1));
-    view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={vi.fn()} />);
+    view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={successfulSync()} />);
     await act(async () => pending.resolve({ ...connection, label: 'A 的私人連線' }));
     expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '連線管理' }));
@@ -190,7 +193,7 @@ describe('iPhone shortcuts panel', () => {
     const api = makeApi([eligible], []);
     api.configure.mockResolvedValue({ ...eligible, mode: 'auto' });
     const user = userEvent.setup();
-    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={vi.fn()} />);
+    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={successfulSync()} />);
     await user.click(screen.getByRole('button', { name: '連線管理' }));
     const mode = await screen.findByLabelText('入帳方式');
     await user.selectOptions(mode, 'auto');
@@ -225,7 +228,7 @@ describe('iPhone shortcuts panel', () => {
     };
     const api = makeApi([automatic], []);
     const user = userEvent.setup();
-    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={vi.fn()} />);
+    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={successfulSync()} />);
     await user.click(screen.getByRole('button', { name: '連線管理' }));
     await user.selectOptions(await screen.findByLabelText('入帳方式'), 'review');
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
@@ -239,12 +242,12 @@ describe('iPhone shortcuts panel', () => {
     };
     const api = makeApi([automatic], []);
     const user = userEvent.setup();
-    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} />);
+    const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
     await user.click(screen.getByRole('button', { name: '連線管理' }));
     const checkbox = await screen.findByRole('checkbox', { name: /我已在 iPhone 重送測試/ });
     await user.click(checkbox);
     expect(checkbox).toBeChecked();
-    view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={vi.fn()} />);
+    view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={successfulSync()} />);
     await user.click(screen.getByRole('button', { name: '連線管理' }));
     expect(await screen.findByRole('checkbox', { name: /我已在 iPhone 重送測試/ })).not.toBeChecked();
     expect(api.configure).not.toHaveBeenCalled();
@@ -258,7 +261,7 @@ describe('iPhone shortcuts panel', () => {
     };
     const api = makeApi([{ ...eligible, mode: 'auto', label: '主要手機' }, { ...eligible, id: 'connection-b', label: '第二支手機' }], []);
     const user = userEvent.setup();
-    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={vi.fn()} />);
+    render(<ShortcutsPanel ownerId="owner-a" data={data} api={api} onSync={successfulSync()} />);
     await user.click(screen.getByRole('button', { name: '連線管理' }));
     const second = (await screen.findByRole('heading', { name: '第二支手機' })).closest('article')!;
     expect(within(second).getByRole('option', { name: '相容通知自動入帳' })).toBeDisabled();
@@ -274,7 +277,7 @@ describe('iPhone shortcuts panel', () => {
   it('can revoke a credential during a financial lock while financial edits stay disabled', async () => {
     const api = makeApi();
     const user = userEvent.setup();
-    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} locked />);
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} locked />);
     await user.click(screen.getByRole('button', { name: '連線管理' }));
     await waitFor(() => expect(screen.getByRole('button', { name: '停用此連線' })).toBeEnabled());
     expect(screen.getByRole('button', { name: '儲存連線設定' })).toBeDisabled();
@@ -297,12 +300,32 @@ describe('iPhone shortcuts panel', () => {
   it('syncs imported notifications discovered by refresh once and coalesces repeated refreshes', async () => {
     const imported = { ...notice, status: 'imported' as const, transaction_id: 'transaction-refresh' };
     const api = makeApi([], [imported]);
-    const onSync = vi.fn(async () => undefined);
+    const onSync = successfulSync('transaction-refresh');
     const { user } = await openInbox(api, onSync);
     expect(onSync).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole('button', { name: '重新整理' }));
     expect(onSync).toHaveBeenCalledTimes(1);
     expect(api.listPending).toHaveBeenCalled();
+  });
+
+  it('retries after partial or skipped sync outcomes and only suppresses a confirmed import', async () => {
+    const imported = { ...notice, status: 'imported' as const, transaction_id: 'transaction-retry' };
+    const api = makeApi([], [imported]);
+    const onSync = vi.fn()
+      .mockResolvedValueOnce({ status: 'partial', confirmedTransactionIds: ['transaction-retry'] })
+      .mockResolvedValueOnce({ status: 'skipped', confirmedTransactionIds: [] })
+      .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: [] })
+      .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: ['transaction-retry'] });
+    const { user } = await openInbox(api, onSync);
+    expect(onSync).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(onSync).toHaveBeenCalledTimes(2);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(onSync).toHaveBeenCalledTimes(3);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(onSync).toHaveBeenCalledTimes(4);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(onSync).toHaveBeenCalledTimes(4);
   });
 
   it('keeps imported recent results and exposes older pending items with a server exact count', async () => {
@@ -315,7 +338,7 @@ describe('iPhone shortcuts panel', () => {
       next_created_at: null, next_id: null,
     });
     const user = userEvent.setup();
-    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} />);
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
     await user.click(screen.getByRole('button', { name: /通知收件匣/ }));
     expect(await screen.findByText('Example Services', { selector: 'h3' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /通知收件匣 \(127\)/ })).toBeInTheDocument();
