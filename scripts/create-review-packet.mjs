@@ -51,7 +51,8 @@ function checkText(bytes, label, max = MAX_FILE) {
   try { value = decoder.decode(bytes); } catch { fail(`Invalid UTF-8 evidence: ${label}`); }
   if (value.includes('\0')) fail(`Binary evidence: ${label}`);
   const patterns = [
-    /^-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/m,
+    // PEM headers also occur inline and behind JSON-escaped newlines.
+    /-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/,
     /\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|shiba_sc_[0-9a-f]{64}|sb_secret_[A-Za-z0-9_-]{20,})\b/,
     /\bnpm_[A-Za-z0-9_-]{20,}\b/,
     /\bBearer\s+[A-Za-z0-9._~-]{20,}/i,
@@ -73,7 +74,7 @@ function checkText(bytes, label, max = MAX_FILE) {
     // Match the complete identifier: underscores are word characters, so a word
     // boundary before PASSWORD misses names such as POSTGRES_PASSWORD.
     const normalized = key.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
-    if (!/(?:^|[_-])(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|service[_-]?role[_-]?key)(?:$|[_-])/i.test(normalized)) continue;
+    if (!/(?:^|[_-])(?:password|passwd|secret|api[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|service[_-]?role[_-]?key)(?:$|[_-])/i.test(normalized)) continue;
     const remainder = value.slice(match.index + prefix.length).split(/\r?\n/, 1)[0];
     // Check the complete expression, so fallbacks and concatenations cannot use
     // a reference-looking first token to hide a literal credential.
@@ -163,7 +164,8 @@ export function captureSource({ root, base, files }) {
     if (!exists && !baseline.has(file)) fail(`Missing source: ${file}`);
     const current = exists ? readFile(absolute, file, file === 'package-lock.json' ? MAX_NPM_LOCKFILE : MAX_FILE, file) : null;
     if (current) {
-      current.gitMode = process.platform === 'win32' ? index.get(file).mode : (fs.statSync(absolute).mode & 0o111) ? '100755' : '100644';
+      // Git's executable bit follows owner execute, even with core.fileMode=false.
+      current.gitMode = process.platform === 'win32' ? index.get(file).mode : (fs.statSync(absolute).mode & 0o100) ? '100755' : '100644';
     }
     let before = null;
     if (baseline.has(file)) {
@@ -258,9 +260,9 @@ export function createPacket({ root, base, files, checks = [], out, goal, phase 
   const markdown = `packetId: ${manifest.packetId}\nsourceDigest: ${manifest.sourceDigest}\nscopeDigest: ${manifest.scopeDigest}\nsourceFileCount: ${manifest.files.length}\n\n${body}\n\nEND_EVIDENCE ${manifest.packetId}\n`;
   const after = captureSource({ root, base, files });
   if (canonical(after.identity) !== canonical(source.identity)) fail('Source changed while building packet; retry after verification.');
-  fs.mkdirSync(out);
-  fs.writeFileSync(path.join(out, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
-  fs.writeFileSync(path.join(out, 'evidence.md'), markdown, { flag: 'wx' });
+  fs.mkdirSync(out, { mode: 0o700 });
+  fs.writeFileSync(path.join(out, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+  fs.writeFileSync(path.join(out, 'evidence.md'), markdown, { flag: 'wx', mode: 0o600 });
   return { packetId: manifest.packetId, ...source.identity, output: out, phase };
 }
 

@@ -162,6 +162,88 @@ test('refuses secrets in current source, historical source and verification logs
   assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected secret/);
 });
 
+// Deliberately invalid, synthetic material: these fixtures contain no usable key.
+function privateKeyFixtures() {
+  const header = ['-----BEGIN ', 'RSA ', 'PRIVATE', ' KEY-----'].join('');
+  const material = ['SYNTHETIC', 'NOT', 'A', 'KEY', '0123456789'].join('-');
+  return { header, material, values: [
+    `prefix ${header} ${material}`,
+    JSON.stringify({ message: `${header}\n${material}` }),
+    JSON.stringify({ private_key: `${header}\n${material}` }),
+  ] };
+}
+
+test('withholds inline and JSON-escaped PEM headers in current and historical source', t => {
+  const f = fixture(t);
+  const { values, material } = privateKeyFixtures();
+  for (const value of values) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${value}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected secret/.test(error.message) && !error.message.includes(material));
+    assert.equal(fs.existsSync(f.options.out), false);
+    f.git(['commit', '-am', 'synthetic invalid private material']);
+    const unsafeBase = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
+    assert.throws(() => createPacket({ ...f.options, base: unsafeBase }), error => /Suspected secret in baseline/.test(error.message) && !error.message.includes(material));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+});
+
+test('withholds private-key fields and prefixed identifiers without a PEM marker', t => {
+  const f = fixture(t);
+  const { material } = privateKeyFixtures();
+  const values = [
+    JSON.stringify({ ['private_key']: material }), `privateKey = "${material}"`,
+    `GOOGLE_PRIVATE_KEY='${material}'`, `service_private_key=${material}`,
+  ];
+  for (const value of values) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${value}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(material));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+  f.git(['commit', '-am', 'synthetic private field baseline']);
+  const unsafeBase = f.git(['rev-parse', 'HEAD']).trim();
+  fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
+  assert.throws(() => createPacket({ ...f.options, base: unsafeBase }), error => /Suspected credential assignment in baseline/.test(error.message) && !error.message.includes(material));
+});
+
+test('withholds embedded private material in cumulative diff before output creation', t => {
+  const f = fixture(t);
+  const { header, material } = privateKeyFixtures();
+  // Source bodies are safe: the synthetic path appears only in diff/metadata.
+  // This isolates the cumulative-diff guard from the source-content guard.
+  for (const name of [`inline-${header}-fixture.txt`, ['diff-private_key', '=', material, '.txt'].join('')]) {
+    const filename = path.join(f.root, name);
+    fs.writeFileSync(filename, 'safe baseline\n');
+    f.git(['add', name]);
+    f.git(['commit', '-m', 'synthetic diff-path fixture']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(filename, 'safe change\n');
+    assert.throws(() => createPacket({ ...f.options, base, files: ['example.js', name] }), error => /Suspected (?:secret|credential assignment) in cumulative diff/.test(error.message) && !error.message.includes(material) && !error.message.includes(header));
+    assert.equal(fs.existsSync(f.options.out), false);
+    f.git(['checkout', '--', name]);
+  }
+});
+
+test('withholds inline PEMs and private-key fields from verification logs', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  const { values, material } = privateKeyFixtures();
+  for (const value of [...values, JSON.stringify({ ['private_key']: material }), `+private_key="${material}"`]) {
+    fs.writeFileSync(metadata.outputFile, `${value}\n`);
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected (?:secret|credential assignment) in check output/.test(error.message) && !error.message.includes(material));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+});
+
+test('allows private-key placeholders and exact environment references', t => {
+  const f = fixture(t);
+  for (const expression of ['"<redacted>"', '"[REDACTED]"', '"${GOOGLE_PRIVATE_KEY}"', '"env(GOOGLE_PRIVATE_KEY)"',
+    'Deno.env.get("GOOGLE_PRIVATE_KEY");', 'process.env.GOOGLE_PRIVATE_KEY;']) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['private_key', ' = ', expression, '\n'].join(''));
+    assert.doesNotThrow(() => captureSource(f.options));
+  }
+});
+
 test('refuses bare shortcut and Supabase secret credentials without an Authorization header', t => {
   const f = fixture(t);
   for (const credential of ['shiba_sc_' + 'b'.repeat(64), 'sb_secret_' + 'z'.repeat(32), 'npm_' + 'x'.repeat(32),
@@ -410,6 +492,53 @@ test('records Git modes and rejects same-byte mode and staging changes in packet
   assert.notEqual(captureSource(f.options).identity.sourceDigest, original);
   assert.throws(() => verifyPacket({ root: f.root, directory: result.output }), /Stale/);
   assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath], out: path.join(f.temp, 'stale-mode') }), /Stale check/);
+});
+
+test('binds owner execute transitions in both directions when Git ignores file modes', { skip: process.platform === 'win32' }, t => {
+  const f = fixture(t);
+  const filename = path.join(f.root, 'example.js');
+  f.git(['config', 'core.fileMode', 'false']);
+  for (const [beforeMode, afterMode, beforeGitMode, afterGitMode] of [
+    [0o755, 0o655, '100755', '100644'], [0o655, 0o755, '100644', '100755'],
+  ]) {
+    fs.chmodSync(filename, beforeMode);
+    const before = captureSource(f.options);
+    const { metadataPath } = check(f);
+    const options = { ...f.options, out: path.join(f.temp, `owner-mode-${beforeMode}`), phase: 'review', checks: [metadataPath] };
+    const packet = createPacket(options);
+    const manifest = JSON.parse(fs.readFileSync(path.join(packet.output, 'manifest.json')));
+    assert.equal(manifest.files[0].baseline.gitMode, '100644');
+    assert.equal(manifest.files[0].current.gitMode, beforeGitMode);
+    assert.equal(manifest.files[0].index.mode, '100644');
+    fs.chmodSync(filename, afterMode);
+    const after = captureSource(f.options);
+    assert.equal(after.entries[0].current.gitMode, afterGitMode);
+    assert.equal(after.entries[0].current.sha256, before.entries[0].current.sha256);
+    assert.deepEqual(after.entries[0].index, before.entries[0].index);
+    assert.equal(after.status, before.status);
+    assert.equal(after.diff, before.diff);
+    assert.equal(after.identity.cumulativeDiffSha256, before.identity.cumulativeDiffSha256);
+    assert.notEqual(after.identity.sourceDigest, before.identity.sourceDigest);
+    assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /Stale/);
+    assert.throws(() => createPacket({ ...options, out: path.join(f.temp, `stale-owner-mode-${beforeMode}`) }), /Stale check/);
+  }
+});
+
+test('creates private packet outputs under umask 022 without changing existing parent permissions', { skip: process.platform === 'win32' }, t => {
+  const f = fixture(t);
+  const parentMode = fs.statSync(f.temp).mode & 0o777;
+  const previousUmask = process.umask(0o022);
+  try {
+    const packet = createPacket(f.options);
+    assert.equal(fs.statSync(packet.output).mode & 0o777, 0o700);
+    for (const name of ['manifest.json', 'evidence.md']) {
+      assert.equal(fs.statSync(path.join(packet.output, name)).mode & 0o777, 0o600);
+    }
+    assert.equal(fs.statSync(f.temp).mode & 0o777, parentMode);
+    assert.equal(verifyPacket({ root: f.root, directory: packet.output }).valid, true);
+  } finally {
+    process.umask(previousUmask);
+  }
 });
 
 test('rejects stage and unstage of unchanged working bytes', t => {
