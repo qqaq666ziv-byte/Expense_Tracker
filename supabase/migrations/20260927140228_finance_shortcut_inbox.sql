@@ -37,6 +37,7 @@ create table if not exists public.finance_shortcut_inbox (
   reason text not null check (octet_length(reason) <= 100),
   parser_format text check (parser_format = 'jkopay-single-debit-v1'),
   auto_eligible boolean not null default false,
+  duplicate_event boolean not null default false,
   ambiguous_of uuid references public.finance_shortcut_inbox(id),
   created_at timestamptz not null default clock_timestamp(),
   unique (user_id, connection_id, event_key),
@@ -48,6 +49,7 @@ create table if not exists public.finance_shortcut_inbox (
 -- Keep compact replay keys after aging out reviewed inbox payloads. This table
 -- is private and has no Data API grants; rows are never pruned automatically.
 create table if not exists finance_private.shortcut_inbox_receipts (
+  inbox_id uuid not null,
   user_id uuid not null references auth.users(id) on delete cascade,
   connection_id uuid not null,
   event_key text not null,
@@ -55,7 +57,6 @@ create table if not exists finance_private.shortcut_inbox_receipts (
   original_status text not null check (original_status in ('imported', 'ignored', 'test')),
   archived_at timestamptz not null default clock_timestamp(),
   primary key (user_id, connection_id, event_key),
-  unique (user_id, event_key),
   foreign key (user_id, connection_id) references public.finance_shortcut_connections(user_id, id)
 );
 
@@ -255,7 +256,8 @@ begin
     coalesce(p_category_id, connection.category_id), chosen_amount, chosen_merchant, chosen_time);
   -- Manual corrections do not prove that the parser understood the notification.
   -- Tests, duplicates and revoked connections can never enable auto mode.
-  if item.auto_eligible and item.parser_format = 'jkopay-single-debit-v1' and item.ambiguous_of is null
+  if item.auto_eligible and not item.duplicate_event
+    and item.parser_format = 'jkopay-single-debit-v1' and item.ambiguous_of is null
     and item.event_key like 'id:%'
     and connection.revoked_at is null and item.payload ->> 'test' = 'false'
     and chosen_amount = item.amount and btrim(chosen_merchant) = item.merchant and chosen_time = item.occurred_at
@@ -317,7 +319,7 @@ begin
     where user_id = owner_id and connection_id = connection.id and event_key = p_event_key;
     if found then
       if receipt.fingerprint <> p_fingerprint then raise exception 'event_id_payload_conflict' using errcode = '23505'; end if;
-      return jsonb_build_object('status', receipt.original_status, 'duplicate', true, 'archived', true);
+      return jsonb_build_object('status', receipt.original_status, 'id', receipt.inbox_id, 'duplicate', true, 'archived', true);
     end if;
     -- A source/device ID may collide across connections. Keep the new proposal
     -- for manual comparison even when the payload differs; do not silently drop
@@ -350,6 +352,11 @@ begin
       select id, user_id, connection_id, event_key, fingerprint, status
       from public.finance_shortcut_inbox
       where user_id = owner_id and status in ('imported', 'ignored', 'test')
+        and id is distinct from duplicate_id
+        and not exists (
+          select 1 from public.finance_shortcut_inbox reference_row
+          where reference_row.ambiguous_of = finance_shortcut_inbox.id
+        )
         and (event_key like 'id:%' or not exists (
           select 1 from public.finance_shortcut_inbox other
           where other.user_id = owner_id and other.id <> finance_shortcut_inbox.id
@@ -360,10 +367,10 @@ begin
       for update skip locked
     ), retained as (
       insert into finance_private.shortcut_inbox_receipts
-        (user_id, connection_id, event_key, fingerprint, original_status)
-      select user_id, connection_id, event_key, fingerprint, status from eligible
+        (inbox_id, user_id, connection_id, event_key, fingerprint, original_status)
+      select id, user_id, connection_id, event_key, fingerprint, status from eligible
       on conflict (user_id, connection_id, event_key) do update
-        set fingerprint = excluded.fingerprint, original_status = excluded.original_status,
+        set inbox_id = excluded.inbox_id, fingerprint = excluded.fingerprint, original_status = excluded.original_status,
             archived_at = clock_timestamp()
       returning user_id, connection_id, event_key
     ), removed as (
@@ -374,13 +381,13 @@ begin
     if archived_count <> 1 then raise exception 'shortcut_inbox_limit' using errcode = '54000'; end if;
   end if;
   insert into public.finance_shortcut_inbox(user_id, connection_id, event_key, fingerprint, payload,
-    amount, merchant, occurred_at, status, reason, parser_format, auto_eligible, ambiguous_of)
+    amount, merchant, occurred_at, status, reason, parser_format, auto_eligible, duplicate_event, ambiguous_of)
   values(owner_id, connection.id, key_to_insert, p_fingerprint, p_payload,
     p_amount, p_merchant, p_occurred_at, case when is_test then 'test' else 'pending' end,
     case when is_test then 'test_only' when cross_connection then 'cross_connection_duplicate'
       when is_duplicate then 'possible_duplicate'
       when p_event_key like 'fp:%' and p_auto_eligible then 'missing_event_id' else p_reason end,
-    p_format, p_auto_eligible, duplicate_id)
+    p_format, p_auto_eligible, is_duplicate, duplicate_id)
   returning * into created;
 
   if connection.mode = 'auto' and connection.verified_at is not null and connection.verified_format = p_format

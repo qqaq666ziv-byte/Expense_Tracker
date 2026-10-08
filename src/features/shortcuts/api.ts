@@ -95,7 +95,10 @@ function rows<T>(value: unknown, decode: (item: unknown) => T): T[] {
 export function createShortcutApi(dependencies: ApiDependencies): ShortcutApi {
   const baseUrl = serviceUrl(dependencies.url);
   async function call(ownerId: string, name: string, parameters: Record<string, unknown> = {}): Promise<unknown> {
-    if (!baseUrl || !isBrowserSafeSupabaseKey(dependencies.anonKey)) throw new ShortcutApiError('unavailable');
+    const anonKey = dependencies.anonKey;
+    if (!baseUrl || typeof anonKey !== 'string' || !isBrowserSafeSupabaseKey(anonKey)) {
+      throw new ShortcutApiError('unavailable');
+    }
     if (!ownerId || ownerId === 'guest') throw new ShortcutApiError('auth');
     let session: SessionResult['data']['session'];
     try {
@@ -113,7 +116,7 @@ export function createShortcutApi(dependencies: ApiDependencies): ShortcutApi {
       const response = await dependencies.fetcher(`${baseUrl}/rest/v1/rpc/${name}`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json', apikey: dependencies.anonKey,
+          'Content-Type': 'application/json', apikey: anonKey,
           Authorization: `Bearer ${session.access_token}`,
         },
         body: JSON.stringify(parameters), signal: controller.signal,

@@ -276,6 +276,8 @@ try {
   equal(await txCount(), beforeFeedEvents + 2, 'switching feeds cannot auto-post an already seen source event');
   equal(await one('select reason, ambiguous_of from public.finance_shortcut_inbox where id=$1', [secondFeedReplay.id]),
     { reason: 'cross_connection_duplicate', ambiguous_of: firstFeedPosted.id }, 'cross-feed proposal identifies the previous event for review');
+  equal((await one('select duplicate_event from public.finance_shortcut_inbox where id=$1', [secondFeedReplay.id])).duplicate_event,
+    true, 'cross-feed duplicate state is persisted independently of its optional inbox reference');
   const secondFeedChanged = await receive({ ...firstFeedChangedEvent, hash: switchHash,
     fingerprint: sha('different-payload-on-another-feed'), amount: '99.00',
     payload: { ...firstFeedChangedEvent.payload, text: 'A different synthetic purchase sharing a source-local ID' },
@@ -311,32 +313,62 @@ try {
   await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
     select $1,$2,'id:' || repeat(lpad(to_hex(n), 8, '0'), 8),repeat('a',64),
       '{"version":1,"source":"jkopay","title":"fixture","text":"terminal","test":false}'::jsonb,
-      case when n <= 3 then 'ignored' else 'pending' end,
-      case when n <= 3 then 'terminal_fixture' else 'pending_fixture' end,
+      case when n <= 4 then 'ignored' else 'pending' end,
+      case when n <= 4 then 'terminal_fixture' else 'pending_fixture' end,
       clock_timestamp() - (10001 - n) * interval '1 second' from generate_series(1,10000) n`, [B, connectionB.id]);
-  const capacityRecovery = await receive(event('inbox-quota', { hash: hashB }));
+  const blockedByReference = await one(`select id,event_key,fingerprint from public.finance_shortcut_inbox
+    where user_id=$1 and connection_id=$2 and event_key='id:' || repeat(lpad(to_hex(1), 8, '0'), 8)`, [B, connectionB.id]);
+  await db.query(`update public.finance_shortcut_inbox set ambiguous_of=$3
+    where user_id=$1 and connection_id=$2 and event_key='id:' || repeat(lpad(to_hex(10000), 8, '0'), 8)`,
+  [B, connectionB.id, blockedByReference.id]);
+  const protectedDuplicate = await one(`select id,event_key,fingerprint from public.finance_shortcut_inbox
+    where user_id=$1 and connection_id=$2 and event_key='id:' || repeat(lpad(to_hex(3), 8, '0'), 8)`, [B, connectionB.id]);
+  const capacityRecovery = await receive(event('inbox-quota', {
+    hash: sha('synthetic-b-0'), key: protectedDuplicate.event_key, fingerprint: protectedDuplicate.fingerprint,
+    payload: { version: 1, source: 'jkopay', title: 'fixture', text: 'terminal', test: false },
+  }));
   equal(capacityRecovery.status, 'pending', 'capacity recovers by retaining a new unprocessed event');
+  equal(capacityRecovery.duplicate, true, 'cross-connection duplicate remains reviewable during capacity recovery');
   equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1', [B])).count,
     10000, 'bounded inbox capacity is restored');
   equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1 and status=\'pending\'', [B])).count,
-    9998, 'capacity recovery leaves all existing pending items intact and stores the new pending event');
+    9997, 'capacity recovery leaves all existing pending items intact and stores the new pending event');
   equal((await one('select count(*)::integer count from finance_private.shortcut_inbox_receipts where user_id=$1', [B])).count,
     1, 'one terminal row is preserved as a compact replay receipt');
-  const archivedFixture = await one(`select event_key,fingerprint from finance_private.shortcut_inbox_receipts
+  equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where id=$1', [blockedByReference.id])).count,
+    1, 'terminal row referenced by ambiguous_of is not deleted');
+  equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where id=$1', [protectedDuplicate.id])).count, 1,
+  'terminal duplicate source selected by this request is not deleted before ambiguous_of is stored');
+  const archivedFixture = await one(`select inbox_id,event_key,fingerprint from finance_private.shortcut_inbox_receipts
     where user_id=$1 and connection_id=$2 limit 1`, [B, connectionB.id]);
   const replayReceipt = await receive(event('archived-replay', { hash: hashB, key: archivedFixture.event_key,
     fingerprint: archivedFixture.fingerprint,
     payload: { version: 1, source: 'jkopay', title: 'fixture', text: 'terminal', test: false } }));
-  equal(replayReceipt, { status: 'ignored', duplicate: true, archived: true },
+  equal(replayReceipt, { status: 'ignored', id: archivedFixture.inbox_id, duplicate: true, archived: true },
     'replay of an archived reviewed event remains deduplicated');
   await rejects(() => receive(event('archived-replay-conflict', { hash: hashB, key: archivedFixture.event_key,
     fingerprint: sha('changed archived payload') })),
   /event_id_payload_conflict/, 'archived replay with changed payload is rejected');
-  const crossConnectionReplay = await receive(event('cross-connection-archived-replay', {
+  const crossConnectionReplay = await receive(strictEvent('cross-connection-archived-replay', {
     hash: sha('synthetic-b-0'), key: archivedFixture.event_key, fingerprint: archivedFixture.fingerprint,
-    payload: { version: 1, source: 'jkopay', title: 'fixture', text: 'terminal', test: false },
   }));
   equal(crossConnectionReplay.duplicate, true, 'archived source ID still marks a second connection proposal as duplicate');
+  equal((await one('select duplicate_event from public.finance_shortcut_inbox where id=$1', [crossConnectionReplay.id])).duplicate_event,
+    true, 'archived cross-connection ambiguity is durably recorded without an active-row foreign key');
+  await review(B, crossConnectionReplay.id, 'approve', 'account-b', 'category-b');
+  equal((await one('select verified_at from public.finance_shortcut_connections where token_hash=$1',
+    [sha('synthetic-b-0')])).verified_at, null, 'review of an archived cross-connection duplicate cannot establish parser proof');
+  const secondBConnection = await one('select id from public.finance_shortcut_connections where token_hash=$1',
+    [sha('synthetic-b-1')]);
+  await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
+    values($1,$2,$3,$4,$5,'ignored','second_connection_terminal',timestamp '2000-01-01 00:00:00+00')`,
+  [B, secondBConnection.id, archivedFixture.event_key, archivedFixture.fingerprint,
+    { version: 1, source: 'jkopay', title: 'fixture', text: 'terminal', test: false }]);
+  const secondRecovery = await receive(event('second-recovery', { hash: hashB }));
+  equal(secondRecovery.status, 'pending', 'capacity still recovers after a duplicate ID was archived on another connection');
+  equal((await one(`select count(*)::integer count from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and event_key=$2`, [B, archivedFixture.event_key])).count,
+  2, 'same owner event ID retains independent dedupe receipts for both connections');
   equal((await as('authenticated', B, 'select public.finance_shortcut_list_inbox() as result')).length, 100, 'list result is bounded to one hundred rows');
   await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
     values($1,$2,'fixture:new-imported',repeat('b',64),'{"test":true}'::jsonb,'pending','imported_fixture',clock_timestamp() + interval '1 day'),
@@ -374,6 +406,8 @@ try {
   assert.match(intakeDef, /pg_advisory_xact_lock[\s\S]+revoked_at is null for update/); assertions += 1;
   assert.match(intakeDef, /status in \('imported', 'ignored', 'test'\)[\s\S]+for update skip locked/); assertions += 1;
   assert.match(intakeDef, /insert into finance_private\.shortcut_inbox_receipts[\s\S]+delete from public\.finance_shortcut_inbox/); assertions += 1;
+  assert.match(intakeDef, /reference_row\.ambiguous_of = finance_shortcut_inbox\.id/); assertions += 1;
+  assert.match(reviewDef, /not item\.duplicate_event/); assertions += 1;
   assert.match(intakeDef, /not exists \([\s\S]+other\.fingerprint = finance_shortcut_inbox\.fingerprint/); assertions += 1;
   assert.match(listInboxDef, /order by created_at desc, id desc limit 100/); assertions += 1;
   assert.match(listInboxDef, /jsonb_agg[\s\S]+order by i\.created_at desc, i\.id desc/); assertions += 1;

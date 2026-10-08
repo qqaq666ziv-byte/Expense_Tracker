@@ -117,6 +117,15 @@ describe('shortcut HTTP boundary', () => {
     expect(db.receive.mock.calls[0][0]).toMatchObject({ p_auto_eligible: false, p_reason: 'topup_requires_review', p_amount: '1234.00' });
     expect(JSON.stringify(db.receive.mock.calls[0])).not.toContain(token);
   });
+  it('returns the original inbox ID when an archived notification is replayed', async () => {
+    const db = dependencies();
+    db.receive.mockResolvedValue({
+      data: { status: 'ignored', id: 'archived-inbox-id', duplicate: true, archived: true }, error: null,
+    });
+    const response = await handleShortcutRequest(request(mixed), db);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: 'ignored', id: 'archived-inbox-id', duplicate: true });
+  });
   it.each([null, 'Bearer wrong', 'Bearer shiba_sc_', `Bearer ${token} extra`])('rejects malformed auth before calling a database', async (authorization) => {
     const db = dependencies();
     expect((await handleShortcutRequest(request(simple, authorization), db)).status).toBe(401);
