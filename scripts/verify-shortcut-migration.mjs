@@ -309,9 +309,34 @@ try {
   await rejects(() => createConnection(B, sha('synthetic-over-limit')), /connection_limit/, 'active connection quota enforced');
 
   await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
-    select $1,$2,'fixture:' || n,repeat('a',64),'{"test":true}'::jsonb,'pending','pending_fixture',
+    select $1,$2,'id:' || repeat(lpad(to_hex(n), 8, '0'), 8),repeat('a',64),
+      '{"version":1,"source":"jkopay","title":"fixture","text":"terminal","test":false}'::jsonb,
+      case when n <= 3 then 'ignored' else 'pending' end,
+      case when n <= 3 then 'terminal_fixture' else 'pending_fixture' end,
       clock_timestamp() - (10001 - n) * interval '1 second' from generate_series(1,10000) n`, [B, connectionB.id]);
-  await rejects(() => receive(event('inbox-quota', { hash: hashB })), /shortcut_inbox_limit/, 'inbox quota includes retained tests and history');
+  const capacityRecovery = await receive(event('inbox-quota', { hash: hashB }));
+  equal(capacityRecovery.status, 'pending', 'capacity recovers by retaining a new unprocessed event');
+  equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1', [B])).count,
+    10000, 'bounded inbox capacity is restored');
+  equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1 and status=\'pending\'', [B])).count,
+    9998, 'capacity recovery leaves all existing pending items intact and stores the new pending event');
+  equal((await one('select count(*)::integer count from finance_private.shortcut_inbox_receipts where user_id=$1', [B])).count,
+    1, 'one terminal row is preserved as a compact replay receipt');
+  const archivedFixture = await one(`select event_key,fingerprint from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and connection_id=$2 limit 1`, [B, connectionB.id]);
+  const replayReceipt = await receive(event('archived-replay', { hash: hashB, key: archivedFixture.event_key,
+    fingerprint: archivedFixture.fingerprint,
+    payload: { version: 1, source: 'jkopay', title: 'fixture', text: 'terminal', test: false } }));
+  equal(replayReceipt, { status: 'ignored', duplicate: true, archived: true },
+    'replay of an archived reviewed event remains deduplicated');
+  await rejects(() => receive(event('archived-replay-conflict', { hash: hashB, key: archivedFixture.event_key,
+    fingerprint: sha('changed archived payload') })),
+  /event_id_payload_conflict/, 'archived replay with changed payload is rejected');
+  const crossConnectionReplay = await receive(event('cross-connection-archived-replay', {
+    hash: sha('synthetic-b-0'), key: archivedFixture.event_key, fingerprint: archivedFixture.fingerprint,
+    payload: { version: 1, source: 'jkopay', title: 'fixture', text: 'terminal', test: false },
+  }));
+  equal(crossConnectionReplay.duplicate, true, 'archived source ID still marks a second connection proposal as duplicate');
   equal((await as('authenticated', B, 'select public.finance_shortcut_list_inbox() as result')).length, 100, 'list result is bounded to one hundred rows');
   await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
     values($1,$2,'fixture:new-imported',repeat('b',64),'{"test":true}'::jsonb,'pending','imported_fixture',clock_timestamp() + interval '1 day'),
@@ -347,6 +372,9 @@ try {
   const reviewDef = (await one("select pg_get_functiondef('finance_private.shortcut_review(uuid,text,text,text,numeric,text,timestamptz)'::regprocedure) as body")).body;
   const postDef = (await one("select pg_get_functiondef('finance_private.shortcut_post(uuid,text,text,numeric,text,timestamptz)'::regprocedure) as body")).body;
   assert.match(intakeDef, /pg_advisory_xact_lock[\s\S]+revoked_at is null for update/); assertions += 1;
+  assert.match(intakeDef, /status in \('imported', 'ignored', 'test'\)[\s\S]+for update skip locked/); assertions += 1;
+  assert.match(intakeDef, /insert into finance_private\.shortcut_inbox_receipts[\s\S]+delete from public\.finance_shortcut_inbox/); assertions += 1;
+  assert.match(intakeDef, /not exists \([\s\S]+other\.fingerprint = finance_shortcut_inbox\.fingerprint/); assertions += 1;
   assert.match(listInboxDef, /order by created_at desc, id desc limit 100/); assertions += 1;
   assert.match(listInboxDef, /jsonb_agg[\s\S]+order by i\.created_at desc, i\.id desc/); assertions += 1;
   assert.match(reviewDef, /pg_advisory_xact_lock[\s\S]+for update/); assertions += 1;

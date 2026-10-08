@@ -45,6 +45,20 @@ create table if not exists public.finance_shortcut_inbox (
   check (not auto_eligible or parser_format is not null)
 );
 
+-- Keep compact replay keys after aging out reviewed inbox payloads. This table
+-- is private and has no Data API grants; rows are never pruned automatically.
+create table if not exists finance_private.shortcut_inbox_receipts (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  connection_id uuid not null,
+  event_key text not null,
+  fingerprint text not null check (fingerprint ~ '^[0-9a-f]{64}$'),
+  original_status text not null check (original_status in ('imported', 'ignored', 'test')),
+  archived_at timestamptz not null default clock_timestamp(),
+  primary key (user_id, connection_id, event_key),
+  unique (user_id, event_key),
+  foreign key (user_id, connection_id) references public.finance_shortcut_connections(user_id, id)
+);
+
 create index if not exists finance_shortcut_connections_owner_idx on public.finance_shortcut_connections(user_id, created_at desc);
 -- The only supported source is jkopay. Extend this key with source if another
 -- provider is introduced; each owner currently has at most one live auto feed.
@@ -53,6 +67,9 @@ create unique index if not exists finance_shortcut_one_active_auto_idx
 create index if not exists finance_shortcut_inbox_owner_idx on public.finance_shortcut_inbox(user_id, created_at desc);
 create index if not exists finance_shortcut_inbox_fingerprint_idx on public.finance_shortcut_inbox(user_id, fingerprint);
 create index if not exists finance_shortcut_inbox_owner_event_idx on public.finance_shortcut_inbox(user_id, event_key);
+create index if not exists finance_shortcut_inbox_capacity_idx
+  on public.finance_shortcut_inbox(user_id, created_at, id)
+  where status in ('imported', 'ignored', 'test');
 
 -- Bounded counters avoid scanning historical financial rows on each request.
 create table if not exists finance_private.shortcut_rate_limits (
@@ -67,6 +84,7 @@ alter table public.finance_shortcut_inbox enable row level security;
 alter table finance_private.shortcut_rate_limits enable row level security;
 revoke all on public.finance_shortcut_connections, public.finance_shortcut_inbox,
   finance_private.shortcut_rate_limits from public, anon, authenticated, service_role;
+revoke all on finance_private.shortcut_inbox_receipts from public, anon, authenticated, service_role;
 -- No direct Data API grants: list RPCs are bounded and never expose token_hash.
 drop policy if exists shortcut_owner_select on public.finance_shortcut_connections;
 create policy shortcut_owner_select on public.finance_shortcut_connections for select to authenticated using ((select auth.uid()) = user_id);
@@ -260,7 +278,8 @@ as $$
 declare owner_id uuid; connection public.finance_shortcut_connections; previous public.finance_shortcut_inbox;
   created public.finance_shortcut_inbox; rate finance_private.shortcut_rate_limits;
   received_time timestamptz := clock_timestamp(); key_to_insert text := p_event_key;
-  duplicate_id uuid; is_test boolean; is_duplicate boolean := false; cross_connection boolean := false; posted_id text;
+  receipt finance_private.shortcut_inbox_receipts; duplicate_id uuid; is_test boolean;
+  is_duplicate boolean := false; cross_connection boolean := false; posted_id text; archived_count integer;
 begin
   select user_id into owner_id from public.finance_shortcut_connections where token_hash = p_token_hash and revoked_at is null;
   if not found then raise exception 'invalid_shortcut_token' using errcode = '42501'; end if;
@@ -294,13 +313,25 @@ begin
       if previous.fingerprint <> p_fingerprint then raise exception 'event_id_payload_conflict' using errcode = '23505'; end if;
       return jsonb_build_object('status', previous.status, 'id', previous.id, 'duplicate', true);
     end if;
+    select * into receipt from finance_private.shortcut_inbox_receipts
+    where user_id = owner_id and connection_id = connection.id and event_key = p_event_key;
+    if found then
+      if receipt.fingerprint <> p_fingerprint then raise exception 'event_id_payload_conflict' using errcode = '23505'; end if;
+      return jsonb_build_object('status', receipt.original_status, 'duplicate', true, 'archived', true);
+    end if;
     -- A source/device ID may collide across connections. Keep the new proposal
     -- for manual comparison even when the payload differs; do not silently drop
     -- a different purchase or auto-post an old event after switching feeds.
     select id into duplicate_id from public.finance_shortcut_inbox
     where user_id = owner_id and connection_id <> connection.id and event_key = p_event_key
     order by created_at, id limit 1;
-    if found then is_duplicate := true; cross_connection := true; end if;
+    if found then is_duplicate := true; cross_connection := true;
+    else
+      select null::uuid into duplicate_id from finance_private.shortcut_inbox_receipts
+      where user_id = owner_id and connection_id <> connection.id and event_key = p_event_key
+      limit 1;
+      if found then is_duplicate := true; cross_connection := true; end if;
+    end if;
   else
     -- A content hash cannot distinguish a retry from two identical purchases.
     -- Preserve the additional arrival for explicit review instead of losing it.
@@ -311,7 +342,37 @@ begin
     end if;
   end if;
   if (select count(*) from public.finance_shortcut_inbox where user_id = owner_id) >= 10000
-  then raise exception 'shortcut_inbox_limit' using errcode = '54000'; end if;
+  then
+    -- Only terminal, already reviewed rows can leave the active inbox. Their
+    -- payloads are replaced by a compact replay receipt in the same transaction.
+    -- Pending items are never removed and no receipt is ever pruned.
+    with eligible as materialized (
+      select id, user_id, connection_id, event_key, fingerprint, status
+      from public.finance_shortcut_inbox
+      where user_id = owner_id and status in ('imported', 'ignored', 'test')
+        and (event_key like 'id:%' or not exists (
+          select 1 from public.finance_shortcut_inbox other
+          where other.user_id = owner_id and other.id <> finance_shortcut_inbox.id
+            and other.fingerprint = finance_shortcut_inbox.fingerprint
+        ))
+      order by created_at, id
+      limit 1
+      for update skip locked
+    ), retained as (
+      insert into finance_private.shortcut_inbox_receipts
+        (user_id, connection_id, event_key, fingerprint, original_status)
+      select user_id, connection_id, event_key, fingerprint, status from eligible
+      on conflict (user_id, connection_id, event_key) do update
+        set fingerprint = excluded.fingerprint, original_status = excluded.original_status,
+            archived_at = clock_timestamp()
+      returning user_id, connection_id, event_key
+    ), removed as (
+      delete from public.finance_shortcut_inbox i using retained r
+      where i.user_id = r.user_id and i.connection_id = r.connection_id and i.event_key = r.event_key
+      returning 1
+    ) select count(*)::integer into archived_count from removed;
+    if archived_count <> 1 then raise exception 'shortcut_inbox_limit' using errcode = '54000'; end if;
+  end if;
   insert into public.finance_shortcut_inbox(user_id, connection_id, event_key, fingerprint, payload,
     amount, merchant, occurred_at, status, reason, parser_format, auto_eligible, ambiguous_of)
   values(owner_id, connection.id, key_to_insert, p_fingerprint, p_payload,
