@@ -45,6 +45,27 @@ function protectedPath(value) {
     || /\.(?:pem|key|p12|pfx|keystore|sqlite3?|db|dump|bak)$/i.test(value);
 }
 
+function credentialUri(value) {
+  // Any authority userinfo is withheld, including opaque username-only tokens.
+  // Encoded delimiters are conservative: an ambiguous match aborts the packet.
+  // Consume each complete authority once; requiring @ in the main expression
+  // would repeatedly rescan nested encoded scheme prefixes with no userinfo.
+  const pattern = /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*(?::|%3a)(?:\/|%2f){2}([^\s/?#"'<>`\\]*)/gi;
+  let view = value;
+  for (let depth = 0; depth < 3; depth++) {
+    for (const [, authority] of view.matchAll(pattern)) {
+      if (/@|%40/i.test(authority)) return true;
+    }
+    if (depth === 2) break;
+    view = view.replace(/\\(?:\\|\/|u([a-f0-9]{4})|x([a-f0-9]{2}))/gi,
+      (match, unicode, hex) => unicode || hex ? String.fromCharCode(parseInt(unicode ?? hex, 16)) : match.slice(1));
+    // Keep escaped path/query/fragment delimiters inside userinfo intact.
+    // A malformed, unrelated percent escape cannot disable the whole scan.
+    view = view.replace(/%([a-f0-9]{2})/gi, (match, hex) => /^(?:2f|3f|23)$/i.test(hex) ? match : String.fromCharCode(parseInt(hex, 16)));
+  }
+  return false;
+}
+
 function checkText(bytes, label, max = MAX_FILE) {
   if (bytes.length > max) fail(`Oversized evidence: ${label}`);
   let value;
@@ -57,9 +78,8 @@ function checkText(bytes, label, max = MAX_FILE) {
     /\bnpm_[A-Za-z0-9_-]{20,}\b/,
     /\bBearer\s+[A-Za-z0-9._~-]{20,}/i,
     /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
-    /https?:\/\/[^\s/:]+:[^\s/@]+@/i,
   ];
-  if (patterns.some(pattern => pattern.test(value))) fail(`Suspected secret in ${label}; content withheld.`);
+  if (patterns.some(pattern => pattern.test(value)) || credentialUri(value)) fail(`Suspected secret in ${label}; content withheld.`);
   const npmAuthAssignments = value.matchAll(/^\s*(?:\/\/[^\s=]+:)?_authToken\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))/gim);
   for (const [, doubleQuoted, singleQuoted, bare] of npmAuthAssignments) {
     const credential = doubleQuoted ?? singleQuoted ?? bare ?? '';
@@ -94,7 +114,10 @@ function readFile(file, label, max, sourcePath) {
   const info = fs.lstatSync(resolved);
   if (!info.isFile() || info.nlink > 1 || info.size > (max ?? MAX_FILE)) fail(`Unsafe or oversized file: ${label}`);
   const bytes = fs.readFileSync(resolved);
-  return { text: sourcePath ? sourceText(bytes, sourcePath, label) : checkText(bytes, label, max), sha256: hash(bytes), bytes: bytes.length };
+  return { text: sourcePath ? sourceText(bytes, sourcePath, label) : checkText(bytes, label, max), sha256: hash(bytes), bytes: bytes.length,
+    // The pinned 40-character commit contract uses Git's SHA-1 blob identity.
+    // Hash the same original bytes that were scanned, without clean filters.
+    ...(sourcePath ? { gitBlobObjectId: createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') } : {}) };
 }
 
 function sourceText(bytes, file, label) {
@@ -145,7 +168,8 @@ export function captureSource({ root, base, files }) {
   const tracked = new Set(index.keys());
   const baseline = new Map(nulList(git(root, ['ls-tree', '-r', '-z', baseCommit])).map(entry => {
     const [metadata, file] = entry.split('\t');
-    return [file, metadata.split(' ')[0]];
+    const [mode, _type, objectId] = metadata.split(' ');
+    return [file, { mode, objectId }];
   }));
   const untracked = new Set(nulList(git(root, ['ls-files', '--others', '--exclude-standard', '-z'])));
   const selectedSet = new Set(selected);
@@ -154,14 +178,17 @@ export function captureSource({ root, base, files }) {
     ...nulList(git(root, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--'])),
   ];
   const omitted = [...new Set([...changed, ...untracked])].filter(file => !selectedSet.has(file) && !protectedPath(file)).sort();
-  if (omitted.length) fail(`Stale or incomplete scope: allowlist omits changed/untracked files: ${omitted.slice(0, 20).join(', ')}`);
+  if (omitted.length) {
+    const labels = checkText(Buffer.from(omitted.slice(0, 20).join(', ')), 'omitted path metadata');
+    fail(`Stale or incomplete scope: allowlist omits changed/untracked files: ${labels}`);
+  }
   const entries = selected.map(file => {
-    if (protectedPath(file)) fail(`Protected path cannot be included: ${file}`);
+    if (protectedPath(file)) fail(`Protected path cannot be included: ${checkText(Buffer.from(file), 'selected path metadata')}`);
     const absolute = safeAbsolute(path.join(root, file));
     if (!within(root, absolute)) fail('Path escaped the authorized root.');
     const exists = fs.existsSync(absolute);
-    if (exists && !tracked.has(file)) fail(`Untracked source must be reviewed and staged first: ${file}`);
-    if (!exists && !baseline.has(file)) fail(`Missing source: ${file}`);
+    if (exists && !tracked.has(file)) fail(`Untracked source must be reviewed and staged first: ${checkText(Buffer.from(file), 'selected path metadata')}`);
+    if (!exists && !baseline.has(file)) fail(`Missing source: ${checkText(Buffer.from(file), 'selected path metadata')}`);
     const current = exists ? readFile(absolute, 'selected source', file === 'package-lock.json' ? MAX_NPM_LOCKFILE : MAX_FILE, file) : null;
     if (current) {
       // Git's executable bit follows owner execute, even with core.fileMode=false.
@@ -170,9 +197,15 @@ export function captureSource({ root, base, files }) {
     let before = null;
     if (baseline.has(file)) {
       const bytes = git(root, ['show', `${baseCommit}:${file}`]);
-      before = { text: sourceText(bytes, file, 'baseline source'), sha256: hash(bytes), bytes: bytes.length, gitMode: baseline.get(file) };
+      before = { text: sourceText(bytes, file, 'baseline source'), sha256: hash(bytes), bytes: bytes.length, gitMode: baseline.get(file).mode };
     }
-    return { path: file, before, current, index: index.get(file) ?? null };
+    const staged = index.get(file) ?? null;
+    // Every stage-0 body must already be represented by a fully scanned source
+    // section. A third partial-staging body is never accepted as opaque evidence.
+    if (staged && staged.objectId !== baseline.get(file)?.objectId && staged.objectId !== current?.gitBlobObjectId) {
+      fail('Unrepresented index contents: stage the reviewed working bytes or restore the pinned baseline index; content withheld.');
+    }
+    return { path: file, before, current, index: staged };
   });
   const exclusions = [...new Set([...tracked, ...baseline.keys(), ...untracked])].filter(file => !selectedSet.has(file)).sort().map(file => ({
     path: file,

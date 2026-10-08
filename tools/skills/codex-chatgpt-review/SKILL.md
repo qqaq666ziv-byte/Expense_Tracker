@@ -114,6 +114,10 @@ try {
 
 工具綁定：完整 base/head SHA、目前實際檔案位元組的 SHA-256（含 dirty tracked 變更）、基準與目前 executable mode、index mode 與 blob ID、Git working status、明確選檔與 Git 可見排除清單的 scopeDigest、每次重算的累積 diff、基準／目前完整來源、真實命令輸出雜湊。sourceDigest 也包含 mode、index、status 與 diff 身分，因此測試前後與送審／採納前都能拒絕只改 staging、mode 或 diff 的舊證據。schema v2 不接受舊格式包，必須重新產生與審查。
 
+index 的 stage-0 內容必須與封包中已完整掃描的 pinned baseline 或目前 worktree 原始位元組相同；兩者之外的第三份 partial-staging 內容直接拒絕，不只記 blob hash 就宣稱已審查。一般未 staged tracked 編輯（index 等於 baseline）與完整 staging（index 等於 current）仍可使用。Git clean filters／換行轉換若產生未呈現的 index 位元組，也會明確拒絕；不要繞過此條件。封包呈現 baseline、current 與 base→worktree diff，沒有另行承諾被拒絕的第三份 index 內容或中間 commits。
+
+credential URI 檢查涵蓋一般 scheme 的 authority userinfo，包含 database protocols、JSON slash／ASCII escape 與最多兩層 percent／JSON 混合編碼。不只檢查 DATABASE_URL 名称；HTTP、PEM、npm 等既有檢查仍適用。username-only userinfo 或 encoded authority 有歧義時保守中止整包，可能誤攔截公開使用者名稱；不刪掉片段後繼續輸出。未編碼的 path／query／fragment 不被當成 authority。秘密偵測仍不能取代人工核對，也不保證任意層數或任意程式組裝的秘密可被辨識。
+
 拒絕漏列的非保護路徑變更、秘密格式（含 `POSTGRES_PASSWORD` 等前綴 credential key）、保護路徑、junction／symlink／hardlink、越界、二進位、無效 UTF-8、過大資料與 stale checks。一般來源與 check log 上限仍是 256 KiB；只有 repo 根目錄的 `package-lock.json` 可在 UTF-8／秘密檢查與 npm v2/v3 JSON 結構核對後使用 512 KiB 上限，完整來源、diff、雜湊與 4 MiB 總封包上限照常適用，不因 lockfile 過大而漏列它。被 Git 忽略或受保護的私人檔案內容完全不讀，其內容變化不在 scopeDigest 的保證內；若此限制使必要驗收無法成立，狀態是缺證據。
 
 ## INIT → PLAN → EXECUTED → REVIEW → 修正／交付

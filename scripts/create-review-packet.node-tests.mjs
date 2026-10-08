@@ -157,6 +157,7 @@ test('refuses secrets in current source, historical source and verification logs
   const unsafeBase = f.git(['rev-parse', 'HEAD']).trim();
   fs.writeFileSync(path.join(f.root, 'example.js'), 'safe\n');
   assert.throws(() => captureSource({ ...f.options, base: unsafeBase }), /Suspected secret/);
+  f.git(['reset', f.options.base, '--', 'example.js']);
   const { metadataPath, metadata } = check(f);
   fs.writeFileSync(metadata.outputFile, secret);
   assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected secret/);
@@ -256,6 +257,107 @@ test('allows private-key placeholders and exact environment references', t => {
   for (const expression of ['"<redacted>"', '"[REDACTED]"', '"${GOOGLE_PRIVATE_KEY}"', '"env(GOOGLE_PRIVATE_KEY)"',
     'Deno.env.get("GOOGLE_PRIVATE_KEY");', 'process.env.GOOGLE_PRIVATE_KEY;']) {
     fs.writeFileSync(path.join(f.root, 'example.js'), ['private_key', ' = ', expression, '\n'].join(''));
+    assert.doesNotThrow(() => captureSource(f.options));
+  }
+});
+
+function credentialUris() {
+  const credential = ['synthetic', 'uri', 'credential', '0123456789'].join('-');
+  const authority = `fixture-user:${credential}@db.example.invalid`;
+  const protocols = ['http', 'https', 'postgres', 'postgresql', 'mysql', 'mariadb', 'mongodb', 'mongodb+srv',
+    'redis', 'rediss', 'amqp', 'amqps', 'ftp', 'ftps', 'sftp', 'ssh', 'ws', 'wss', 'custom+db'];
+  const uri = ['postgresql', '://', authority, '/fixture'].join('');
+  return { credential, values: [
+    ...protocols.map(protocol => [protocol, '://', authority, '/fixture'].join('')),
+    ['redis', '://', credential, '@cache.example.invalid/0'].join(''),
+    ['postgresql', '://fixture%3Auser:', credential, '%2F%40part@db.example.invalid/fixture'].join(''),
+    ['postgresql', '://fixture-user%3A', credential, '%40db.example.invalid/fixture'].join(''),
+    uri.replaceAll('/', '\\/'),
+    uri.replaceAll(':', '\\u003a').replaceAll('/', '\\u002f').replaceAll('@', '\\u0040'),
+    encodeURIComponent(uri), encodeURIComponent(encodeURIComponent(uri)),
+    [...uri].map(character => `%${character.charCodeAt(0).toString(16).padStart(2, '0')}`).join(''),
+    ["postgresql", '://fixture-user:', credential, '%2Fpart@db.example.invalid/fixture'].join(''),
+    ['postgresql', '://:', credential, '@db.example.invalid/fixture'].join(''),
+    ['postgresql', '%3A%2F%2Ffixture-user%3A', credential, '%40db.example.invalid/fixture'].join('').replaceAll('/', '\\/'),
+    ['postgresql', '://fixture-user:', credential, '%zz@db.example.invalid/fixture'].join(''),
+    ['unrelated%zz ', uri].join(''),
+  ] };
+}
+
+test('withholds credential-bearing URIs across protocols and userinfo encodings', t => {
+  const f = fixture(t);
+  const { credential, values } = credentialUris();
+  for (const uri of values) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `DATABASE_URL=${uri}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected secret/.test(error.message) && !error.message.includes(credential));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+  f.git(['commit', '-am', 'synthetic encoded URI baseline']);
+  const base = f.git(['rev-parse', 'HEAD']).trim();
+  fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
+  assert.throws(() => createPacket({ ...f.options, base }), /Suspected secret in baseline source/);
+});
+
+test('withholds credential URIs from check output and metadata', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  const { credential, values } = credentialUris();
+  for (const [index, uri] of values.entries()) {
+    fs.writeFileSync(metadata.outputFile, JSON.stringify({ database: uri }));
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected secret/.test(error.message) && !error.message.includes(credential), `synthetic URI fixture ${index}`);
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+  fs.writeFileSync(metadata.outputFile, 'safe synthetic check output\n');
+  metadata.command = ['inspect ', values[2]].join('');
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+  assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected secret in check metadata/);
+});
+
+test('withholds encoded credential URIs appearing only in cumulative diff metadata', t => {
+  const f = fixture(t);
+  const { credential } = credentialUris();
+  const name = ['postgresql', '%3A%2F%2Ffixture-user%3A', credential, '%40db.example.invalid.txt'].join('');
+  const filename = path.join(f.root, name);
+  fs.writeFileSync(filename, 'safe baseline\n');
+  f.git(['add', name]);
+  f.git(['commit', '-m', 'synthetic encoded URI path']);
+  const base = f.git(['rev-parse', 'HEAD']).trim();
+  fs.writeFileSync(filename, 'safe current\n');
+  assert.throws(() => createPacket({ ...f.options, base, files: ['example.js', name] }), error => /Suspected secret in cumulative diff/.test(error.message) && !error.message.includes(credential));
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('withholds credential URIs in omitted and untracked path errors without echoing them', t => {
+  const f = fixture(t);
+  const { credential } = credentialUris();
+  const name = ['postgresql', '%3A%2F%2Ffixture-user%3A', credential, '%40db.example.invalid.txt'].join('');
+  fs.writeFileSync(path.join(f.root, name), 'safe synthetic source\n');
+  for (const files of [['example.js'], ['example.js', name]]) {
+    assert.throws(() => createPacket({ ...f.options, files }), error => /Suspected secret/.test(error.message) && !error.message.includes(credential) && !error.message.includes(name));
+  }
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('allows credential-free URIs and fails closed on ambiguous encoded userinfo', t => {
+  const f = fixture(t);
+  for (const uri of [['postgresql', '://db.example.invalid/fixture'].join(''),
+    'https://docs.example.invalid/users/contact@example.invalid', 'https://docs.example.invalid/?email=contact@example.invalid',
+    'https://docs.example.invalid/path?fixture=user:value@example.invalid', 'mailto:public-user@example.invalid']) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `DATABASE_URL=${uri}\n`);
+    assert.doesNotThrow(() => captureSource(f.options));
+  }
+  // Username-only or fully encoded ambiguous authorities are deliberately
+  // rejected, never silently removed from an otherwise successful packet.
+  const ambiguous = ['custom+db', '%3A%2F%2Fpublic-user%40db.example.invalid'].join('');
+  fs.writeFileSync(path.join(f.root, 'example.js'), ambiguous);
+  assert.throws(() => createPacket(f.options), /Suspected secret/);
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('scans bounded long scheme-like text without repeated suffix backtracking', { timeout: 10000 }, t => {
+  const f = fixture(t);
+  for (const value of ['x'.repeat(250000), 'a+.-'.repeat(62500), 'x%3a%2f%2f_'.repeat(20000)]) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), value);
     assert.doesNotThrow(() => captureSource(f.options));
   }
 });
@@ -369,6 +471,7 @@ test('withholds prefixed credentials from historical source, logs and check meta
   const unsafeBase = f.git(['rev-parse', 'HEAD']).trim();
   fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
   assert.throws(() => createPacket({ ...f.options, base: unsafeBase }), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(synthetic));
+  f.git(['reset', f.options.base, '--', 'example.js']);
   const { metadata, metadataPath } = check(f);
   for (const output of [assignment, `+${assignment}`, `$env:POSTGRES_PASSWORD = "${synthetic}"\n`]) {
     fs.writeFileSync(metadata.outputFile, output);
@@ -568,22 +671,83 @@ test('rejects stage and unstage of unchanged working bytes', t => {
   assert.throws(() => verifyPacket({ root: f.root, directory: staged.output }), /Stale/);
 });
 
-test('binds index blob IDs when working bytes, status and cumulative diff remain the same', t => {
+test('rejects unrepresented index blobs even when working bytes, status and cumulative diff remain the same', t => {
+  const f = fixture(t);
+  const filename = path.join(f.root, 'example.js');
+  const packet = createPacket(f.options);
+  let beforeStatus;
+  for (const amount of [2, 3]) {
+    fs.writeFileSync(filename, `export const amount = ${amount};\n`);
+    f.git(['add', 'example.js']);
+    fs.writeFileSync(filename, 'export const amount = 1;\n');
+    const status = f.git(['status', '--porcelain=v1', '--untracked-files=no']);
+    if (beforeStatus) assert.equal(status, beforeStatus);
+    beforeStatus = status;
+    assert.equal(f.git(['diff', f.options.base, '--', 'example.js']), '');
+    assert.throws(() => captureSource(f.options), /Unrepresented index contents/);
+    assert.throws(() => createPacket({ ...f.options, out: path.join(f.temp, `hidden-stage-${amount}`) }), /Unrepresented index contents/);
+    assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /Unrepresented index contents|Stale/);
+  }
+});
+
+test('rejects hidden staged credentials and partial staging without publishing their contents', t => {
+  const f = fixture(t);
+  const { metadataPath } = check(f);
+  const filename = path.join(f.root, 'example.js');
+  const { values, credential } = credentialUris();
+  for (const staged of [`DATABASE_URL=${values[2]}\n`, 'export const amount = 2;\n']) {
+    fs.writeFileSync(filename, staged);
+    f.git(['add', 'example.js']);
+    for (const working of ['export const amount = 1;\n', 'export const amount = 3;\n']) {
+      fs.writeFileSync(filename, working);
+      assert.throws(() => createPacket(f.options), error => /Unrepresented index contents/.test(error.message) && !error.message.includes(credential));
+      assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Unrepresented index contents/);
+      assert.equal(fs.existsSync(f.options.out), false);
+    }
+  }
+});
+
+test('allows fully represented baseline or current index contents, including original BOM bytes', t => {
+  const f = fixture(t);
+  const filename = path.join(f.root, 'example.js');
+  fs.writeFileSync(filename, 'export const amount = 2;\n');
+  const unstaged = createPacket(f.options);
+  assert.equal(verifyPacket({ root: f.root, directory: unstaged.output }).valid, true);
+  const bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('export const amount = 3;\n')]);
+  fs.writeFileSync(filename, bom);
+  f.git(['add', 'example.js']);
+  const staged = createPacket({ ...f.options, out: path.join(f.temp, 'fully-staged') });
+  assert.equal(verifyPacket({ root: f.root, directory: staged.output }).valid, true);
+  f.git(['reset', '--', 'example.js']);
+  assert.throws(() => verifyPacket({ root: f.root, directory: staged.output }), /Stale/);
+});
+
+test('rejects staged additions and deleted working files whose index content is unrepresented', t => {
+  const f = fixture(t);
+  const added = path.join(f.root, 'added.js');
+  fs.writeFileSync(added, 'export const amount = 2;\n');
+  f.git(['add', 'added.js']);
+  fs.writeFileSync(added, 'export const amount = 3;\n');
+  assert.throws(() => createPacket({ ...f.options, files: ['example.js', 'added.js'] }), /Unrepresented index contents/);
+  f.git(['reset', '--', 'added.js']);
+  fs.unlinkSync(added);
+  fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 2;\n');
+  f.git(['add', 'example.js']);
+  fs.unlinkSync(path.join(f.root, 'example.js'));
+  assert.throws(() => createPacket(f.options), /Unrepresented index contents/);
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('rejects normalized index bytes when actual current bytes and baseline do not represent them', t => {
   const f = fixture(t);
   const filename = path.join(f.root, 'example.js');
   fs.writeFileSync(filename, 'export const amount = 2;\n');
   f.git(['add', 'example.js']);
-  fs.writeFileSync(filename, 'export const amount = 1;\n');
-  const before = captureSource(f.options);
-  const packet = createPacket(f.options);
-  fs.writeFileSync(filename, 'export const amount = 3;\n');
-  f.git(['add', 'example.js']);
-  fs.writeFileSync(filename, 'export const amount = 1;\n');
-  const after = captureSource(f.options);
-  assert.equal(after.status, before.status);
-  assert.equal(after.identity.cumulativeDiffSha256, before.identity.cumulativeDiffSha256);
-  assert.notEqual(after.identity.sourceDigest, before.identity.sourceDigest);
-  assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /Stale/);
+  f.git(['config', 'core.autocrlf', 'true']);
+  fs.writeFileSync(filename, 'export const amount = 2;\r\n');
+  assert.equal(f.git(['diff', '--', 'example.js']), '');
+  assert.throws(() => createPacket(f.options), /Unrepresented index contents/);
+  assert.equal(fs.existsSync(f.options.out), false);
 });
 
 test('rejects omitted index-only mode and blob changes', t => {
@@ -631,6 +795,25 @@ test('rejects index changes while building a packet before writing output', t =>
     return bytes;
   });
   assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Source changed while building/);
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('rejects a third staged blob introduced during packet capture with unchanged worktree bytes', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  const read = fs.readFileSync;
+  const filename = path.join(f.root, 'example.js');
+  t.mock.method(fs, 'readFileSync', function (file, ...args) {
+    const bytes = read.call(fs, file, ...args);
+    if (file === metadata.outputFile) {
+      const original = read.call(fs, filename);
+      fs.writeFileSync(filename, 'export const hidden = 2;\n');
+      f.git(['add', 'example.js']);
+      fs.writeFileSync(filename, original);
+    }
+    return bytes;
+  });
+  assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Unrepresented index contents/);
   assert.equal(fs.existsSync(f.options.out), false);
 });
 
