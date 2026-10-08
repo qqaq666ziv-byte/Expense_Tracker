@@ -33,7 +33,7 @@ function makeApi(connections = [connection], notices: ShortcutInboxItem[] = [not
     listConnections: vi.fn(async () => connections),
     listInbox: vi.fn(async () => notices),
     listPending: vi.fn(async () => ({ items: notices.filter((item) => item.status === 'pending'), pending_count: notices.filter((item) => item.status === 'pending').length,
-      has_more: false, next_created_at: null, next_id: null })),
+      has_more: false, next_created_at: null as string | null, next_id: null as string | null })),
     create: vi.fn(async () => connection),
     revoke: vi.fn(async () => undefined),
     configure: vi.fn(async () => connection),
