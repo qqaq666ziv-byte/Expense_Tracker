@@ -93,6 +93,25 @@ describe('shortcut API owner and credential boundaries', () => {
     await expect(api.listInbox('owner-a')).rejects.toMatchObject({ kind: 'request' });
   });
 
+  it('requests a bounded pending keyset page and validates its contract', async () => {
+    const { api, fetcher } = setup();
+    const item = { id: 'pending-a', connection_id: 'connection-a', amount: 12, merchant: 'Synthetic', occurred_at: null,
+      status: 'pending', transaction_id: null, reason: 'review', payload: {}, created_at: '2026-01-01T00:00:00Z' };
+    fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ items: [item], pending_count: 125, has_more: true,
+      next_created_at: item.created_at, next_id: item.id })));
+    const page = await api.listPending('owner-a', null);
+    expect(page.items).toHaveLength(1);
+    expect(page.pending_count).toBe(125);
+    const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toContain('finance_shortcut_list_pending');
+    expect(JSON.parse(String(init.body))).toEqual({
+      p_before_created_at: null, p_before_id: null, p_limit: 100,
+    });
+    fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ items: [], pending_count: 125, has_more: true,
+      next_created_at: null, next_id: null })));
+    await expect(api.listPending('owner-a', { created_at: item.created_at, id: item.id })).rejects.toMatchObject({ kind: 'request' });
+  });
+
   it('reports network failures without leaking their text', async () => {
     const { api, fetcher } = setup();
     fetcher.mockRejectedValueOnce(new Error('private network details'));

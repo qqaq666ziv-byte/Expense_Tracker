@@ -1,5 +1,5 @@
 import { isBrowserSafeSupabaseKey, supabase } from '../../lib/supabaseClient';
-import type { ShortcutApi, ShortcutConnection, ShortcutInboxItem, ShortcutInboxStatus } from './types';
+import type { ShortcutApi, ShortcutConnection, ShortcutInboxItem, ShortcutInboxStatus, ShortcutPendingPage, ShortcutPendingCursor } from './types';
 
 export class ShortcutApiError extends Error {
   constructor(readonly kind: 'unavailable' | 'auth' | 'network' | 'request' | 'stable-event-id-required' | 'active-auto-connection') {
@@ -92,6 +92,17 @@ function rows<T>(value: unknown, decode: (item: unknown) => T): T[] {
   return value.map(decode);
 }
 
+function pendingPage(value: unknown): ShortcutPendingPage {
+  const row = record(value);
+  const count = Number(row.pending_count);
+  if (!Number.isSafeInteger(count) || count < 0 || typeof row.has_more !== 'boolean') throw new ShortcutApiError('request');
+  const nextCreated = nullableText(row.next_created_at);
+  const nextId = nullableText(row.next_id);
+  if (row.has_more && (!nextCreated || !nextId)) throw new ShortcutApiError('request');
+  return { items: rows(row.items, inbox), pending_count: count, has_more: row.has_more,
+    next_created_at: nextCreated, next_id: nextId };
+}
+
 export function createShortcutApi(dependencies: ApiDependencies): ShortcutApi {
   const baseUrl = serviceUrl(dependencies.url);
   async function call(ownerId: string, name: string, parameters: Record<string, unknown> = {}): Promise<unknown> {
@@ -144,6 +155,9 @@ export function createShortcutApi(dependencies: ApiDependencies): ShortcutApi {
     endpoint: baseUrl ? `${baseUrl}/functions/v1/finance-shortcut-receive` : null,
     listConnections: async (ownerId) => rows(await call(ownerId, 'finance_shortcut_list_connections'), connection),
     listInbox: async (ownerId) => rows(await call(ownerId, 'finance_shortcut_list_inbox'), inbox),
+    listPending: async (ownerId, cursor: ShortcutPendingCursor | null) => pendingPage(await call(ownerId, 'finance_shortcut_list_pending', {
+      p_before_created_at: cursor?.created_at ?? null, p_before_id: cursor?.id ?? null, p_limit: 100,
+    })),
     create: async (ownerId, label, tokenHash) => connection(single(await call(ownerId, 'finance_shortcut_create', { p_label: label, p_token_hash: tokenHash }))),
     revoke: async (ownerId, id) => { await call(ownerId, 'finance_shortcut_revoke', { p_id: id }); },
     configure: async (ownerId, configuration) => {

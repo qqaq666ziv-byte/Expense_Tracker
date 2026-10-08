@@ -162,10 +162,23 @@ test('refuses secrets in current source, historical source and verification logs
 
 test('refuses bare shortcut and Supabase secret credentials without an Authorization header', t => {
   const f = fixture(t);
-  for (const credential of ['shiba_sc_' + 'b'.repeat(64), 'sb_secret_' + 'z'.repeat(32)]) {
+  for (const credential of ['shiba_sc_' + 'b'.repeat(64), 'sb_secret_' + 'z'.repeat(32), 'npm_' + 'x'.repeat(32),
+    '//registry.npmjs.org/:_authToken=npm_' + 'y'.repeat(32), `_authToken="npm_${'z'.repeat(32)}"`]) {
     fs.writeFileSync(path.join(f.root, 'example.js'), credential);
     assert.throws(() => captureSource(f.options), error => /Suspected secret/.test(error.message) && !error.message.includes(credential));
+    fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
   }
+  for (const filename of ['.npmrc', '.npmrc.local']) {
+    const protectedFile = path.join(f.root, filename);
+    fs.writeFileSync(protectedFile, `//registry.npmjs.org/:_authToken=npm_${'q'.repeat(32)}\n`);
+    f.git(['add', filename]);
+    assert.throws(() => captureSource({ ...f.options, files: [filename] }), /Protected path/);
+    assert.equal(captureSource(f.options).exclusions.find((item) => item.path === filename)?.reason, 'protected-path-content-not-read');
+    fs.rmSync(protectedFile);
+    f.git(['reset', '--', filename]);
+  }
+  fs.writeFileSync(path.join(f.root, 'example.js'), '_authToken=${NPM_TOKEN}\n');
+  assert.doesNotThrow(() => captureSource(f.options));
   assert.equal(fs.existsSync(f.options.out), false);
 });
 
@@ -186,7 +199,7 @@ test('allows exact Supabase env references while rejecting malformed references 
     'env( SUPABASE_SECRET)', 'env(SUPABASE_SECRET=actual)', 'actual-secret-value-12345',
   ]) {
     fs.writeFileSync(configFile, `secret = "${malformed}"\n`);
-    assert.throws(() => captureSource(options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(malformed));
+    assert.throws(() => captureSource(options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(malformed), malformed);
   }
 });
 

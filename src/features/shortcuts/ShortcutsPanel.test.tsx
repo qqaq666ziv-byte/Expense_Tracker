@@ -29,6 +29,8 @@ function makeApi(connections = [connection], notices: ShortcutInboxItem[] = [not
     endpoint: 'https://example.invalid/functions/v1/finance-shortcut-receive',
     listConnections: vi.fn(async () => connections),
     listInbox: vi.fn(async () => notices),
+    listPending: vi.fn(async () => ({ items: notices.filter((item) => item.status === 'pending'), pending_count: notices.filter((item) => item.status === 'pending').length,
+      has_more: false, next_created_at: null, next_id: null })),
     create: vi.fn(async () => connection),
     revoke: vi.fn(async () => undefined),
     configure: vi.fn(async () => connection),
@@ -102,6 +104,7 @@ describe('iPhone shortcuts panel', () => {
     const first = deferred<ShortcutInboxItem[]>();
     const api = makeApi();
     api.listInbox.mockImplementationOnce(() => first.promise).mockResolvedValue([]);
+    api.listPending.mockResolvedValue({ items: [], pending_count: 0, has_more: false, next_created_at: null, next_id: null });
     const user = userEvent.setup();
     const view = render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} />);
     view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={vi.fn()} />);
@@ -289,6 +292,37 @@ describe('iPhone shortcuts panel', () => {
     expect(await screen.findByText(/此筆已在雲端入帳；本機帳本尚未更新/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '確認入帳' })).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain('private sync details');
+  });
+
+  it('syncs imported notifications discovered by refresh once and coalesces repeated refreshes', async () => {
+    const imported = { ...notice, status: 'imported' as const, transaction_id: 'transaction-refresh' };
+    const api = makeApi([], [imported]);
+    const onSync = vi.fn(async () => undefined);
+    const { user } = await openInbox(api, onSync);
+    expect(onSync).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(onSync).toHaveBeenCalledTimes(1);
+    expect(api.listPending).toHaveBeenCalled();
+  });
+
+  it('keeps imported recent results and exposes older pending items with a server exact count', async () => {
+    const recentImported = { ...notice, id: 'recent-import', status: 'imported' as const, transaction_id: 'tx-recent' };
+    const oldPending = { ...notice, id: 'old-pending', merchant: 'Old pending service' };
+    const api = makeApi([], [recentImported]);
+    api.listPending.mockResolvedValueOnce({ items: [oldPending], pending_count: 127, has_more: true,
+      next_created_at: oldPending.created_at, next_id: oldPending.id }).mockResolvedValueOnce({
+      items: [{ ...oldPending, id: 'older-pending', merchant: 'Older service' }], pending_count: 127, has_more: false,
+      next_created_at: null, next_id: null,
+    });
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: /通知收件匣/ }));
+    expect(await screen.findByText('Example Services', { selector: 'h3' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /通知收件匣 \(127\)/ })).toBeInTheDocument();
+    expect(screen.getByText('Old pending service', { selector: 'h3' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '載入更多待確認項目' }));
+    expect(screen.getByText('Older service', { selector: 'h3' })).toBeInTheDocument();
+    expect(screen.getByText('Example Services', { selector: 'h3' })).toBeInTheDocument();
   });
 
   it('does not sync an old owner after their in-flight approval completes', async () => {

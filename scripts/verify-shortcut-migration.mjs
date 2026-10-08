@@ -10,6 +10,7 @@ const migrationDirectory = resolve(dirname(fileURLToPath(import.meta.url)), '../
 const files = (await readdir(migrationDirectory)).filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name)).sort();
 const sources = await Promise.all(files.map((name) => readFile(resolve(migrationDirectory, name), 'utf8')));
 const shortcutSql = sources[files.findIndex((name) => name.endsWith('_finance_shortcut_inbox.sql'))];
+const latestMigrationSql = sources.at(-1);
 assert.ok(shortcutSql, 'shortcut migration exists');
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
@@ -73,6 +74,7 @@ try {
   `);
   await db.exec(sources.join('\n'));
   await db.exec(shortcutSql);
+  await db.exec(latestMigrationSql);
   equal((await one("select count(*)::integer count from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname like 'finance_shortcut_%' and c.relkind='r' and c.relrowsecurity")).count, 2, 'both public tables have RLS after retry');
   const permissions = await one(`select
     has_table_privilege('authenticated','public.finance_shortcut_connections','SELECT') as direct_connection_read,
@@ -172,7 +174,21 @@ try {
   equal(await txCount(), beforeAuto + 1, 'auto creates exactly one row');
   equal((await receive(strictEvent('auto-1'))).duplicate, true, 'auto retry remains idempotent');
   equal(await txCount(), beforeAuto + 1, 'auto retry does not create another row');
-  await rejects(() => receive(strictEvent('auto-1', { fingerprint: sha('different-body') })), /event_id_payload_conflict/, 'same source ID with changed payload is rejected');
+  const activeConflictBefore = await one('select minute_count,day_count from finance_private.shortcut_rate_limits where user_id=$1', [A]);
+  equal(await receive(strictEvent('auto-1', { fingerprint: sha('different-body') })), { error: 'event_id_payload_conflict' }, 'same source ID with changed payload returns a committed conflict');
+  const activeConflictAfter = await one('select minute_count,day_count from finance_private.shortcut_rate_limits where user_id=$1', [A]);
+  equal(Number(activeConflictAfter.minute_count), Number(activeConflictBefore.minute_count) + 1, 'active conflict consumes minute quota');
+  equal(Number(activeConflictAfter.day_count), Number(activeConflictBefore.day_count) + 1, 'active conflict consumes daily quota');
+  await db.query(`update finance_private.shortcut_rate_limits set minute_start=date_trunc('minute',clock_timestamp()),minute_count=28,
+    day_start=date_trunc('day',clock_timestamp() at time zone 'UTC') at time zone 'UTC',day_count=28 where user_id=$1`, [A]);
+  equal((await receive(strictEvent('auto-1', { fingerprint: sha('conflict-near-minute-limit-1') }))).error,
+    'event_id_payload_conflict', 'first repeated conflict below threshold remains a conflict');
+  equal((await receive(strictEvent('auto-1', { fingerprint: sha('conflict-near-minute-limit-2') }))).error,
+    'event_id_payload_conflict', 'second repeated conflict reaches but does not exceed threshold');
+  equal((await receive(strictEvent('auto-1', { fingerprint: sha('conflict-near-minute-limit-3') }))).error,
+    'shortcut_rate_limit', 'repeated conflicts consume quota and are eventually rate limited');
+  await db.query(`update finance_private.shortcut_rate_limits set minute_start=date_trunc('minute',clock_timestamp()),minute_count=0,
+    day_start=date_trunc('day',clock_timestamp() at time zone 'UTC') at time zone 'UTC',day_count=0 where user_id=$1`, [A]);
 
   const noId = strictEvent('no-id', { key: `fp:${sha('same-content')}`, fingerprint: sha('same-content') });
   const noIdFirst = await receive(noId);
@@ -289,8 +305,8 @@ try {
   equal(await txCount(), beforeFeedEvents + 2, 'different cross-feed payload also cannot auto-create finance');
   equal((await receive({ ...firstFeedEvent, hash: switchHash })).id, secondFeedReplay.id,
     'exact replay within the new connection returns its own prior pending proposal');
-  await rejects(() => receive({ ...firstFeedEvent, hash: switchHash, fingerprint: sha('changed-within-same-feed') }),
-    /event_id_payload_conflict/, 'same-connection changed payload remains a conflict rather than a new proposal');
+  equal(await receive({ ...firstFeedEvent, hash: switchHash, fingerprint: sha('changed-within-same-feed') }),
+    { error: 'event_id_payload_conflict' }, 'same-connection changed payload remains a conflict rather than a new proposal');
   const ambiguousProofHash = sha('synthetic-ambiguous-proof');
   const ambiguousProofConnection = await createConnection(A, ambiguousProofHash);
   const ambiguousProof = await receive({ ...firstFeedEvent, hash: ambiguousProofHash });
@@ -303,10 +319,12 @@ try {
   // Resource bounds are shared across an owner's tokens and include retries.
   await db.query(`insert into finance_private.shortcut_rate_limits values($1,date_trunc('minute',clock_timestamp()),30,date_trunc('day',clock_timestamp()),30)
     on conflict(user_id) do update set minute_start=excluded.minute_start,minute_count=30,day_start=excluded.day_start,day_count=30`, [A]);
-  await rejects(() => receive(event('rate-limit', { hash: sha('synthetic-second-credential') })), /shortcut_rate_limit/, 'minute quota enforced');
+  equal(await receive(event('rate-limit', { hash: sha('synthetic-second-credential') })), { error: 'shortcut_rate_limit' }, 'minute quota enforced with a committed denial');
+  equal(Number((await one('select minute_count from finance_private.shortcut_rate_limits where user_id=$1', [A])).minute_count), 31, 'rate-limited attempt is metered');
   await db.query(`update finance_private.shortcut_rate_limits set minute_start=date_trunc('minute',clock_timestamp()),minute_count=0,
     day_start=date_trunc('day',clock_timestamp() at time zone 'UTC') at time zone 'UTC',day_count=300 where user_id=$1`, [A]);
-  await rejects(() => receive(event('daily-limit', { hash: sha('synthetic-second-credential') })), /shortcut_rate_limit/, 'daily quota enforced');
+  equal(await receive(event('daily-limit', { hash: sha('synthetic-second-credential') })), { error: 'shortcut_rate_limit' }, 'daily quota enforced with a committed denial');
+  equal(Number((await one('select day_count from finance_private.shortcut_rate_limits where user_id=$1', [A])).day_count), 301, 'daily-denied attempt is metered');
   for (let i = 0; i < 4; i += 1) await createConnection(B, sha(`synthetic-b-${i}`));
   await rejects(() => createConnection(B, sha('synthetic-over-limit')), /connection_limit/, 'active connection quota enforced');
 
@@ -346,9 +364,8 @@ try {
     payload: { version: 1, source: 'jkopay', title: 'fixture', text: 'terminal', test: false } }));
   equal(replayReceipt, { status: 'ignored', id: archivedFixture.inbox_id, duplicate: true, archived: true },
     'replay of an archived reviewed event remains deduplicated');
-  await rejects(() => receive(event('archived-replay-conflict', { hash: hashB, key: archivedFixture.event_key,
-    fingerprint: sha('changed archived payload') })),
-  /event_id_payload_conflict/, 'archived replay with changed payload is rejected');
+  equal(await receive(event('archived-replay-conflict', { hash: hashB, key: archivedFixture.event_key,
+    fingerprint: sha('changed archived payload') })), { error: 'event_id_payload_conflict' }, 'archived replay with changed payload is rejected and metered');
   const crossConnectionReplay = await receive(strictEvent('cross-connection-archived-replay', {
     hash: sha('synthetic-b-0'), key: archivedFixture.event_key, fingerprint: archivedFixture.fingerprint,
   }));
@@ -370,6 +387,19 @@ try {
     where user_id=$1 and event_key=$2`, [B, archivedFixture.event_key])).count,
   2, 'same owner event ID retains independent dedupe receipts for both connections');
   equal((await as('authenticated', B, 'select public.finance_shortcut_list_inbox() as result')).length, 100, 'list result is bounded to one hundred rows');
+  const pendingPage = await as('authenticated', B, 'select public.finance_shortcut_list_pending($1,$2,$3) as result', [null, null, 2]);
+  equal(pendingPage.pending_count, Number((await one("select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1 and status='pending'", [B])).count), 'pending list reports exact backlog count across the owner inbox');
+  equal(pendingPage.items.length, 2, 'pending list page is bounded');
+  equal(pendingPage.has_more, true, 'pending list exposes another page');
+  equal(new Date(pendingPage.items[0].created_at).getTime(), new Date((await one("select min(created_at) created_at from public.finance_shortcut_inbox where user_id=$1 and status='pending'", [B])).created_at).getTime(),
+    'pending page starts with the oldest actionable row');
+  const secondPendingPage = await as('authenticated', B, 'select public.finance_shortcut_list_pending($1,$2,$3) as result', [pendingPage.next_created_at, pendingPage.next_id, 2]);
+  assert.ok(new Date(secondPendingPage.items[0].created_at) >= new Date(pendingPage.items.at(-1).created_at)); assertions += 1;
+  await rejects(() => as('authenticated', B, 'select public.finance_shortcut_list_pending($1,$2,$3) as result', [pendingPage.next_created_at, null, 2]),
+    /invalid_pending_cursor/, 'partial keyset cursor is rejected');
+  const ownerAPending = await as('authenticated', A, 'select public.finance_shortcut_list_pending($1,$2,$3) as result', [null, null, 100]);
+  assert.ok(ownerAPending.items.every((item) => item.connection_id !== connectionB.id), 'pending pages remain scoped to authenticated owner'); assertions += 1;
+  equal((await one("select has_function_privilege('authenticated','public.finance_shortcut_list_pending(timestamp with time zone,uuid,integer)','EXECUTE') as granted")).granted, true, 'pending RPC is explicitly granted to authenticated owners');
   await db.query(`insert into public.finance_shortcut_inbox(user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
     values($1,$2,'fixture:new-imported',repeat('b',64),'{"test":true}'::jsonb,'pending','imported_fixture',clock_timestamp() + interval '1 day'),
       ($1,$2,'fixture:new-pending-tie-a',repeat('c',64),'{"test":true}'::jsonb,'pending','pending_fixture',timestamp '2099-01-01 00:00:00+00'),

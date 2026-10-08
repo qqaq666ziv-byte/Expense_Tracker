@@ -444,6 +444,8 @@ export function useFinanceApp(
   const storageRecoveryRef = useRef<LocalStateRecovery | undefined>(initialLoad.recovery);
   const ownerGenerationRef = useRef(0);
   const syncTokenRef = useRef<{ generation: number; ownerId: string; id: symbol } | null>(null);
+  const queuedSyncRef = useRef<{ generation: number; promise: Promise<void>; resolve: () => void; reject: (reason: unknown) => void } | null>(null);
+  const syncNowRef = useRef<(() => Promise<void>) | null>(null);
   const durableOwnerRef = useRef<string>();
   const durabilityBlockedRef = useRef<string>();
   const financialWritePendingRef = useRef(false);
@@ -548,6 +550,8 @@ export function useFinanceApp(
     const generation = ownerGenerationRef.current;
     const provisional = createInitialState(nextOwnerId);
     syncTokenRef.current = null;
+    queuedSyncRef.current?.resolve();
+    queuedSyncRef.current = null;
     durableOwnerRef.current = undefined;
     durabilityBlockedRef.current = undefined;
     storageRecoveryRef.current = undefined;
@@ -625,7 +629,15 @@ export function useFinanceApp(
     const generation = ownerGenerationRef.current;
     const ownerId = activeOwnerRef.current;
     if (started.ownerId === 'guest' || started.ownerId !== ownerId) return;
-    if (syncTokenRef.current?.generation === generation) return;
+    if (syncTokenRef.current?.generation === generation) {
+      if (!queuedSyncRef.current || queuedSyncRef.current.generation !== generation) {
+        let resolve!: () => void;
+        let reject!: (reason: unknown) => void;
+        const promise = new Promise<void>((finish, fail) => { resolve = finish; reject = fail; });
+        queuedSyncRef.current = { generation, promise, resolve, reject };
+      }
+      return queuedSyncRef.current.promise;
+    }
     const token = { generation, ownerId, id: Symbol('sync') };
     syncTokenRef.current = token;
     setSyncBusy(true);
@@ -662,9 +674,21 @@ export function useFinanceApp(
       if (syncTokenRef.current === token) {
         syncTokenRef.current = null;
         setSyncBusy(false);
+        const queued = queuedSyncRef.current;
+        if (queued?.generation === generation) {
+          queuedSyncRef.current = null;
+          try {
+            await syncNowRef.current?.();
+            queued.resolve();
+          } catch (error) {
+            queued.reject(error);
+            throw error;
+          }
+        }
       }
     }
   }, [commitState]);
+  syncNowRef.current = syncNow;
 
   useEffect(() => {
     if (state.ownerId === 'guest' || authLoading || durabilityLoading) return;

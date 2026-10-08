@@ -90,6 +90,10 @@ export async function handleShortcutRequest(request: Request, dependencies: Shor
       return response(503, { error: 'shortcut_service_unavailable' });
     }
     const data = result.data as Record<string, unknown> | null;
+    if (data?.error === 'event_id_payload_conflict') return response(409, { error: 'event_id_payload_conflict' });
+    if (data?.error === 'shortcut_rate_limit' || data?.error === 'shortcut_inbox_limit') {
+      return response(429, { error: 'shortcut_limit_reached' });
+    }
     if (!data || !['pending', 'imported', 'ignored', 'test'].includes(String(data.status))
       || typeof data.id !== 'string' || typeof data.duplicate !== 'boolean') {
       return response(503, { error: 'shortcut_service_unavailable' });

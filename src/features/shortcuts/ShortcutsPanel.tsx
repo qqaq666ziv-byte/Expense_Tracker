@@ -5,7 +5,7 @@ import type { FinanceData } from '../../domain/model';
 import { parseShortcutNotification } from '../../../supabase/functions/_shared/shortcutNotification';
 import { createShortcutSecret, shortcutApi, ShortcutApiError } from './api';
 import { parseShortcutReviewAmount, reviewTimeInput, reviewTimeIso, shortcutParents, shortcutReason, SHORTCUT_TEST_TEMPLATE } from './model';
-import type { ShortcutApi, ShortcutConfiguration, ShortcutConnection, ShortcutInboxItem, ShortcutReview } from './types';
+import type { ShortcutApi, ShortcutConfiguration, ShortcutConnection, ShortcutInboxItem, ShortcutPendingCursor, ShortcutReview } from './types';
 import './shortcuts.css';
 
 export interface ShortcutsPanelProps {
@@ -38,6 +38,9 @@ function OwnerShortcutsPanel({
   const [section, setSection] = useState<Section>('setup');
   const [connections, setConnections] = useState<ShortcutConnection[]>([]);
   const [inbox, setInbox] = useState<ShortcutInboxItem[]>([]);
+  const [pendingCursor, setPendingCursor] = useState<ShortcutPendingCursor | null>(null);
+  const [pendingHasMore, setPendingHasMore] = useState(false);
+  const [pendingCount, setPendingCount] = useState(0);
   const [label, setLabel] = useState('我的 iPhone');
   const [secret, setSecret] = useState<{ connectionId: string; token: string } | null>(null);
   const [message, setMessage] = useState('');
@@ -46,6 +49,8 @@ function OwnerShortcutsPanel({
   const [loaded, setLoaded] = useState(false);
   const alive = useRef(true);
   const busyRef = useRef(false);
+  const syncedImportsRef = useRef(new Set<string>());
+  const syncingImportsRef = useRef(new Set<string>());
   const locksRef = useRef(locked);
   locksRef.current = locked;
   const parents = shortcutParents(data, ownerId, lockedAccountIds, lockedCategoryIds);
@@ -55,13 +60,46 @@ function OwnerShortcutsPanel({
     return () => { alive.current = false; };
   }, []);
 
+  const syncImported = useCallback(async (items: ShortcutInboxItem[]) => {
+    const transactionIds = [...new Set(items.filter((item) => item.status === 'imported' && item.transaction_id)
+      .map((item) => item.transaction_id!))].filter((id) => !data.transactions.some((row) => row.id === id)
+        && !syncedImportsRef.current.has(id) && !syncingImportsRef.current.has(id));
+    if (!transactionIds.length) return;
+    transactionIds.forEach((id) => syncingImportsRef.current.add(id));
+    try {
+      await onSync();
+      transactionIds.forEach((id) => syncedImportsRef.current.add(id));
+    } finally {
+      transactionIds.forEach((id) => syncingImportsRef.current.delete(id));
+    }
+  }, [data.transactions, onSync]);
+
   const refreshData = useCallback(async () => {
-    const [nextConnections, nextInbox] = await Promise.all([api.listConnections(ownerId), api.listInbox(ownerId)]);
+    const [nextConnections, nextInbox, pending] = await Promise.all([
+      api.listConnections(ownerId), api.listInbox(ownerId), api.listPending(ownerId, null),
+    ]);
     if (!alive.current) return;
     setConnections(nextConnections);
-    setInbox(nextInbox);
+    const combined = [...new Map([...pending.items, ...nextInbox].map((item) => [item.id, item])).values()];
+    setInbox(combined);
+    setPendingCount(pending.pending_count);
+    setPendingHasMore(pending.has_more);
+    setPendingCursor(pending.has_more && pending.next_created_at && pending.next_id
+      ? { created_at: pending.next_created_at, id: pending.next_id } : null);
     setLoaded(true);
-  }, [api, ownerId]);
+    await syncImported(nextInbox);
+  }, [api, ownerId, syncImported]);
+
+  const loadMorePending = useCallback(async () => {
+    if (!pendingCursor || !pendingHasMore) return;
+    const page = await api.listPending(ownerId, pendingCursor);
+    if (!alive.current) return;
+    setInbox((previous) => [...new Map([...previous, ...page.items].map((item) => [item.id, item])).values()]);
+    setPendingCount(page.pending_count);
+    setPendingHasMore(page.has_more);
+    setPendingCursor(page.has_more && page.next_created_at && page.next_id
+      ? { created_at: page.next_created_at, id: page.next_id } : null);
+  }, [api, ownerId, pendingCursor, pendingHasMore]);
 
   const run = useCallback(async (action: () => Promise<void>, mutation = true) => {
     if (guest || busyRef.current || (mutation && locksRef.current) || !alive.current) return;
@@ -128,6 +166,7 @@ function OwnerShortcutsPanel({
     if (result.status === 'imported') {
       try {
         await onSync();
+        if (result.transaction_id) syncedImportsRef.current.add(result.transaction_id);
       } catch {
         if (alive.current) setMessage('此筆已在雲端入帳；本機帳本尚未更新，請恢復連線後同步，勿另行新增同一筆。');
         return;
@@ -140,7 +179,6 @@ function OwnerShortcutsPanel({
     await refreshData();
   });
 
-  const pendingCount = inbox.filter((item) => item.status === 'pending').length;
   return (
     <div className="shortcut-panel">
       <section className="card shortcut-intro">
@@ -187,8 +225,9 @@ function OwnerShortcutsPanel({
       {section === 'test' && <LocalNotificationTest />}
       {section === 'inbox' && <section className="card shortcut-stack">
         <div className="section-heading"><div><p className="eyebrow">先核對，餘額才會改變</p><h2><Inbox size={21} aria-hidden="true" /> 通知收件匣</h2></div><button type="button" className="secondary-button" disabled={guest || busy} onClick={() => void run(refreshData, false)}><RefreshCw size={16} aria-hidden="true" />重新整理</button></div>
-        <p className="shortcut-muted">最多顯示最近 100 筆接收結果。只有「已入帳」會影響帳本；未收到通知或捷徑失敗時，請比對支付明細補記。</p>
+        <p className="shortcut-muted">顯示最近 100 筆接收結果及所有待確認項目（每頁最多 100 筆）。只有「已入帳」會影響帳本；未收到通知或捷徑失敗時，請比對支付明細補記。</p>
         {guest ? <p className="empty-state">登入後即可查看你的通知收件匣。</p> : !loaded ? <p className="empty-state">{busy ? '正在讀取通知…' : '尚未取得收件匣，請重新整理。'}</p> : inbox.length === 0 ? <p className="empty-state">還沒有通知。先從 iPhone 傳入一則測試，再按重新整理。</p> : inbox.map((item) => <Fragment key={`${item.id}:${item.status}`}><InboxCard item={item} parents={parents} disabled={busy || locked} onReview={review} /></Fragment>)}
+        {pendingHasMore && <button type="button" className="secondary-button" disabled={busy || guest} onClick={() => void run(loadMorePending, false)}>載入更多待確認項目</button>}
       </section>}
       {section === 'connections' && <section className="card shortcut-stack">
         <div className="section-heading"><div><p className="eyebrow">每支手機各用一組金鑰</p><h2><ShieldCheck size={21} aria-hidden="true" /> 連線管理</h2></div><button type="button" className="secondary-button" disabled={guest || busy} onClick={() => void run(refreshData, false)}><RefreshCw size={16} aria-hidden="true" />重新整理</button></div>

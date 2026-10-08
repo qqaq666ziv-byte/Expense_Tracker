@@ -44,11 +44,21 @@ export interface ShortcutReview {
   occurredAt: string | null;
 }
 
+export interface ShortcutPendingCursor { created_at: string; id: string }
+export interface ShortcutPendingPage {
+  items: ShortcutInboxItem[];
+  pending_count: number;
+  has_more: boolean;
+  next_created_at: string | null;
+  next_id: string | null;
+}
+
 /** Inject a deterministic adapter in tests; the normal adapter binds every call to its owner. */
 export interface ShortcutApi {
   endpoint: string | null;
   listConnections(ownerId: string): Promise<ShortcutConnection[]>;
   listInbox(ownerId: string): Promise<ShortcutInboxItem[]>;
+  listPending(ownerId: string, cursor: ShortcutPendingCursor | null): Promise<ShortcutPendingPage>;
   create(ownerId: string, label: string, tokenHash: string): Promise<ShortcutConnection>;
   revoke(ownerId: string, id: string): Promise<void>;
   configure(ownerId: string, configuration: ShortcutConfiguration): Promise<ShortcutConnection>;

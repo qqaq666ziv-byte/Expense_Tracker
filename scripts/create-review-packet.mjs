@@ -39,7 +39,7 @@ function relativeFile(value) {
 }
 
 function protectedPath(value) {
-  return value.split('/').some(segment => /^(?:\.env(?:\..*)?|\.git|\.ssh|\.aws|\.codex|\.ai-bridge|node_modules|private|backups?|dumps?|production-data|financial-data)$/i.test(segment))
+  return value.split('/').some(segment => /^(?:\.env(?:\..*)?|\.npmrc(?:\..*)?|\.git|\.ssh|\.aws|\.codex|\.ai-bridge|node_modules|private|backups?|dumps?|production-data|financial-data)$/i.test(segment))
     || /(?:^|\/)(?:credentials|secrets|cookies|service-account[^/]*)(?:\.[^/]*)?$/i.test(value)
     || /\.(?:pem|key|p12|pfx|keystore|sqlite3?|db|dump|bak)$/i.test(value);
 }
@@ -52,13 +52,23 @@ function checkText(bytes, label, max = MAX_FILE) {
   const patterns = [
     /^-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/m,
     /\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|shiba_sc_[0-9a-f]{64}|sb_secret_[A-Za-z0-9_-]{20,})\b/,
+    /\bnpm_[A-Za-z0-9_-]{20,}\b/,
     /\bBearer\s+[A-Za-z0-9._~-]{20,}/i,
     /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
     /https?:\/\/[^\s/:]+:[^\s/@]+@/i,
   ];
   if (patterns.some(pattern => pattern.test(value))) fail(`Suspected secret in ${label}; content withheld.`);
-  const assignments = value.matchAll(/\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|service[_-]?role[_-]?key)\b\s*[:=]\s*["']([^"'\r\n]{8,})["']/gi);
-  for (const [, credential] of assignments) {
+  const npmAuthAssignments = value.matchAll(/^\s*(?:\/\/[^\s=]+:)?_authToken\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))/gim);
+  for (const [, doubleQuoted, singleQuoted, bare] of npmAuthAssignments) {
+    const credential = doubleQuoted ?? singleQuoted ?? bare ?? '';
+    if (!/^\$\{[A-Z][A-Z0-9_]*\}$/.test(credential)
+      && !/^(?:<[^>]+>|\[REDACTED\]|(?:your|example|test|fake|placeholder|replace)[-_ ].*)$/i.test(credential)) {
+      fail(`Suspected credential assignment in ${label}; content withheld.`);
+    }
+  }
+  const assignments = value.matchAll(/\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|service[_-]?role[_-]?key)\b\s*[:=]\s*(?:"([^"\r\n]{8,})"|'([^'\r\n]{8,})'|([^\s#]{8,}))/gi);
+  for (const [, doubleQuoted, singleQuoted, bare] of assignments) {
+    const credential = doubleQuoted ?? singleQuoted ?? bare ?? '';
     // Supabase TOML env(NAME) is a reference, not the environment variable's value.
     if (/^env\([A-Z][A-Z0-9_]*\)$/.test(credential)) continue;
     if (!/^(?:<[^>]+>|\$\{[^}]+\}|\[REDACTED\]|(?:your|example|test|fake|placeholder|replace)[-_ ].*)$/i.test(credential)) fail(`Suspected credential assignment in ${label}; content withheld.`);
