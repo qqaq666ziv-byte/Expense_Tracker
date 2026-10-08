@@ -86,6 +86,56 @@ describe('iPhone shortcuts panel', () => {
     expect(localStorage.length).toBe(0);
   });
 
+  it('provides an accessible, expandable setup guide with lifecycle and troubleshooting details', async () => {
+    const api = makeApi([], []);
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    const guide = screen.getByText('展開完整教學與錯誤處理').closest('details');
+    expect(guide).toBeInTheDocument();
+    expect(guide).not.toHaveAttribute('open');
+    await user.click(screen.getByText('展開完整教學與錯誤處理'));
+    expect(guide).toHaveAttribute('open');
+    expect(guide).toHaveTextContent('完成保存前，請留在本頁');
+    expect(guide).toHaveTextContent('既有金鑰沒有閒置到期設定');
+    expect(guide).toHaveTextContent('429');
+    expect(guide).toHaveTextContent('503');
+    expect(guide).toHaveTextContent('401');
+    expect(guide).toHaveTextContent('100 筆累積連線紀錄');
+    expect(guide).toHaveTextContent('尚未在 iPhone 真機驗證');
+    expect(screen.getByText('展開完整教學與錯誤處理').closest('summary')?.tagName).toBe('SUMMARY');
+  });
+
+  it('keeps an undisplayed create key and retry action when the setup guide is collapsed again', async () => {
+    const api = makeApi([], []);
+    api.create.mockRejectedValueOnce(new Error('simulated offline'));
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    await user.click(screen.getByText('展開完整教學與錯誤處理'));
+    await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
+    await screen.findByText(/^連線結果尚未確認。/);
+    const hash = api.create.mock.calls[0][2];
+    await user.click(screen.getByText('展開完整教學與錯誤處理'));
+    expect(screen.getByRole('button', { name: '以相同金鑰重試' })).toBeInTheDocument();
+    expect(api.create.mock.calls[0][2]).toBe(hash);
+    expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '以相同金鑰重試' }));
+    expect(await screen.findByLabelText('一次性顯示的捷徑金鑰')).toBeInTheDocument();
+  });
+
+  it('keeps the one-time key when leaving and returning to setup within the same panel', async () => {
+    const api = makeApi([], []);
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
+    const field = await screen.findByLabelText('一次性顯示的捷徑金鑰');
+    const createdToken = (field as HTMLTextAreaElement).value;
+    await user.click(screen.getByRole('button', { name: '通知測試' }));
+    await user.click(screen.getByRole('button', { name: '連接 iPhone' }));
+    expect((screen.getByLabelText('一次性顯示的捷徑金鑰') as HTMLTextAreaElement).value).toBe(createdToken);
+    expect(api.create).toHaveBeenCalledTimes(1);
+  });
+
   it('creates a transient secret, sends only its hash and clears it synchronously on an owner switch', async () => {
     const api = makeApi([], []);
     const user = userEvent.setup();
@@ -110,7 +160,7 @@ describe('iPhone shortcuts panel', () => {
     render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
     await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
-    await screen.findByText(/連線結果尚未確認/);
+    await screen.findByText(/^連線結果尚未確認。/);
     const firstHash = api.create.mock.calls[0][2];
     expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
     expect(localStorage.length).toBe(0);
@@ -130,7 +180,7 @@ describe('iPhone shortcuts panel', () => {
     render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
     await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
-    await screen.findByText(/連線結果尚未確認/);
+    await screen.findByText(/^連線結果尚未確認。/);
     await user.click(screen.getByRole('button', { name: '以相同金鑰重試' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('這組金鑰所屬的連線已停用');
     expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
@@ -144,7 +194,7 @@ describe('iPhone shortcuts panel', () => {
     render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
     await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
-    await screen.findByText(/連線結果尚未確認/);
+    await screen.findByText(/^連線結果尚未確認。/);
     await user.click(screen.getByRole('button', { name: '連線管理' }));
     await user.click(screen.getByRole('button', { name: '重新整理' }));
     expect(await screen.findByText('測試手機', { selector: 'h3' })).toBeInTheDocument();

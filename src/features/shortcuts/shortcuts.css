@@ -18,6 +18,14 @@
 .shortcut-panel textarea { display: block; resize: vertical; font: inherit; min-width: 0; }
 .shortcut-panel textarea:focus-visible { outline: 3px solid rgba(217,101,18,.3); outline-offset: 3px; }
 .shortcut-panel details > summary { cursor: pointer; font-size: .83rem; color: var(--orange-dark); }
+.shortcut-guide { border-color: #e8d2b6; }
+.shortcut-guide > div h2 { margin: 0 0 6px; font-size: 1.05rem; }
+.shortcut-guide details > summary { min-height: 44px; display: flex; align-items: center; font-weight: 750; }
+.shortcut-guide-content { display: grid; gap: 10px; padding-top: 10px; }
+.shortcut-guide-content h3 { margin-top: 6px; }
+.shortcut-guide-list { margin: 0; padding-left: 22px; font-size: .84rem; line-height: 1.75; }
+.shortcut-guide-list li + li { margin-top: 8px; }
+.shortcut-guide summary:focus-visible { outline: 3px solid rgba(217,101,18,.3); outline-offset: 3px; border-radius: 5px; }
 .shortcut-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .shortcut-confirmation { display: flex; align-items: flex-start; gap: 10px; padding: 13px; border: 1px solid var(--line); border-radius: 11px; font-size: .82rem; line-height: 1.7; }
 .shortcut-confirmation input { flex-shrink: 0; margin-top: 5px; width: 17px; height: 17px; accent-color: var(--orange); }
