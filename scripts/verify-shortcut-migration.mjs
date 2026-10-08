@@ -9,9 +9,8 @@ import { PGlite } from '@electric-sql/pglite';
 const migrationDirectory = resolve(dirname(fileURLToPath(import.meta.url)), '../supabase/migrations');
 const files = (await readdir(migrationDirectory)).filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name)).sort();
 const sources = await Promise.all(files.map((name) => readFile(resolve(migrationDirectory, name), 'utf8')));
-const shortcutSql = sources[files.findIndex((name) => name.endsWith('_finance_shortcut_inbox.sql'))];
-const latestMigrationSql = sources.at(-1);
-assert.ok(shortcutSql, 'shortcut migration exists');
+assert.ok(files.some((name) => name.endsWith('_finance_shortcut_inbox.sql')), 'shortcut migration exists');
+assert.ok(files.some((name) => name.endsWith('_idempotent_shortcut_create.sql')), 'idempotent create migration exists');
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
 const sha = (text) => createHash('sha256').update(text).digest('hex');
@@ -73,8 +72,6 @@ try {
     alter default privileges for role postgres in schema public grant execute on functions to anon, authenticated, service_role;
   `);
   await db.exec(sources.join('\n'));
-  await db.exec(shortcutSql);
-  await db.exec(latestMigrationSql);
   equal((await one("select count(*)::integer count from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname like 'finance_shortcut_%' and c.relkind='r' and c.relrowsecurity")).count, 2, 'both public tables have RLS after retry');
   const permissions = await one(`select
     has_table_privilege('authenticated','public.finance_shortcut_connections','SELECT') as direct_connection_read,
@@ -101,7 +98,13 @@ try {
       ($1,'income-a','income','Income category','vector','wallet','fixture-i')`, [A, B]);
   await rejects(() => createConnection(null, hashA), /authentication_required/, 'missing owner fails closed');
   const connection = await createConnection(A, hashA);
+  equal(await createConnection(A, hashA), connection, 'lost create response retry returns same connection');
+  equal((await listConnections(A)).filter((row) => row.id === connection.id).length, 1, 'create retry does not add a connection');
   const connectionB = await createConnection(B, hashB);
+  await rejects(() => as('authenticated', A, 'select public.finance_shortcut_create($1,$2) as result', ['different label', hashA]),
+    /connection_create_conflict/, 'same token hash cannot be rebound to a different label');
+  await rejects(() => as('authenticated', B, 'select public.finance_shortcut_create($1,$2) as result', ['測試手機', hashA]),
+    /duplicate key/, 'existing credential hash cannot be disclosed to another owner');
   equal(connection.mode, 'review', 'new connection defaults to review');
   equal(connection.verified_at, null, 'new connection is unverified');
   equal('token_hash' in connection, false, 'create response never exposes credential hash');

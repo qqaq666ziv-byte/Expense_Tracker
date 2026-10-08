@@ -34,7 +34,7 @@ function makeApi(connections = [connection], notices: ShortcutInboxItem[] = [not
     listInbox: vi.fn(async () => notices),
     listPending: vi.fn(async () => ({ items: notices.filter((item) => item.status === 'pending'), pending_count: notices.filter((item) => item.status === 'pending').length,
       has_more: false, next_created_at: null as string | null, next_id: null as string | null })),
-    create: vi.fn(async () => connection),
+    create: vi.fn(async (_ownerId: string, _label: string, _tokenHash: string) => connection),
     revoke: vi.fn(async () => undefined),
     configure: vi.fn(async () => connection),
     review: vi.fn(async () => ({ status: 'imported' as const, transaction_id: 'transaction-a' })),
@@ -101,6 +101,25 @@ describe('iPhone shortcuts panel', () => {
     view.rerender(<ShortcutsPanel ownerId="guest" data={createInitialState('guest').data} api={api} onSync={successfulSync()} />);
     expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain(secret);
+  });
+
+  it('retries an uncertain create with the same in-memory token hash', async () => {
+    const api = makeApi([], []);
+    api.create.mockRejectedValueOnce(new Error('simulated network interruption'));
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
+    await screen.findByText(/連線結果尚未確認/);
+    const firstHash = api.create.mock.calls[0][2];
+    expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
+    expect(localStorage.length).toBe(0);
+    await user.click(screen.getByRole('button', { name: '以相同金鑰重試' }));
+    const field = await screen.findByLabelText('一次性顯示的捷徑金鑰');
+    expect(api.create).toHaveBeenCalledTimes(2);
+    expect(api.create.mock.calls[1][2]).toBe(firstHash);
+    expect((field as HTMLTextAreaElement).value).toMatch(/^shiba_sc_[a-f0-9]{64}$/);
+    expect(localStorage.length).toBe(0);
   });
 
   it('ignores previous-owner fetch results after an account change', async () => {

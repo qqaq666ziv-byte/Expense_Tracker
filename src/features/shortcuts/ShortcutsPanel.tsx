@@ -44,6 +44,7 @@ function OwnerShortcutsPanel({
   const [pendingCount, setPendingCount] = useState(0);
   const [label, setLabel] = useState('我的 iPhone');
   const [secret, setSecret] = useState<{ connectionId: string; token: string } | null>(null);
+  const [pendingCreate, setPendingCreate] = useState<{ label: string; token: string; tokenHash: string } | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -135,13 +136,15 @@ function OwnerShortcutsPanel({
 
   const create = (event: FormEvent) => {
     event.preventDefault();
-    if (!label.trim()) { setError('請輸入連線名稱。'); return; }
+    if (!pendingCreate && !label.trim()) { setError('請輸入連線名稱。'); return; }
     void run(async () => {
-      const generated = await createShortcutSecret();
+      const pending = pendingCreate ?? { label: label.trim(), ...await createShortcutSecret() };
       if (!alive.current || locksRef.current) return;
-      const connection = await api.create(ownerId, label.trim(), generated.tokenHash);
+      setPendingCreate(pending);
+      const connection = await api.create(ownerId, pending.label, pending.tokenHash);
       if (!alive.current) return;
-      setSecret({ connectionId: connection.id, token: generated.token });
+      setPendingCreate(null);
+      setSecret({ connectionId: connection.id, token: pending.token });
       setConnections((previous) => [connection, ...previous]);
       setMessage('連線已建立。請現在複製金鑰；離開此頁後將無法再次查看。');
     });
@@ -205,9 +208,10 @@ function OwnerShortcutsPanel({
       {section === 'setup' && <section className="card shortcut-stack">
         <div><h3>1. 建立你的連線</h3><p className="shortcut-muted">金鑰只用於此連線的通知接收，可隨時在連線管理停用。不要把金鑰貼進網址、公開捷徑或聊天。</p></div>
         <form className="shortcut-inline-form" onSubmit={create}>
-          <label className="field-label">連線名稱<input className="field" maxLength={64} autoComplete="off" value={label} onChange={(event) => setLabel(event.target.value)} disabled={guest || busy || locked} /></label>
-          <button className="primary-button" disabled={guest || busy || locked || !api.endpoint || !!secret} type="submit">{busy ? '處理中…' : '建立連線與金鑰'}</button>
+          <label className="field-label">連線名稱<input className="field" maxLength={64} autoComplete="off" value={pendingCreate?.label ?? label} onChange={(event) => setLabel(event.target.value)} disabled={guest || busy || locked || !!pendingCreate} /></label>
+          <button className="primary-button" disabled={guest || busy || locked || !api.endpoint || !!secret} type="submit">{busy ? '處理中…' : pendingCreate ? '以相同金鑰重試' : '建立連線與金鑰'}</button>
         </form>
+        {pendingCreate && <p className="warning-message">連線結果尚未確認。恢復網路後，請留在此頁並以相同金鑰重試；這個金鑰只暫存在目前頁面，離開頁面後無法恢復。</p>}
         {secret && <div className="shortcut-secret shortcut-stack">
           <label className="field-label">一次性顯示的捷徑金鑰<textarea className="field shortcut-code" readOnly value={secret.token} rows={2} spellCheck={false} autoComplete="off" /></label>
           <p>請貼入 iPhone 捷徑的 Authorization 標頭，格式為 <code>Bearer 金鑰</code>。複製後請妥善保管；忘記時需停用舊連線再建立新的。</p>
