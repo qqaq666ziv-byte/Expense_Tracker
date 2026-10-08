@@ -11,6 +11,7 @@ export async function handleShortcutReceive(request: Request): Promise<Response>
   });
   return handleShortcutRequest(request, {
     authenticate: async (hash) => admin.rpc('finance_shortcut_authenticate', { p_token_hash: hash }),
+    meterRejection: async (hash) => admin.rpc('finance_shortcut_meter_rejection', { p_token_hash: hash }),
     receive: async (parameters) => admin.rpc('finance_shortcut_receive', parameters),
   });
 }

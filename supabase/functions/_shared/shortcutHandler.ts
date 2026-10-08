@@ -7,6 +7,7 @@ export interface ShortcutRpcResult {
 
 export interface ShortcutReceiverDependencies {
   authenticate(hash: string): Promise<ShortcutRpcResult>;
+  meterRejection(hash: string): Promise<ShortcutRpcResult>;
   receive(parameters: Record<string, unknown>): Promise<ShortcutRpcResult>;
 }
 
@@ -23,9 +24,28 @@ function response(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers });
 }
 
+async function validationRejection(dependencies: ShortcutReceiverDependencies, tokenHash: string,
+  status: 400 | 413 | 415): Promise<Response> {
+  // Only the credential hash leaves this boundary. Invalid bodies are never
+  // stored, and valid requests are metered once by the existing receive RPC.
+  const result = await dependencies.meterRejection(tokenHash);
+  if (result.error?.code === '42501') return response(401, { error: 'invalid_shortcut_token' });
+  if (result.error?.code === '53300' || result.error?.code === '54000'
+    || (result.data as Record<string, unknown> | null)?.error === 'shortcut_rate_limit') {
+    return response(429, { error: 'shortcut_limit_reached' });
+  }
+  if (result.error || (result.data as Record<string, unknown> | null)?.status !== 'metered') {
+    return response(503, { error: 'shortcut_service_unavailable' });
+  }
+  return response(status, { error: status === 415 ? 'json_content_type_required' : 'invalid_shortcut_payload' });
+}
+
 async function readBoundedJson(request: Request): Promise<unknown> {
   const length = request.headers.get('content-length');
-  if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_BYTES)) throw new Error('payload_too_large');
+  if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_BYTES)) {
+    await request.body?.cancel().catch(() => {});
+    throw new Error('payload_too_large');
+  }
   if (!request.body) throw new Error('invalid_body');
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -36,7 +56,7 @@ async function readBoundedJson(request: Request): Promise<unknown> {
       if (done) break;
       total += value.byteLength;
       if (total > MAX_BYTES) {
-        await reader.cancel();
+        await reader.cancel().catch(() => {});
         throw new Error('payload_too_large');
       }
       chunks.push(value);
@@ -65,13 +85,15 @@ export async function handleShortcutRequest(request: Request, dependencies: Shor
     if (authentication.error) return response(503, { error: 'shortcut_service_unavailable' });
     if (authentication.data !== true) return response(401, { error: 'invalid_shortcut_token' });
     if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') {
-      return response(415, { error: 'json_content_type_required' });
+      await request.body?.cancel().catch(() => {});
+      return await validationRejection(dependencies, tokenHash, 415);
     }
     let payload;
     try {
       payload = validateShortcutPayload(await readBoundedJson(request));
     } catch (error) {
-      return response(error instanceof Error && error.message === 'payload_too_large' ? 413 : 400, { error: 'invalid_shortcut_payload' });
+      return await validationRejection(dependencies, tokenHash,
+        error instanceof Error && error.message === 'payload_too_large' ? 413 : 400);
     }
     const parsed = parseShortcutNotification(payload);
     const identity = await shortcutEventIdentity(payload);
@@ -86,7 +108,9 @@ export async function handleShortcutRequest(request: Request, dependencies: Shor
       if (code === '42501') return response(401, { error: 'invalid_shortcut_token' });
       if (code === '53300' || code === '54000') return response(429, { error: 'shortcut_limit_reached' });
       if (code === '23505') return response(409, { error: 'event_id_payload_conflict' });
-      if (code === '22023' || code === '23514') return response(400, { error: 'invalid_shortcut_payload' });
+      // SQL validation errors roll back the receive statement, including any
+      // quota increment. Meter that failed attempt in a fresh transaction.
+      if (code === '22023' || code === '23514') return await validationRejection(dependencies, tokenHash, 400);
       return response(503, { error: 'shortcut_service_unavailable' });
     }
     const data = result.data as Record<string, unknown> | null;

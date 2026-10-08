@@ -4,6 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
+import { handleShortcutRequest } from '../supabase/functions/_shared/shortcutHandler.ts';
 
 // In-memory PostgreSQL only: no URLs, credentials or Production connection.
 const migrationDirectory = resolve(dirname(fileURLToPath(import.meta.url)), '../supabase/migrations');
@@ -14,6 +15,9 @@ assert.ok(files.some((name) => name.endsWith('_idempotent_shortcut_create.sql'))
 const ambiguityMigrationIndex = files.findIndex((name) => name.endsWith('_shortcut_archive_ambiguity_leaves.sql'));
 assert.notEqual(ambiguityMigrationIndex, -1, 'ambiguity capacity migration exists');
 const ambiguityMigrationSql = sources[ambiguityMigrationIndex];
+const validationMeterMigrationIndex = files.findIndex((name) => name.endsWith('_shortcut_meter_validation_failures.sql'));
+assert.notEqual(validationMeterMigrationIndex, -1, 'HTTP validation quota migration exists');
+const validationMeterMigrationSql = sources[validationMeterMigrationIndex];
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
 const C = '33333333-3333-4333-8333-333333333333';
@@ -80,7 +84,7 @@ try {
   `);
   // First verify the previous PR schema, then upgrade a populated 10,000-row
   // reproduction below. This tests migration safety rather than only empty DBs.
-  await db.exec(sources.filter((_, index) => index !== ambiguityMigrationIndex).join('\n'));
+  await db.exec(sources.filter((_, index) => index !== ambiguityMigrationIndex && index !== validationMeterMigrationIndex).join('\n'));
   equal((await one("select count(*)::integer count from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname like 'finance_shortcut_%' and c.relkind='r' and c.relrowsecurity")).count, 2, 'both public tables have RLS after retry');
   const permissions = await one(`select
     has_table_privilege('authenticated','public.finance_shortcut_connections','SELECT') as direct_connection_read,
@@ -656,6 +660,201 @@ try {
   equal((await one("select count(*)::integer count from pg_constraint where conrelid='public.finance_shortcut_inbox'::regclass and contype='u'")).count, 1, 'owner/connection/event unique constraint closes duplicate race');
   equal((await one("select to_regprocedure('public.finance_shortcut_configure(uuid,text,text,text)') is null as absent")).absent,
     true, 'old four-argument configure overload cannot bypass explicit confirmation');
+
+  // Upgrade the populated database without changing the previous capacity RPC
+  // or retaining validation bodies. Exercise the real HTTP handler against the
+  // local PostgreSQL RPCs instead of using a mocked quota counter.
+  const beforeMeterUpgrade = await preservedSnapshot();
+  const beforeMeterMetadata = await one(`select
+    (select md5(string_agg(to_jsonb(c)::text,'' order by id)) from public.finance_shortcut_connections c) connections,
+    (select md5(string_agg(to_jsonb(r)::text,'' order by user_id)) from finance_private.shortcut_rate_limits r) rates`);
+  await db.exec(validationMeterMigrationSql);
+  await db.exec(validationMeterMigrationSql);
+  equal(await preservedSnapshot(), beforeMeterUpgrade, 'validation meter upgrade/reapplication preserves inbox, receipts and financial rows');
+  equal(await one(`select
+    (select md5(string_agg(to_jsonb(c)::text,'' order by id)) from public.finance_shortcut_connections c) connections,
+    (select md5(string_agg(to_jsonb(r)::text,'' order by user_id)) from finance_private.shortcut_rate_limits r) rates`),
+  beforeMeterMetadata, 'validation meter upgrade/reapplication preserves credentials, connection limits and quotas');
+  equal((await one("select pg_get_functiondef('finance_private.shortcut_receive(text,text,text,jsonb,numeric,text,timestamptz,text,boolean,text)'::regprocedure) as body")).body,
+    intakeDef, 'validation migration preserves the existing ambiguity capacity fix exactly');
+  equal(await one(`select
+    has_function_privilege('anon','public.finance_shortcut_meter_rejection(text)','EXECUTE') anon,
+    has_function_privilege('authenticated','public.finance_shortcut_meter_rejection(text)','EXECUTE') owner,
+    has_function_privilege('service_role','public.finance_shortcut_meter_rejection(text)','EXECUTE') service,
+    has_function_privilege('anon','finance_private.shortcut_meter_rejection(text)','EXECUTE') private_anon,
+    has_function_privilege('authenticated','finance_private.shortcut_meter_rejection(text)','EXECUTE') private_owner,
+    has_function_privilege('service_role','finance_private.shortcut_meter_rejection(text)','EXECUTE') private_service`),
+  { anon: false, owner: false, service: true, private_anon: false, private_owner: false, private_service: true },
+  'public/private validation meter functions are service-only despite permissive default grants');
+
+  const G = '77777777-7777-4777-8777-777777777777';
+  const H = '88888888-8888-4888-8888-888888888888';
+  await db.query('insert into auth.users(id) values($1),($2)', [G, H]);
+  const tokenG = `shiba_sc_${'b'.repeat(64)}`;
+  const tokenG2 = `shiba_sc_${'c'.repeat(64)}`;
+  const tokenG3 = `shiba_sc_${'d'.repeat(64)}`;
+  const tokenH = `shiba_sc_${'e'.repeat(64)}`;
+  const connectionG = await createConnection(G, sha(tokenG));
+  await createConnection(G, sha(tokenG2));
+  const connectionG3 = await createConnection(G, sha(tokenG3));
+  const connectionH = await createConnection(H, sha(tokenH));
+  const meter = (hash, role = 'service_role', owner = null) => as(role, owner,
+    'select public.finance_shortcut_meter_rejection($1) as result', [hash]);
+  const quota = (owner) => one('select minute_count,day_count from finance_private.shortcut_rate_limits where user_id=$1', [owner]);
+  const resetQuota = (owner, minuteCount = 0, dayCount = 0) => db.query(`
+    insert into finance_private.shortcut_rate_limits(user_id,minute_start,minute_count,day_start,day_count)
+    values($1,date_trunc('minute',clock_timestamp()),$2,date_trunc('day',clock_timestamp() at time zone 'UTC') at time zone 'UTC',$3)
+    on conflict(user_id) do update set minute_start=excluded.minute_start,minute_count=excluded.minute_count,
+      day_start=excluded.day_start,day_count=excluded.day_count`, [owner, minuteCount, dayCount]);
+  async function rpcResult(action) {
+    try { return { data: await action(), error: null }; }
+    catch (error) { return { data: null, error: { code: error.code } }; }
+  }
+  function httpDependencies(afterAuthentication = null) {
+    const calls = { authenticate: 0, meter: 0, receive: 0 };
+    return {
+      calls,
+      authenticate: async (hash) => {
+        calls.authenticate += 1;
+        const result = await rpcResult(() => as('service_role', null,
+          'select public.finance_shortcut_authenticate($1) as result', [hash]));
+        if (afterAuthentication && result.data === true) await afterAuthentication(hash);
+        return result;
+      },
+      meterRejection: async (hash) => { calls.meter += 1; return rpcResult(() => meter(hash)); },
+      receive: async (p) => {
+        calls.receive += 1;
+        return rpcResult(() => as('service_role', null,
+          'select public.finance_shortcut_receive($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) as result',
+          [p.p_token_hash,p.p_event_key,p.p_fingerprint,p.p_payload,p.p_amount,p.p_merchant,
+            p.p_occurred_at,p.p_format,p.p_auto_eligible,p.p_reason]));
+      },
+    };
+  }
+  function httpRequest(token, body = '{', mime = 'application/json', extraHeaders = {}) {
+    return new Request('https://example.invalid/synthetic-shortcut', {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': mime, ...extraHeaders }, body,
+    });
+  }
+  const validHttpBody = JSON.stringify({ version: 1, source: 'jkopay', title: 'Synthetic',
+    text: 'Synthetic HTTP to local PostgreSQL verification', test: false, eventId: 'synthetic-http-event' });
+  const httpDeps = httpDependencies();
+  const beforeHttpFinancialCount = await txCount();
+  const beforeHttpInboxCount = Number((await one('select count(*)::integer count from public.finance_shortcut_inbox')).count);
+  for (const [body, mime, extraHeaders, expectedStatus] of [
+    ['{', 'application/json', {}, 400],
+    ['{}', 'application/json', {}, 400],
+    [new Uint8Array([255]), 'application/json', {}, 400],
+    ['x', 'application/json', { 'content-length': '8193' }, 413],
+    ['x'.repeat(8193), 'application/json', {}, 413],
+    ['Synthetic non-JSON body', 'text/plain', {}, 415],
+  ]) {
+    const res = await handleShortcutRequest(httpRequest(tokenG, body, mime, extraHeaders), httpDeps);
+    equal(res.status, expectedStatus, 'actual authenticated HTTP validation failure retains its status below quota');
+    equal(await res.json(), { error: expectedStatus === 415 ? 'json_content_type_required' : 'invalid_shortcut_payload' },
+      'validation response contains no body, owner or credential data');
+  }
+  equal(await quota(G), { minute_count: 6, day_count: 6 }, 'six actual HTTP validation failures commit six shared quota charges');
+  equal(httpDeps.calls, { authenticate: 6, meter: 6, receive: 0 }, 'HTTP validation failures call only the hash-only rejection RPC');
+  equal(Number((await one('select count(*)::integer count from public.finance_shortcut_inbox')).count), beforeHttpInboxCount,
+    'authenticated invalid HTTP bodies create no inbox rows');
+  equal(await txCount(), beforeHttpFinancialCount, 'authenticated invalid HTTP bodies create no financial rows');
+
+  const normalResponse = await handleShortcutRequest(httpRequest(tokenG, validHttpBody), httpDeps);
+  equal(normalResponse.status, 200, 'normal HTTP intake still succeeds');
+  const normalResult = await normalResponse.json();
+  equal(await quota(G), { minute_count: 7, day_count: 7 }, 'normal HTTP intake increments shared quota exactly once');
+  equal(httpDeps.calls.meter, 6, 'normal HTTP intake does not double-charge via rejection meter');
+  const replayResponse = await handleShortcutRequest(httpRequest(tokenG, validHttpBody), httpDeps);
+  equal(await replayResponse.json(), { status: 'pending', id: normalResult.id, duplicate: true }, 'normal HTTP replay remains idempotent');
+  equal(await quota(G), { minute_count: 8, day_count: 8 }, 'normal replay is charged exactly once');
+  const conflictResponse = await handleShortcutRequest(httpRequest(tokenG, validHttpBody.replace('verification', 'conflict')), httpDeps);
+  equal(conflictResponse.status, 409, 'normal HTTP payload conflict keeps its status');
+  equal(await quota(G), { minute_count: 9, day_count: 9 }, 'committed normal conflict is charged exactly once');
+  equal(httpDeps.calls.meter, 6, 'replay and conflict use the existing receive quota path');
+
+  // A database constraint failure aborts the complete receive statement. The
+  // handler's new validation meter restores exactly one committed charge.
+  await db.exec(`create function pg_temp.reject_shortcut_validation() returns trigger language plpgsql as $$
+    begin raise exception 'synthetic constraint validation failure' using errcode='23514'; end $$;
+    create trigger reject_shortcut_validation before insert on public.finance_shortcut_inbox
+      for each row execute function pg_temp.reject_shortcut_validation();`);
+  const sqlFailure = await handleShortcutRequest(httpRequest(tokenG, validHttpBody.replace('synthetic-http-event', 'synthetic-sql-failure')), httpDeps);
+  await db.exec('drop trigger reject_shortcut_validation on public.finance_shortcut_inbox');
+  equal(sqlFailure.status, 400, 'HTTP SQL validation failure stays a sanitized 400');
+  equal(await quota(G), { minute_count: 10, day_count: 10 }, 'rolled-back SQL validation failure receives exactly one committed replacement charge');
+  equal(Number((await one('select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1', [G])).count), 1,
+    'failed SQL validation leaves only the one previously accepted event');
+
+  const parallelFailures = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+    handleShortcutRequest(httpRequest(index % 2 ? tokenG2 : tokenG), httpDeps)));
+  equal(parallelFailures.map((res) => res.status), Array(20).fill(400), 'interleaved malformed HTTP requests from both connections exhaust one owner quota');
+  equal(await quota(G), { minute_count: 30, day_count: 30 }, 'shared owner row records every interleaved failure without lost or double charges');
+  for (const [body, mime] of [['{', 'application/json'], ['x'.repeat(8193), 'application/json'], ['Synthetic', 'text/plain']]) {
+    const res = await handleShortcutRequest(httpRequest(tokenG2, body, mime), httpDeps);
+    equal(res.status, 429, 'malformed, oversize and MIME failures become 429 after shared quota drains');
+    equal(await res.json(), { error: 'shortcut_limit_reached' }, 'quota denial is sanitized');
+  }
+  equal(await quota(G), { minute_count: 31, day_count: 33 }, 'denied malformed attempts commit bounded quota counts');
+  const limitedNormal = await handleShortcutRequest(httpRequest(tokenG, validHttpBody), httpDeps);
+  equal(limitedNormal.status, 429, 'malformed HTTP traffic drains quota used by normal intake');
+  equal(await quota(G), { minute_count: 32, day_count: 34 }, 'denied normal receive keeps its existing single quota charge');
+  equal((await handleShortcutRequest(httpRequest(tokenH), httpDeps)).status, 400, 'another owner retains independent quota');
+  equal(await quota(H), { minute_count: 1, day_count: 1 }, 'another owner has only its own validation charge');
+
+  await resetQuota(G, 0, 300);
+  equal((await handleShortcutRequest(httpRequest(tokenG), httpDeps)).status, 429, 'daily quota also applies to malformed HTTP');
+  equal(await quota(G), { minute_count: 1, day_count: 301 }, 'daily denial commits its threshold charge');
+  equal(await meter(sha(tokenG2)), { error: 'shortcut_rate_limit' }, 'another same-owner connection cannot bypass daily denial');
+  equal(await quota(G), { minute_count: 2, day_count: 301 }, 'daily validation counter saturates rather than growing forever');
+  await resetQuota(G, 2147483647, 2147483647);
+  equal(await meter(sha(tokenG)), { error: 'shortcut_rate_limit' }, 'legacy maximal integer counts deny safely without overflow');
+  equal(await quota(G), { minute_count: 31, day_count: 301 }, 'maximal counters are safely bounded at denial sentinels');
+  await db.query("update finance_private.shortcut_rate_limits set minute_start='2000-01-01',day_start='2000-01-01' where user_id=$1", [G]);
+  equal(await meter(sha(tokenG2)), { status: 'metered' }, 'new minute/UTC-day windows reset saturated counters');
+  equal(await quota(G), { minute_count: 1, day_count: 1 }, 'new time windows start at one charge');
+
+  const beforeRevocationQuota = await quota(H);
+  const revokeRaceDeps = httpDependencies(async () => {
+    await as('authenticated', H, 'select public.finance_shortcut_revoke($1) as result', [connectionH.id]);
+  });
+  const revokedFailure = await handleShortcutRequest(httpRequest(tokenH), revokeRaceDeps);
+  equal(revokedFailure.status, 401, 'revocation between preliminary auth and validation meter wins');
+  equal(await revokedFailure.json(), { error: 'invalid_shortcut_token' }, 'revocation race response reveals no owner or credential');
+  equal(revokeRaceDeps.calls, { authenticate: 1, meter: 1, receive: 0 }, 'validation race reaches only the locked rejection meter');
+  equal(await quota(H), beforeRevocationQuota, 'revoked validation request cannot mutate quota');
+  const normalRaceDeps = httpDependencies(async () => {
+    await as('authenticated', G, 'select public.finance_shortcut_revoke($1) as result', [connectionG3.id]);
+  });
+  equal((await handleShortcutRequest(httpRequest(tokenG3, validHttpBody), normalRaceDeps)).status, 401,
+    'revocation between preliminary auth and normal receive still wins');
+  equal(normalRaceDeps.calls, { authenticate: 1, meter: 0, receive: 1 }, 'normal revocation race never uses rejection meter');
+  equal(await quota(G), { minute_count: 1, day_count: 1 }, 'revoked normal receive leaves quota unchanged');
+  const invalidDeps = httpDependencies();
+  for (const invalidToken of [tokenH, `shiba_sc_${'f'.repeat(64)}`]) {
+    equal((await handleShortcutRequest(httpRequest(invalidToken), invalidDeps)).status, 401, 'already revoked and unknown tokens stay 401');
+  }
+  equal(invalidDeps.calls, { authenticate: 2, meter: 0, receive: 0 }, 'unauthorized credentials consume no owner quota');
+
+  for (const invalidHash of [null, '', 'A'.repeat(64), 'a'.repeat(65), sha('synthetic-unknown-rejection-hash'), sha(tokenH)]) {
+    await rejects(() => meter(invalidHash), /invalid_shortcut_token/, 'invalid/unknown/revoked hash fails closed before metering');
+  }
+  equal(await quota(G), { minute_count: 1, day_count: 1 }, 'invalid hash probes cannot charge another owner');
+  equal(await quota(H), beforeRevocationQuota, 'invalid hash probes cannot charge revoked owner');
+  await rejects(() => meter(sha(tokenG), 'authenticated', G), /permission denied/, 'owner cannot directly call rejection meter');
+  await rejects(() => meter(sha(tokenG), 'anon'), /permission denied/, 'anonymous caller cannot directly call rejection meter');
+  equal((await one("select pg_get_function_arguments('public.finance_shortcut_meter_rejection(text)'::regprocedure) arguments")).arguments,
+    'p_token_hash text', 'meter RPC accepts only the fixed-size hash with no payload or owner arguments');
+  const meterDef = (await one("select pg_get_functiondef('finance_private.shortcut_meter_rejection(text)'::regprocedure) body")).body;
+  assert.match(meterDef, /pg_advisory_xact_lock[\s\S]+revoked_at is null for update/); assertions += 1;
+  assert.match(meterDef, /least\(shortcut_rate_limits.minute_count, 30\) \+ 1/); assertions += 1;
+  assert.match(meterDef, /least\(shortcut_rate_limits.day_count, 300\) \+ 1/); assertions += 1;
+  assert.doesNotMatch(meterDef, /insert into public\.finance_shortcut_inbox|update public\.finance_shortcut_connections|p_payload/); assertions += 1;
+  equal(await txCount(), beforeHttpFinancialCount, 'validation metering and revocation tests leave all financial rows unchanged');
+  equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1 and connection_id=$2',
+    [G, connectionG.id])).count, 1, 'only accepted normal intake stores a body; malformed traffic never does');
+  const createDef = (await one("select pg_get_functiondef('finance_private.shortcut_create(text,text)'::regprocedure) body")).body;
+  assert.match(createDef, /user_id = owner_id\) >= 100/); assertions += 1;
   equal((await one(`select count(*)::integer count from pg_proc p join pg_namespace n on n.oid=p.pronamespace
     where n.nspname='public' and p.proname like 'finance_shortcut_%' and p.prosecdef`)).count, 0, 'all public wrappers are security invoker');
   console.log(`SHORTCUT_MIGRATION_OK: ${assertions} assertions; local PGlite only; no Production writes. Concurrent lock structure verified; no multi-session concurrency claim.`);

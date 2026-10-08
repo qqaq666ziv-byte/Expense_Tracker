@@ -9,6 +9,7 @@ import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const MAX_FILE = 256 * 1024;
+const MAX_NPM_LOCKFILE = 512 * 1024;
 const MAX_EVIDENCE = 4 * 1024 * 1024;
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -66,9 +67,20 @@ function checkText(bytes, label, max = MAX_FILE) {
       fail(`Suspected credential assignment in ${label}; content withheld.`);
     }
   }
-  const assignments = value.matchAll(/\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|service[_-]?role[_-]?key)\b\s*[:=]\s*(?:"([^"\r\n]{8,})"|'([^'\r\n]{8,})'|([^\s#]{8,}))/gi);
-  for (const [, doubleQuoted, singleQuoted, bare] of assignments) {
-    const credential = doubleQuoted ?? singleQuoted ?? bare ?? '';
+  const assignments = value.matchAll(/(?=((?:^|[^A-Za-z0-9_$-])["']?([A-Za-z_$][A-Za-z0-9_$-]*)["']?\s*[:=]\s*))/gm);
+  for (const match of assignments) {
+    const [, prefix, key] = match;
+    // Match the complete identifier: underscores are word characters, so a word
+    // boundary before PASSWORD misses names such as POSTGRES_PASSWORD.
+    const normalized = key.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+    if (!/(?:^|[_-])(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|service[_-]?role[_-]?key)(?:$|[_-])/i.test(normalized)) continue;
+    const remainder = value.slice(match.index + prefix.length).split(/\r?\n/, 1)[0];
+    // Check the complete expression, so fallbacks and concatenations cannot use
+    // a reference-looking first token to hide a literal credential.
+    if (/^(?:Deno\.env\.get\((['"])[A-Z][A-Z0-9_]*\1\)|process\.env\.[A-Z][A-Z0-9_]*);\s*(?:\/\/.*)?$/.test(remainder)) continue;
+    const literal = /^(?:"([^"\r\n]{8,})"|'([^'\r\n]{8,})'|([^\s#"'`,;]{8,}))/.exec(remainder);
+    if (!literal) continue;
+    const credential = literal[1] ?? literal[2] ?? literal[3] ?? '';
     // Supabase TOML env(NAME) is a reference, not the environment variable's value.
     if (/^env\([A-Z][A-Z0-9_]*\)$/.test(credential)) continue;
     if (!/^(?:<[^>]+>|\$\{[^}]+\}|\[REDACTED\]|(?:your|example|test|fake|placeholder|replace)[-_ ].*)$/i.test(credential)) fail(`Suspected credential assignment in ${label}; content withheld.`);
@@ -76,12 +88,30 @@ function checkText(bytes, label, max = MAX_FILE) {
   return value;
 }
 
-function readFile(file, label, max) {
+function readFile(file, label, max, sourcePath) {
   const resolved = safeAbsolute(file);
   const info = fs.lstatSync(resolved);
   if (!info.isFile() || info.nlink > 1 || info.size > (max ?? MAX_FILE)) fail(`Unsafe or oversized file: ${label}`);
   const bytes = fs.readFileSync(resolved);
-  return { text: checkText(bytes, label, max), sha256: hash(bytes), bytes: bytes.length };
+  return { text: sourcePath ? sourceText(bytes, sourcePath, label) : checkText(bytes, label, max), sha256: hash(bytes), bytes: bytes.length };
+}
+
+function sourceText(bytes, file, label) {
+  const value = checkText(bytes, label, file === 'package-lock.json' ? MAX_NPM_LOCKFILE : MAX_FILE);
+  if (bytes.length <= MAX_FILE) return value;
+  // Only the root npm lockfile receives a larger bound. Its complete bytes still
+  // pass UTF-8/secret checks and enter the source, diff and aggregate identities.
+  let lock;
+  try { lock = JSON.parse(value); } catch { fail(`Oversized evidence is not a validated npm lockfile: ${label}`); }
+  const object = item => item && typeof item === 'object' && !Array.isArray(item);
+  const allowed = new Set(['name', 'version', 'lockfileVersion', 'requires', 'packages', 'dependencies']);
+  if (!object(lock) || ![2, 3].includes(lock.lockfileVersion) || typeof lock.name !== 'string'
+    || !object(lock.packages) || !object(lock.packages[''])
+    || Object.keys(lock).some(key => !allowed.has(key))
+    || Object.entries(lock.packages).some(([name, entry]) => (name !== '' && !name.startsWith('node_modules/')) || !object(entry))) {
+    fail(`Oversized evidence is not a validated npm lockfile: ${label}`);
+  }
+  return value;
 }
 
 function git(root, args) {
@@ -104,11 +134,24 @@ export function captureSource({ root, base, files }) {
   git(root, ['merge-base', '--is-ancestor', baseCommit, headCommit]);
   const selected = [...new Set((files ?? []).map(relativeFile))].sort();
   if (!selected.length || selected.length > 200 || selected.length !== files.length) fail('Select 1-200 distinct explicit file paths.');
-  const tracked = new Set(nulList(git(root, ['ls-files', '-z'])));
-  const baseline = new Set(nulList(git(root, ['ls-tree', '-r', '-z', '--name-only', baseCommit])));
+  const index = new Map();
+  for (const entry of nulList(git(root, ['ls-files', '--stage', '-z']))) {
+    const [metadata, file] = entry.split('\t');
+    const [mode, objectId, stage] = metadata.split(' ');
+    if (index.has(file) || stage !== '0') fail('Unmerged index cannot be captured as review evidence.');
+    index.set(file, { mode, objectId });
+  }
+  const tracked = new Set(index.keys());
+  const baseline = new Map(nulList(git(root, ['ls-tree', '-r', '-z', baseCommit])).map(entry => {
+    const [metadata, file] = entry.split('\t');
+    return [file, metadata.split(' ')[0]];
+  }));
   const untracked = new Set(nulList(git(root, ['ls-files', '--others', '--exclude-standard', '-z'])));
   const selectedSet = new Set(selected);
-  const changed = nulList(git(root, ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--']));
+  const changed = [
+    ...nulList(git(root, ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--'])),
+    ...nulList(git(root, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--'])),
+  ];
   const omitted = [...new Set([...changed, ...untracked])].filter(file => !selectedSet.has(file) && !protectedPath(file)).sort();
   if (omitted.length) fail(`Stale or incomplete scope: allowlist omits changed/untracked files: ${omitted.slice(0, 20).join(', ')}`);
   const entries = selected.map(file => {
@@ -118,23 +161,31 @@ export function captureSource({ root, base, files }) {
     const exists = fs.existsSync(absolute);
     if (exists && !tracked.has(file)) fail(`Untracked source must be reviewed and staged first: ${file}`);
     if (!exists && !baseline.has(file)) fail(`Missing source: ${file}`);
-    const current = exists ? readFile(absolute, file) : null;
+    const current = exists ? readFile(absolute, file, file === 'package-lock.json' ? MAX_NPM_LOCKFILE : MAX_FILE, file) : null;
+    if (current) {
+      current.gitMode = process.platform === 'win32' ? index.get(file).mode : (fs.statSync(absolute).mode & 0o111) ? '100755' : '100644';
+    }
     let before = null;
     if (baseline.has(file)) {
       const bytes = git(root, ['show', `${baseCommit}:${file}`]);
-      before = { text: checkText(bytes, `baseline ${file}`), sha256: hash(bytes), bytes: bytes.length };
+      before = { text: sourceText(bytes, file, `baseline ${file}`), sha256: hash(bytes), bytes: bytes.length, gitMode: baseline.get(file) };
     }
-    return { path: file, before, current };
+    return { path: file, before, current, index: index.get(file) ?? null };
   });
-  const exclusions = [...new Set([...tracked, ...baseline, ...untracked])].filter(file => !selectedSet.has(file)).sort().map(file => ({
+  const exclusions = [...new Set([...tracked, ...baseline.keys(), ...untracked])].filter(file => !selectedSet.has(file)).sort().map(file => ({
     path: file,
     reason: protectedPath(file) ? 'protected-path-content-not-read' : untracked.has(file) ? 'untracked-outside-explicit-scope' : 'outside-explicit-affected-scope',
   }));
-  const sourceDigest = hash(canonical(entries.map(({ path: file, current }) => ({ path: file, sha256: current?.sha256 ?? null }))));
-  const scopeDigest = hash(canonical({ files: selected, exclusions }));
-  const identity = { baseCommit, headCommit, sourceDigest, scopeDigest };
   const status = gitText(root, ['status', '--porcelain=v1', '--untracked-files=no', '--', ...selected]);
-  return { root, identity, entries, exclusions, status };
+  const diffBytes = git(root, ['-c', 'core.quotePath=false', 'diff', '--no-renames', '--no-ext-diff', '--no-textconv', '--no-color', baseCommit, '--', ...selected]);
+  const diff = checkText(diffBytes, 'cumulative diff', MAX_EVIDENCE);
+  const cumulativeDiffSha256 = hash(diffBytes);
+  const sourceDigest = hash(canonical({ files: entries.map(({ path: file, current, index: staged }) => ({
+    path: file, sha256: current?.sha256 ?? null, gitMode: current?.gitMode ?? null, index: staged,
+  })), status, cumulativeDiffSha256 }));
+  const scopeDigest = hash(canonical({ files: selected, exclusions }));
+  const identity = { baseCommit, headCommit, sourceDigest, scopeDigest, cumulativeDiffSha256 };
+  return { root, identity, entries, exclusions, status, diff };
 }
 
 function externalFile(root, file, label, max) {
@@ -180,13 +231,13 @@ export function createPacket({ root, base, files, checks = [], out, goal, phase 
   if (!fs.existsSync(path.dirname(out))) fail('Output parent directory must already exist.');
   const verification = checks.map(check => readCheck(source, check));
   if (phase === 'review' && !verification.length) fail('Review phase requires actual check evidence.');
-  const diffBytes = git(source.root, ['-c', 'core.quotePath=false', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', source.identity.baseCommit, '--', ...files]);
-  const diff = checkText(diffBytes, 'cumulative diff', MAX_EVIDENCE);
   const manifest = {
-    schemaVersion: 1, phase, goal, createdAt: new Date().toISOString(), ...source.identity,
-    files: source.entries.map(({ path: file, before, current }) => ({ path: file, baseline: before && { sha256: before.sha256, bytes: before.bytes }, current: current && { sha256: current.sha256, bytes: current.bytes } })),
+    schemaVersion: 2, phase, goal, createdAt: new Date().toISOString(), ...source.identity,
+    files: source.entries.map(({ path: file, before, current, index }) => ({ path: file,
+      baseline: before && { sha256: before.sha256, bytes: before.bytes, gitMode: before.gitMode },
+      current: current && { sha256: current.sha256, bytes: current.bytes, gitMode: current.gitMode }, index })),
     exclusions: source.exclusions, trackedWorkingState: source.status,
-    checks: verification.map(({ output: _output, ...check }) => check), cumulativeDiffSha256: hash(diffBytes),
+    checks: verification.map(({ output: _output, ...check }) => check),
     limitations: ['All non-protected changed/untracked paths must be selected; ignored and protected private contents are not inspected.', 'Local records are not platform-signed proof; reviewer reads evidence and does not rerun checks.', 'Confirm excluded unchanged dependencies do not affect the requested acceptance.'],
   };
   const body = [
@@ -195,7 +246,7 @@ export function createPacket({ root, base, files, checks = [], out, goal, phase 
     `Phase: ${phase}. Goal: ${goal}`,
     phase === 'plan' ? 'Return a concrete bounded plan, risks and relevant checks. This planning packet is not a completed review.' : 'Read all evidence. First acknowledge packetId, sourceDigest, scopeDigest, sourceFileCount and END_EVIDENCE from this packet. Then return a JSON review with the same identities, verdict PASS/CHANGES_REQUESTED/INCOMPLETE, findings and summary. Missing necessary evidence, nonzero checks or truncation cannot produce PASS.',
     '## Manifest', fenced(JSON.stringify(manifest, null, 2)),
-    '## Cumulative change from pinned baseline through current working bytes', fenced(diff),
+    '## Cumulative change from pinned baseline through current working bytes', fenced(source.diff),
     ...source.entries.flatMap(entry => [`## Source: ${entry.path}`, '### Baseline',
       entry.before?.sha256 && entry.before.sha256 === entry.current?.sha256 ? `(identical to Current below; SHA-256 ${entry.before.sha256})` : entry.before ? fenced(entry.before.text) : '(absent at baseline)',
       '### Current', entry.current ? fenced(entry.current.text) : '(deleted)']),
@@ -218,7 +269,7 @@ export function verifyPacket({ root, directory }) {
   directory = safeAbsolute(directory);
   const parsed = JSON.parse(externalFile(root, path.join(directory, 'manifest.json'), 'manifest', MAX_EVIDENCE).text);
   const { packetId, ...unsigned } = parsed;
-  if (parsed.schemaVersion !== 1 || packetId !== hash(canonical(unsigned))) fail('Packet manifest was modified.');
+  if (parsed.schemaVersion !== 2 || packetId !== hash(canonical(unsigned))) fail('Packet manifest was modified or uses an unsupported schema.');
   const markdown = externalFile(root, path.join(directory, 'evidence.md'), 'packet', MAX_EVIDENCE + 1024).text;
   const prefix = `packetId: ${packetId}\nsourceDigest: ${parsed.sourceDigest}\nscopeDigest: ${parsed.scopeDigest}\nsourceFileCount: ${parsed.files.length}\n\n`;
   const suffix = `\n\nEND_EVIDENCE ${packetId}\n`;

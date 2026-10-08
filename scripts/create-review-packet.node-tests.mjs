@@ -1,11 +1,13 @@
 // Run with node --test; the filename intentionally stays outside Vitest's defaults.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { captureSource, createPacket, verifyPacket } from './create-review-packet.mjs';
+import { runTrustedReviewPacket } from '../tools/run-trusted-review-packet.mjs';
 
 function fixture(t) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'expense-review-packet-'));
@@ -241,4 +243,346 @@ test('captures failures honestly without claiming review PASS', t => {
   assert.equal(manifest.checks[0].exitCode, 1);
   assert.equal(manifest.verdict, undefined);
   assert.equal(verifyPacket({ root: f.root, directory: result.output }).valid, true);
+});
+
+test('withholds prefixed credential assignments before publishing source or cumulative diff', t => {
+  const f = fixture(t);
+  const synthetic = ['synthetic', 'credential', '0123456789'].join('-');
+  const assignments = [
+    `POSTGRES_PASSWORD="${synthetic}"`, `SUPABASE_SERVICE_ROLE_KEY='${synthetic}'`,
+    `STRIPE_SECRET_KEY=${synthetic}`, `GOOGLE_CLIENT_SECRET="${synthetic}"`,
+    `process.env.POSTGRES_PASSWORD = "${synthetic}"`, `$env:POSTGRES_PASSWORD = "${synthetic}"`,
+    `{"SUPABASE_SERVICE_ROLE_KEY":"${synthetic}"}`, `databasePassword = "${synthetic}"`,
+    `message = "POSTGRES_PASSWORD=${synthetic}"`, `{"message":"SUPABASE_SECRET=${synthetic}"}`,
+  ];
+  for (const assignment of assignments) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${assignment}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(synthetic));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+});
+
+test('withholds prefixed credentials from historical source, logs and check metadata', t => {
+  const f = fixture(t);
+  const synthetic = ['synthetic', 'historical', '0123456789'].join('-');
+  const assignment = `POSTGRES_PASSWORD="${synthetic}"\n`;
+  fs.writeFileSync(path.join(f.root, 'example.js'), assignment);
+  f.git(['commit', '-am', 'synthetic historical credential']);
+  const unsafeBase = f.git(['rev-parse', 'HEAD']).trim();
+  fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
+  assert.throws(() => createPacket({ ...f.options, base: unsafeBase }), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(synthetic));
+  const { metadata, metadataPath } = check(f);
+  for (const output of [assignment, `+${assignment}`, `$env:POSTGRES_PASSWORD = "${synthetic}"\n`]) {
+    fs.writeFileSync(metadata.outputFile, output);
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(synthetic));
+  }
+  fs.writeFileSync(metadata.outputFile, 'synthetic check complete\n');
+  metadata.command = `synthetic checker POSTGRES_PASSWORD=${synthetic}`;
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+  assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected credential assignment/);
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('allows prefixed credential env references and explicit placeholders', t => {
+  const f = fixture(t);
+  for (const reference of ['${POSTGRES_PASSWORD}', 'env(POSTGRES_PASSWORD)', '<redacted>', '[REDACTED]', 'example-password']) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `POSTGRES_PASSWORD="${reference}"\n`);
+    assert.doesNotThrow(() => captureSource(f.options));
+  }
+});
+
+test('allows only exact built-in environment reads for credential variables', t => {
+  const f = fixture(t);
+  for (const expression of ["Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');", 'Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");', 'process.env.POSTGRES_PASSWORD;']) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['const serviceRoleKey', ' = ', expression, '\n'].join(''));
+    assert.doesNotThrow(() => captureSource(f.options));
+  }
+  for (const expression of [
+    "Deno.env.get('lowercase_name');", "prefixDeno.env.get('SUPABASE_SERVICE_ROLE_KEY');",
+    "Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')suffix;", "Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') + 'synthetic-value';",
+    "Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? 'synthetic-value';", 'process.env.POSTGRES_PASSWORD + "synthetic-value";',
+    "Deno.env.get('NAME', 'synthetic-value');", "Deno.env.get('NAME')\n + 'synthetic-value';",
+  ]) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['const serviceRoleKey', ' = ', expression, '\n'].join(''));
+    assert.throws(() => captureSource(f.options), /Suspected credential assignment/);
+  }
+});
+
+function npmLockfile(count = 1200) {
+  const packages = { '': { name: 'synthetic-packet-fixture', version: '1.0.0' } };
+  for (let index = 0; index < count; index++) packages[`node_modules/synthetic-package-${index}`] = {
+    version: '1.0.0', resolved: `https://registry.npmjs.org/synthetic-package-${index}/-/synthetic-package-${index}-1.0.0.tgz`,
+    integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
+  };
+  packages['node_modules/synthetic-lock-end-marker'] = { version: '1.0.0' };
+  return JSON.stringify({ name: 'synthetic-packet-fixture', version: '1.0.0', lockfileVersion: 3, requires: true, packages }, null, 2) + '\n';
+}
+
+test('includes complete oversized validated npm lockfile baseline and current bytes', t => {
+  const f = fixture(t);
+  const lockfile = npmLockfile();
+  assert.ok(Buffer.byteLength(lockfile) > 256 * 1024 && Buffer.byteLength(lockfile) <= 512 * 1024);
+  const filename = path.join(f.root, 'package-lock.json');
+  fs.writeFileSync(filename, lockfile);
+  f.git(['add', 'package-lock.json']);
+  f.git(['commit', '-m', 'synthetic lock baseline']);
+  const base = f.git(['rev-parse', 'HEAD']).trim();
+  fs.writeFileSync(filename, lockfile.replace('"version": "1.0.0"', '"version": "1.0.1"'));
+  const result = createPacket({ ...f.options, base, files: ['example.js', 'package-lock.json'] });
+  const manifest = JSON.parse(fs.readFileSync(path.join(result.output, 'manifest.json')));
+  const entry = manifest.files.find(file => file.path === 'package-lock.json');
+  assert.equal(entry.baseline.bytes, Buffer.byteLength(lockfile));
+  assert.equal(entry.current.bytes, Buffer.byteLength(lockfile));
+  const body = fs.readFileSync(path.join(result.output, 'evidence.md'), 'utf8');
+  assert.equal(body.split('synthetic-lock-end-marker').length - 1, 2);
+  assert.equal(verifyPacket({ root: f.root, directory: result.output }).valid, true);
+});
+
+test('keeps lockfile exception narrow and checks original BOM bytes, format, secrets and upper bound', t => {
+  const f = fixture(t);
+  const lockfile = npmLockfile();
+  for (const name of ['large.txt', 'nested/package-lock.json']) {
+    const absolute = path.join(f.root, name);
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    fs.writeFileSync(absolute, lockfile);
+    f.git(['add', name]);
+    assert.throws(() => captureSource({ ...f.options, files: ['example.js', name] }), /oversized/i);
+    f.git(['rm', '-f', name]);
+  }
+  const filename = path.join(f.root, 'package-lock.json');
+  fs.writeFileSync(filename, lockfile);
+  f.git(['add', 'package-lock.json']);
+  const options = { ...f.options, files: ['example.js', 'package-lock.json'] };
+  for (const bad of [
+    'x'.repeat(270000), JSON.stringify({ packages: {}, padding: 'x'.repeat(270000) }),
+    Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('x'.repeat(256 * 1024))]),
+    lockfile.replace('"lockfileVersion": 3', '"lockfileVersion": 1'),
+  ]) {
+    fs.writeFileSync(filename, bad);
+    assert.throws(() => captureSource(options), /validated npm lockfile/);
+  }
+  const synthetic = ['synthetic', 'lock', '0123456789'].join('-');
+  fs.writeFileSync(filename, lockfile.replace('"version": "1.0.0"', `"POSTGRES_PASSWORD": "${synthetic}"`));
+  assert.throws(() => captureSource(options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(synthetic));
+  for (const bad of [Buffer.concat([Buffer.from(lockfile), Buffer.from([0xff])]), lockfile + '\0']) {
+    fs.writeFileSync(filename, bad);
+    assert.throws(() => captureSource(options), /Invalid UTF-8|Binary/);
+  }
+  fs.writeFileSync(filename, npmLockfile(2000));
+  assert.throws(() => captureSource(options), /oversized/i);
+});
+
+test('retains log and total evidence limits when including a larger lockfile', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  fs.writeFileSync(metadata.outputFile, 'x'.repeat(256 * 1024 + 1));
+  assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /oversized/i);
+  const files = ['example.js', 'package-lock.json'];
+  fs.writeFileSync(path.join(f.root, 'package-lock.json'), npmLockfile());
+  for (let index = 0; index < 19; index++) {
+    const name = `synthetic-large-${index}.txt`;
+    fs.writeFileSync(path.join(f.root, name), 'x'.repeat(220000));
+    files.push(name);
+  }
+  f.git(['add', ...files]);
+  f.git(['commit', '-m', 'synthetic aggregate boundary']);
+  assert.throws(() => createPacket({ ...f.options, base: f.git(['rev-parse', 'HEAD']).trim(), files }), /Oversized evidence: complete packet/);
+});
+
+test('records Git modes and rejects same-byte mode and staging changes in packets and checks', t => {
+  const f = fixture(t);
+  const { metadataPath } = check(f);
+  const result = createPacket({ ...f.options, phase: 'review', checks: [metadataPath] });
+  const manifest = JSON.parse(fs.readFileSync(path.join(result.output, 'manifest.json')));
+  assert.equal(manifest.schemaVersion, 2);
+  assert.equal(manifest.files[0].baseline.gitMode, '100644');
+  assert.equal(manifest.files[0].current.gitMode, '100644');
+  assert.equal(manifest.files[0].index.mode, '100644');
+  const original = captureSource(f.options).identity.sourceDigest;
+  if (process.platform !== 'win32') {
+    fs.chmodSync(path.join(f.root, 'example.js'), 0o755);
+    assert.notEqual(captureSource(f.options).identity.sourceDigest, original);
+    assert.throws(() => verifyPacket({ root: f.root, directory: result.output }), /Stale/);
+    fs.chmodSync(path.join(f.root, 'example.js'), 0o644);
+  }
+  f.git(['config', 'core.fileMode', 'false']);
+  f.git(['update-index', '--chmod=+x', 'example.js']);
+  assert.notEqual(captureSource(f.options).identity.sourceDigest, original);
+  assert.throws(() => verifyPacket({ root: f.root, directory: result.output }), /Stale/);
+  assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath], out: path.join(f.temp, 'stale-mode') }), /Stale check/);
+});
+
+test('rejects stage and unstage of unchanged working bytes', t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 2;\n');
+  const packet = createPacket(f.options);
+  f.git(['add', 'example.js']);
+  assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /Stale/);
+  const staged = createPacket({ ...f.options, out: path.join(f.temp, 'staged') });
+  f.git(['reset', '--', 'example.js']);
+  assert.throws(() => verifyPacket({ root: f.root, directory: staged.output }), /Stale/);
+});
+
+test('binds index blob IDs when working bytes, status and cumulative diff remain the same', t => {
+  const f = fixture(t);
+  const filename = path.join(f.root, 'example.js');
+  fs.writeFileSync(filename, 'export const amount = 2;\n');
+  f.git(['add', 'example.js']);
+  fs.writeFileSync(filename, 'export const amount = 1;\n');
+  const before = captureSource(f.options);
+  const packet = createPacket(f.options);
+  fs.writeFileSync(filename, 'export const amount = 3;\n');
+  f.git(['add', 'example.js']);
+  fs.writeFileSync(filename, 'export const amount = 1;\n');
+  const after = captureSource(f.options);
+  assert.equal(after.status, before.status);
+  assert.equal(after.identity.cumulativeDiffSha256, before.identity.cumulativeDiffSha256);
+  assert.notEqual(after.identity.sourceDigest, before.identity.sourceDigest);
+  assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /Stale/);
+});
+
+test('rejects omitted index-only mode and blob changes', t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, 'unrelated.js'), 'export const unchanged = 1;\n');
+  f.git(['add', 'unrelated.js']);
+  f.git(['commit', '-m', 'synthetic extra baseline']);
+  f.options.base = f.git(['rev-parse', 'HEAD']).trim();
+  f.git(['config', 'core.fileMode', 'false']);
+  f.git(['update-index', '--chmod=+x', 'unrelated.js']);
+  assert.throws(() => captureSource(f.options), /allowlist omits changed.*unrelated.js/);
+  f.git(['reset', '--', 'unrelated.js']);
+  fs.writeFileSync(path.join(f.root, 'unrelated.js'), 'export const unchanged = 2;\n');
+  f.git(['add', 'unrelated.js']);
+  fs.writeFileSync(path.join(f.root, 'unrelated.js'), 'export const unchanged = 1;\n');
+  assert.throws(() => captureSource(f.options), /allowlist omits changed.*unrelated.js/);
+});
+
+test('recomputes actual diff during freshness verification', t => {
+  const f = fixture(t);
+  const lines = Array.from({ length: 12 }, (_, index) => `line ${index}`);
+  fs.writeFileSync(path.join(f.root, 'example.js'), lines.join('\n') + '\n');
+  f.git(['commit', '-am', 'synthetic diff baseline']);
+  f.options.base = f.git(['rev-parse', 'HEAD']).trim();
+  lines[6] = 'changed line';
+  fs.writeFileSync(path.join(f.root, 'example.js'), lines.join('\n') + '\n');
+  const before = captureSource(f.options);
+  const packet = createPacket(f.options);
+  f.git(['config', 'diff.context', '0']);
+  const after = captureSource(f.options);
+  assert.equal(after.entries[0].current.sha256, before.entries[0].current.sha256);
+  assert.equal(after.status, before.status);
+  assert.notEqual(after.identity.cumulativeDiffSha256, before.identity.cumulativeDiffSha256);
+  assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /Stale/);
+});
+
+test('rejects index changes while building a packet before writing output', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  f.git(['config', 'core.fileMode', 'false']);
+  const read = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', function (filename, ...args) {
+    const bytes = read.call(fs, filename, ...args);
+    if (filename === metadata.outputFile) f.git(['update-index', '--chmod=+x', 'example.js']);
+    return bytes;
+  });
+  assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Source changed while building/);
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
+test('trusted launcher rejects malicious checkout and replacement bytes without executing them', t => {
+  const f = fixture(t);
+  const marker = path.join(f.temp, 'must-never-exist');
+  const malicious = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'executed');\n`;
+  const candidate = path.join(f.root, 'contributor-builder.mjs');
+  fs.writeFileSync(candidate, malicious);
+  const digest = value => createHash('sha256').update(value).digest('hex');
+  assert.throws(() => runTrustedReviewPacket({ root: f.root, builder: candidate, expectedSha256: digest(malicious) }), /outside the contributor checkout/);
+  const installed = path.join(f.temp, 'installed-builder.mjs');
+  const trusted = 'process.stdout.write("trusted fixture");\n';
+  const pin = digest(trusted);
+  fs.writeFileSync(installed, malicious);
+  assert.throws(() => runTrustedReviewPacket({ root: f.root, builder: installed, expectedSha256: pin }), /no code executed/);
+  assert.throws(() => runTrustedReviewPacket({ root: f.root, builder: installed }), /independently recorded/);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+test('trusted launcher executes verified snapshot despite candidate replacement and inherited module hooks', t => {
+  const f = fixture(t);
+  const marker = path.join(f.temp, 'must-never-exist');
+  const malicious = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'executed');\n`;
+  const hook = path.join(f.temp, 'untrusted-hook.mjs');
+  fs.writeFileSync(hook, malicious);
+  const trusted = 'process.stdout.write(JSON.stringify({ root: process.argv[3], snapshot: import.meta.url, nodeOptions: process.env.NODE_OPTIONS ?? null, nodePath: process.env.NODE_PATH ?? null }));\n';
+  const installed = path.join(f.temp, 'installed-builder.mjs');
+  fs.writeFileSync(installed, trusted);
+  const read = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', function (filename, ...args) {
+    const bytes = read.call(fs, filename, ...args);
+    if (filename === installed) fs.writeFileSync(installed, malicious);
+    return bytes;
+  });
+  const oldOptions = process.env.NODE_OPTIONS;
+  const oldPath = process.env.NODE_PATH;
+  try {
+    process.env.NODE_OPTIONS = `--import=${hook}`;
+    process.env.NODE_PATH = f.root;
+    const result = JSON.parse(runTrustedReviewPacket({ root: f.root, builder: installed,
+      expectedSha256: createHash('sha256').update(trusted).digest('hex') }));
+    assert.equal(result.root, f.root);
+    assert.match(result.snapshot, /trusted-review-builder-/);
+    assert.equal(result.nodeOptions, null);
+    assert.equal(result.nodePath, null);
+    assert.equal(fs.existsSync(marker), false);
+  } finally {
+    if (oldOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = oldOptions;
+    if (oldPath === undefined) delete process.env.NODE_PATH; else process.env.NODE_PATH = oldPath;
+  }
+});
+
+test('trusted launcher runs inspected packet builder copied outside the review checkout', t => {
+  const f = fixture(t);
+  const bytes = fs.readFileSync(new URL('./create-review-packet.mjs', import.meta.url));
+  const installed = path.join(f.temp, 'installed-builder.mjs');
+  fs.writeFileSync(installed, bytes);
+  const result = JSON.parse(runTrustedReviewPacket({ root: f.root, builder: installed,
+    expectedSha256: createHash('sha256').update(bytes).digest('hex'), args: ['--base', f.options.base, '--files', 'example.js', '--identity-only'] }));
+  assert.deepEqual(result, captureSource(f.options).identity);
+});
+
+test('trusted launcher rejects checkout-local temporary directories before execution', t => {
+  const f = fixture(t);
+  const marker = path.join(f.temp, 'must-never-exist');
+  const bytes = `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'executed');\n`;
+  const installed = path.join(f.temp, 'independently-pinned-fixture.mjs');
+  fs.writeFileSync(installed, bytes);
+  const names = process.platform === 'win32' ? ['TEMP', 'TMP'] : ['TMPDIR'];
+  const previous = names.map(name => process.env[name]);
+  try {
+    for (const name of names) process.env[name] = f.root;
+    assert.throws(() => runTrustedReviewPacket({ root: f.root, builder: installed,
+      expectedSha256: createHash('sha256').update(bytes).digest('hex') }), /temporary directory must be outside.*no code executed/);
+    assert.equal(fs.existsSync(marker), false);
+  } finally {
+    names.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; });
+  }
+});
+
+test('captures inspected builder tests, entrypoint and real npm lockfile as source without executing them', t => {
+  const f = fixture(t);
+  const files = [
+    'scripts/create-review-packet.mjs', 'scripts/create-review-packet.node-tests.mjs',
+    'tools/run-trusted-review-packet.mjs', 'tools/skills/codex-chatgpt-review/SKILL.md',
+    'tools/skills/codex-chatgpt-review/INSTALLATION.md', 'supabase/functions/finance-shortcut-receive/index.ts', 'package-lock.json',
+  ];
+  for (const file of files) {
+    const absolute = path.join(f.root, file);
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    fs.writeFileSync(absolute, fs.readFileSync(new URL(`../${file}`, import.meta.url)));
+  }
+  f.git(['add', ...files]);
+  f.git(['commit', '-m', 'inspected source capture fixture']);
+  const base = f.git(['rev-parse', 'HEAD']).trim();
+  const source = captureSource({ ...f.options, base, files: ['example.js', ...files] });
+  assert.equal(source.entries.length, files.length + 1);
+  assert.ok(source.entries.find(file => file.path === 'package-lock.json').current.bytes > 256 * 1024);
 });

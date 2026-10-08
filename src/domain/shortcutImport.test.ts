@@ -3,7 +3,7 @@ import {
   normalizeShortcutAmount, normalizeShortcutTimestamp, parseShortcutNotification,
   shortcutEventIdentity, shortcutSha256, validateShortcutPayload,
 } from '../../supabase/functions/_shared/shortcutNotification';
-import { handleShortcutRequest, type ShortcutReceiverDependencies } from '../../supabase/functions/_shared/shortcutHandler';
+import { handleShortcutRequest, type ShortcutReceiverDependencies, type ShortcutRpcResult } from '../../supabase/functions/_shared/shortcutHandler';
 
 // All fixtures are synthetic; no user screenshot, merchant or amount is stored.
 const simple = {
@@ -103,9 +103,10 @@ describe('shortcut HTTP boundary', () => {
   }
   function dependencies() {
     return {
-      authenticate: vi.fn(async () => ({ data: true, error: null })),
-      receive: vi.fn(async () => ({ data: { status: 'pending', id: 'test-id', duplicate: false, user_id: 'private' }, error: null })),
-    } as ShortcutReceiverDependencies & { authenticate: ReturnType<typeof vi.fn>; receive: ReturnType<typeof vi.fn> };
+      authenticate: vi.fn(async (_hash: string): Promise<ShortcutRpcResult> => ({ data: true, error: null })),
+      meterRejection: vi.fn(async (_hash: string): Promise<ShortcutRpcResult> => ({ data: { status: 'metered' }, error: null })),
+      receive: vi.fn(async (_parameters: Record<string, unknown>): Promise<ShortcutRpcResult> => ({ data: { status: 'pending', id: 'test-id', duplicate: false, user_id: 'private' }, error: null })),
+    } satisfies ShortcutReceiverDependencies;
   }
   it('hashes the full credential, strips response metadata and sets no-store', async () => {
     const db = dependencies();
@@ -114,6 +115,8 @@ describe('shortcut HTTP boundary', () => {
     expect(await response.json()).toEqual({ status: 'pending', id: 'test-id', duplicate: false });
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(db.authenticate).toHaveBeenCalledWith(await shortcutSha256(token));
+    expect(db.receive).toHaveBeenCalledTimes(1);
+    expect(db.meterRejection).not.toHaveBeenCalled();
     expect(db.receive.mock.calls[0][0]).toMatchObject({ p_auto_eligible: false, p_reason: 'topup_requires_review', p_amount: '1234.00' });
     expect(JSON.stringify(db.receive.mock.calls[0])).not.toContain(token);
   });
@@ -125,22 +128,27 @@ describe('shortcut HTTP boundary', () => {
     const response = await handleShortcutRequest(request(mixed), db);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ status: 'ignored', id: 'archived-inbox-id', duplicate: true });
+    expect(db.receive).toHaveBeenCalledTimes(1);
+    expect(db.meterRejection).not.toHaveBeenCalled();
   });
   it.each([null, 'Bearer wrong', 'Bearer shiba_sc_', `Bearer ${token} extra`])('rejects malformed auth before calling a database', async (authorization) => {
     const db = dependencies();
     expect((await handleShortcutRequest(request(simple, authorization), db)).status).toBe(401);
     expect(db.authenticate).not.toHaveBeenCalled();
+    expect(db.meterRejection).not.toHaveBeenCalled();
     expect(db.receive).not.toHaveBeenCalled();
   });
   it('rejects unknown/revoked credentials before processing invalid JSON', async () => {
     const db = dependencies();
     db.authenticate.mockResolvedValue({ data: false, error: null });
     expect((await handleShortcutRequest(request('{'), db)).status).toBe(401);
+    expect(db.meterRejection).not.toHaveBeenCalled();
     expect(db.receive).not.toHaveBeenCalled();
   });
   it.each(['{', JSON.stringify({ ...simple, user_id: 'owner-b' }), JSON.stringify({ ...simple, amount: '1.001' })])('does not store invalid input', async (body) => {
     const db = dependencies();
     expect((await handleShortcutRequest(request(body), db)).status).toBe(400);
+    expect(db.meterRejection).toHaveBeenCalledExactlyOnceWith(await shortcutSha256(token));
     expect(db.receive).not.toHaveBeenCalled();
   });
   it.each([undefined, null, 'false'])('never calls receive when test is omitted or not boolean (%j)', async (test) => {
@@ -148,22 +156,44 @@ describe('shortcut HTTP boundary', () => {
     const response = await handleShortcutRequest(request({ ...simple, test }), db);
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: 'invalid_shortcut_payload' });
+    expect(db.meterRejection).toHaveBeenCalledExactlyOnceWith(await shortcutSha256(token));
     expect(db.receive).not.toHaveBeenCalled();
   });
   it('enforces the streamed byte limit without relying on Content-Length', async () => {
     const db = dependencies();
     expect((await handleShortcutRequest(request(' '.repeat(8193)), db)).status).toBe(413);
+    expect(db.meterRejection).toHaveBeenCalledExactlyOnceWith(await shortcutSha256(token));
     expect(db.receive).not.toHaveBeenCalled();
   });
   it('requires JSON content type', async () => {
-    expect((await handleShortcutRequest(request(simple, `Bearer ${token}`, { 'Content-Type': 'text/plain' }), dependencies())).status).toBe(415);
-  });
-  it.each([['42501', 401], ['53300', 429], ['54000', 429], ['23505', 409], ['22023', 400], ['XX000', 503]])('maps DB error %s without leaking details', async (code, expected) => {
     const db = dependencies();
-    db.receive.mockResolvedValue({ data: null, error: { code, message: 'private raw payload' } });
+    expect((await handleShortcutRequest(request(simple, `Bearer ${token}`, { 'Content-Type': 'text/plain' }), db)).status).toBe(415);
+    expect(db.meterRejection).toHaveBeenCalledExactlyOnceWith(await shortcutSha256(token));
+    expect(db.receive).not.toHaveBeenCalled();
+  });
+  it('returns a sanitized 429 when an authenticated validation failure exhausts quota', async () => {
+    const db = dependencies();
+    db.meterRejection.mockResolvedValue({ data: { error: 'shortcut_rate_limit', private: token }, error: null });
+    const response = await handleShortcutRequest(request('{'), db);
+    expect(response.status).toBe(429);
+    expect(await response.json()).toEqual({ error: 'shortcut_limit_reached' });
+    expect(db.authenticate).toHaveBeenCalledExactlyOnceWith(await shortcutSha256(token));
+    expect(db.meterRejection).toHaveBeenCalledExactlyOnceWith(await shortcutSha256(token));
+    expect(db.receive).not.toHaveBeenCalled();
+  });
+  it.each([['42501', 401], ['53300', 429], ['54000', 429], ['23505', 409], ['22023', 400], ['23514', 400], ['XX000', 503]])('maps DB error %s without leaking details', async (code, expected) => {
+    const db = dependencies();
+    const error = { code, message: 'private raw payload' };
+    db.receive.mockResolvedValue({ data: null, error });
     const response = await handleShortcutRequest(request(), db);
     expect(response.status).toBe(expected);
     expect(await response.text()).not.toContain('private');
+    expect(db.receive).toHaveBeenCalledTimes(1);
+    if (code === '22023' || code === '23514') {
+      expect(db.meterRejection).toHaveBeenCalledExactlyOnceWith(await shortcutSha256(token));
+    } else {
+      expect(db.meterRejection).not.toHaveBeenCalled();
+    }
   });
   it('fails closed when server configuration or RPC response is unavailable', async () => {
     expect((await handleShortcutRequest(request(), null)).status).toBe(503);
@@ -174,6 +204,6 @@ describe('shortcut HTTP boundary', () => {
   it.each([true, false])('passes explicit test=%s without changing the caller intent', async (test) => {
     const db = dependencies();
     expect((await handleShortcutRequest(request({ ...simple, test }), db)).status).toBe(200);
-    expect(db.receive.mock.calls[0][0].p_payload.test).toBe(test);
+    expect(db.receive.mock.calls[0][0]).toMatchObject({ p_payload: { test } });
   });
 });
