@@ -224,6 +224,22 @@ test('withholds embedded private material in cumulative diff before output creat
   }
 });
 
+test('does not echo sensitive source filenames when rejecting current or historical content', t => {
+  const f = fixture(t);
+  const { material } = privateKeyFixtures();
+  const name = ['source-private_key', '=', material, '.txt'].join('');
+  const filename = path.join(f.root, name);
+  fs.writeFileSync(filename, JSON.stringify({ ['private_key']: material }));
+  f.git(['add', name]);
+  const options = { ...f.options, files: ['example.js', name] };
+  assert.throws(() => createPacket(options), error => /Suspected credential assignment in selected source/.test(error.message) && !error.message.includes(material) && !error.message.includes(name));
+  f.git(['commit', '-m', 'synthetic sensitive filename and content']);
+  const base = f.git(['rev-parse', 'HEAD']).trim();
+  fs.writeFileSync(filename, 'safe current source\n');
+  assert.throws(() => createPacket({ ...options, base }), error => /Suspected credential assignment in baseline source/.test(error.message) && !error.message.includes(material) && !error.message.includes(name));
+  assert.equal(fs.existsSync(f.options.out), false);
+});
+
 test('withholds inline PEMs and private-key fields from verification logs', t => {
   const f = fixture(t);
   const { metadata, metadataPath } = check(f);

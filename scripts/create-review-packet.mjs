@@ -162,7 +162,7 @@ export function captureSource({ root, base, files }) {
     const exists = fs.existsSync(absolute);
     if (exists && !tracked.has(file)) fail(`Untracked source must be reviewed and staged first: ${file}`);
     if (!exists && !baseline.has(file)) fail(`Missing source: ${file}`);
-    const current = exists ? readFile(absolute, file, file === 'package-lock.json' ? MAX_NPM_LOCKFILE : MAX_FILE, file) : null;
+    const current = exists ? readFile(absolute, 'selected source', file === 'package-lock.json' ? MAX_NPM_LOCKFILE : MAX_FILE, file) : null;
     if (current) {
       // Git's executable bit follows owner execute, even with core.fileMode=false.
       current.gitMode = process.platform === 'win32' ? index.get(file).mode : (fs.statSync(absolute).mode & 0o100) ? '100755' : '100644';
@@ -170,7 +170,7 @@ export function captureSource({ root, base, files }) {
     let before = null;
     if (baseline.has(file)) {
       const bytes = git(root, ['show', `${baseCommit}:${file}`]);
-      before = { text: sourceText(bytes, file, `baseline ${file}`), sha256: hash(bytes), bytes: bytes.length, gitMode: baseline.get(file) };
+      before = { text: sourceText(bytes, file, 'baseline source'), sha256: hash(bytes), bytes: bytes.length, gitMode: baseline.get(file) };
     }
     return { path: file, before, current, index: index.get(file) ?? null };
   });
