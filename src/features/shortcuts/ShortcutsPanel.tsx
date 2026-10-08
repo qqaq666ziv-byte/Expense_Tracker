@@ -144,8 +144,13 @@ function OwnerShortcutsPanel({
       const connection = await api.create(ownerId, pending.label, pending.tokenHash);
       if (!alive.current) return;
       setPendingCreate(null);
+      if (connection.revoked_at) {
+        setConnections((previous) => mergeConnections(previous, connection));
+        setError('這組金鑰所屬的連線已停用，無法用來接收通知。請在連線管理確認狀態；若要重新連線，請建立新的連線。');
+        return;
+      }
       setSecret({ connectionId: connection.id, token: pending.token });
-      setConnections((previous) => [connection, ...previous]);
+      setConnections((previous) => mergeConnections(previous, connection));
       setMessage('連線已建立。請現在複製金鑰；離開此頁後將無法再次查看。');
     });
   };
@@ -246,6 +251,10 @@ function OwnerShortcutsPanel({
       </section>}
     </div>
   );
+}
+
+function mergeConnections(previous: ShortcutConnection[], updated: ShortcutConnection): ShortcutConnection[] {
+  return [updated, ...previous.filter((connection) => connection.id !== updated.id)];
 }
 
 type Parents = ReturnType<typeof shortcutParents>;

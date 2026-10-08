@@ -231,6 +231,10 @@ try {
 
   await rejects(() => as('authenticated', B, 'select public.finance_shortcut_revoke($1) as result', [connection.id]), /connection_not_found/, 'foreign owner cannot revoke');
   await as('authenticated', A, 'select public.finance_shortcut_revoke($1) as result', [connection.id]);
+  const revokedRetry = await createConnection(A, hashA);
+  equal(revokedRetry.id, connection.id, 'revoked create retry resolves only to the existing revoked row');
+  equal(revokedRetry.revoked_at !== null, true, 'idempotent create retry does not clear revocation');
+  equal(revokedRetry.mode, 'review', 'idempotent create retry does not re-enable auto mode');
   equal(await as('service_role', null, 'select public.finance_shortcut_authenticate($1) as result', [hashA]), false, 'revoke invalidates scoped credential');
   await rejects(() => receive(event('after-revoke')), /invalid_shortcut_token/, 'intake rechecks revocation inside lock');
   await rejects(() => configure(A, connection.id), /connection_not_found/, 'revoked credential cannot be re-enabled');

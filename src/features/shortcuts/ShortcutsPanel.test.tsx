@@ -122,6 +122,39 @@ describe('iPhone shortcuts panel', () => {
     expect(localStorage.length).toBe(0);
   });
 
+  it('does not show a usable secret when an idempotent retry returns a revoked connection', async () => {
+    const api = makeApi([], []);
+    api.create.mockRejectedValueOnce(new Error('simulated lost response'));
+    api.create.mockResolvedValueOnce({ ...connection, revoked_at: '2026-10-08T12:00:00.000Z' });
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
+    await screen.findByText(/連線結果尚未確認/);
+    await user.click(screen.getByRole('button', { name: '以相同金鑰重試' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('這組金鑰所屬的連線已停用');
+    expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
+  });
+
+  it('replaces a refreshed connection row on a successful idempotent retry', async () => {
+    const api = makeApi([], []);
+    api.create.mockRejectedValueOnce(new Error('simulated lost response'));
+    api.listConnections.mockResolvedValueOnce([]).mockResolvedValueOnce([connection]);
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
+    await screen.findByText(/連線結果尚未確認/);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(await screen.findByText('測試手機', { selector: 'h3' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '連接 iPhone' }));
+    await user.click(screen.getByRole('button', { name: '以相同金鑰重試' }));
+    await screen.findByLabelText('一次性顯示的捷徑金鑰');
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    expect(screen.getAllByText('測試手機', { selector: 'h3' })).toHaveLength(1);
+  });
+
   it('ignores previous-owner fetch results after an account change', async () => {
     const first = deferred<ShortcutInboxItem[]>();
     const api = makeApi();
