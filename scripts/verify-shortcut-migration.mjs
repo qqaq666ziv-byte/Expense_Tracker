@@ -11,8 +11,15 @@ const files = (await readdir(migrationDirectory)).filter((name) => /^\d{14}_[a-z
 const sources = await Promise.all(files.map((name) => readFile(resolve(migrationDirectory, name), 'utf8')));
 assert.ok(files.some((name) => name.endsWith('_finance_shortcut_inbox.sql')), 'shortcut migration exists');
 assert.ok(files.some((name) => name.endsWith('_idempotent_shortcut_create.sql')), 'idempotent create migration exists');
+const ambiguityMigrationIndex = files.findIndex((name) => name.endsWith('_shortcut_archive_ambiguity_leaves.sql'));
+assert.notEqual(ambiguityMigrationIndex, -1, 'ambiguity capacity migration exists');
+const ambiguityMigrationSql = sources[ambiguityMigrationIndex];
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
+const C = '33333333-3333-4333-8333-333333333333';
+const D = '44444444-4444-4444-8444-444444444444';
+const E = '55555555-5555-4555-8555-555555555555';
+const F = '66666666-6666-4666-8666-666666666666';
 const sha = (text) => createHash('sha256').update(text).digest('hex');
 const hashA = sha('synthetic-only-secret-a');
 const hashB = sha('synthetic-only-secret-b');
@@ -71,7 +78,9 @@ try {
     alter default privileges for role postgres in schema public grant all on tables to anon, authenticated, service_role;
     alter default privileges for role postgres in schema public grant execute on functions to anon, authenticated, service_role;
   `);
-  await db.exec(sources.join('\n'));
+  // First verify the previous PR schema, then upgrade a populated 10,000-row
+  // reproduction below. This tests migration safety rather than only empty DBs.
+  await db.exec(sources.filter((_, index) => index !== ambiguityMigrationIndex).join('\n'));
   equal((await one("select count(*)::integer count from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname like 'finance_shortcut_%' and c.relkind='r' and c.relrowsecurity")).count, 2, 'both public tables have RLS after retry');
   const permissions = await one(`select
     has_table_privilege('authenticated','public.finance_shortcut_connections','SELECT') as direct_connection_read,
@@ -436,6 +445,199 @@ try {
     'RLS prevents reading foreign inbox even with a test-only column grant');
   await db.exec('revoke select(id,user_id) on public.finance_shortcut_inbox from authenticated');
 
+  // Reproduce the production-sized dead end: one no-ID root and 9,999 same
+  // fingerprint arrivals, all ignored. RPCs seed the actual ambiguity shape;
+  // synthetic SQL fills out the remaining equivalent arrivals without making
+  // 10,000 network requests or bypassing production rate limits.
+  await db.query('insert into auth.users(id) values($1),($2),($3),($4)', [C, D, E, F]);
+  const hashC = sha('synthetic-ambiguity-capacity');
+  const connectionC = await createConnection(C, hashC);
+  const contentFingerprint = sha(JSON.stringify(['jkopay', '扣款通知',
+    'Synthetic notification for database verification', null, null, null, null, false]));
+  const sameContent = event('terminal-no-id-group', {
+    hash: hashC, key: `fp:${contentFingerprint}`, fingerprint: contentFingerprint,
+  });
+  const root = await receive(sameContent);
+  const leaf = await receive(sameContent);
+  await review(C, root.id, 'ignore');
+  await review(C, leaf.id, 'ignore');
+  await db.query(`insert into public.finance_shortcut_inbox
+    (user_id,connection_id,event_key,fingerprint,payload,status,reason,duplicate_event,ambiguous_of)
+    select $1,$2,'amb:' || gen_random_uuid()::text,$3,$4,'ignored','ignored_by_owner',true,$5
+    from generate_series(1,9998)`, [C, connectionC.id, sameContent.fingerprint, sameContent.payload, root.id]);
+  equal(await one(`select count(*)::integer total, count(*) filter (where status='pending')::integer pending
+    from public.finance_shortcut_inbox where user_id=$1`, [C]), { total: 10000, pending: 0 },
+  'regression fixture has exactly 10,000 ignored no-ID arrivals and no pending work');
+  equal((await one(`select count(*)::integer count from public.finance_shortcut_inbox i
+    where i.user_id=$1 and i.status in ('imported','ignored','test')
+      and not exists(select 1 from public.finance_shortcut_inbox child where child.ambiguous_of=i.id)
+      and (i.event_key like 'id:%' or not exists(select 1 from public.finance_shortcut_inbox other
+        where other.user_id=i.user_id and other.id<>i.id and other.fingerprint=i.fingerprint))`, [C])).count,
+  0, 'old archive rules have no eligible row despite every arrival being terminal');
+  const recoveryInput = event('new-after-terminal-ambiguity', { hash: hashC });
+  equal(await receive(recoveryInput), { error: 'shortcut_inbox_limit' }, 'previous RPC reproduces the permanent capacity rejection');
+  equal(await one('select minute_count,day_count from finance_private.shortcut_rate_limits where user_id=$1', [C]),
+    { minute_count: 3, day_count: 3 }, 'reproduction is not a rate-limit denial');
+
+  // The previous RPC could forget a lone archived fingerprint and accept a
+  // later arrival under the same fp: key. Build that real pre-upgrade overlap
+  // through RPCs, so recovery must preserve both arrivals instead of upserting
+  // over the original receipt.
+  const hashE = sha('synthetic-legacy-fingerprint-overlap');
+  const connectionE = await createConnection(E, hashE);
+  const legacyContent = { ...sameContent, hash: hashE };
+  const legacyFirst = await receive(legacyContent);
+  await review(E, legacyFirst.id, 'ignore');
+  await db.query(`insert into public.finance_shortcut_inbox
+    (user_id,connection_id,event_key,fingerprint,payload,status,reason)
+    select $1,$2,'id:' || md5('legacy-filler-' || n::text) || md5('legacy-filler-' || n::text),$3,$4,'pending','pending_fixture'
+    from generate_series(1,9999) n`, [E, connectionE.id, sha('legacy-pending-filler'), sameContent.payload]);
+  const legacyReplacement = await receive(event('legacy-archive-original', { hash: hashE }));
+  equal(legacyReplacement.status, 'pending', 'legacy RPC archives its lone terminal no-ID root');
+  await review(E, legacyReplacement.id, 'ignore');
+  const legacyLater = await receive(legacyContent);
+  equal(legacyLater.duplicate, false, 'old RPC really reuses an archived fp key without its duplicate flag');
+  await review(E, legacyLater.id, 'ignore');
+  equal((await one(`select inbox_id from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and connection_id=$2 and event_key=$3`, [E, connectionE.id, legacyContent.key])).inbox_id,
+  legacyFirst.id, 'legacy overlapping fixture retains the original receipt before upgrade');
+  const preservedSnapshot = () => one(`select
+    (select md5(string_agg(to_jsonb(i)::text,'' order by id)) from public.finance_shortcut_inbox i) inbox,
+    (select md5(string_agg(concat_ws('|',inbox_id,user_id,connection_id,event_key,fingerprint,original_status,archived_at)::text,
+      '' order by user_id,connection_id,event_key)) from finance_private.shortcut_inbox_receipts) receipts,
+    (select md5(string_agg(to_jsonb(t)::text,'' order by user_id,id)) from public.transactions t) finance`);
+  const beforeUpgrade = await preservedSnapshot();
+  await db.exec(ambiguityMigrationSql);
+  equal(await preservedSnapshot(), beforeUpgrade, 'populated upgrade preserves every inbox, replay key and financial row');
+  await db.exec(ambiguityMigrationSql);
+  equal(await preservedSnapshot(), beforeUpgrade, 'migration reapplication is idempotent on populated data');
+  equal((await one(`select count(*)::integer count from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and ambiguous_of is null and duplicate_event is null`, [B])).count,
+  Number((await one('select count(*)::integer count from finance_private.shortcut_inbox_receipts where user_id=$1', [B])).count),
+  'upgrade preserves old receipts without inventing historical ambiguity flags');
+  await db.exec(`create function pg_temp.fail_shortcut_insert() returns trigger language plpgsql as $$
+    begin raise exception 'synthetic intake insert failure'; end $$;
+    create trigger fail_shortcut_insert before insert on public.finance_shortcut_inbox
+    for each row execute function pg_temp.fail_shortcut_insert();`);
+  await rejects(() => receive(recoveryInput), /synthetic intake insert failure/, 'downstream intake failure aborts archive and insert together');
+  equal(await preservedSnapshot(), beforeUpgrade, 'failed intake rolls back receipt creation and terminal deletion');
+  await db.exec('drop trigger fail_shortcut_insert on public.finance_shortcut_inbox');
+  const beforeAmbiguityCapacity = await txCount();
+  const recoveredNewEvent = await receive(recoveryInput);
+  equal(recoveredNewEvent.status, 'pending', 'terminal ambiguity leaves allow a new event to recover capacity');
+  equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1', [C])).count,
+    10000, 'duplicate-only inbox remains bounded after capacity recovery');
+  equal((await one(`select count(*)::integer count from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and fingerprint=$2`, [C, sameContent.fingerprint])).count, 1,
+  'one ambiguity leaf is retained as a permanent receipt');
+  equal(await one(`select ambiguous_of,duplicate_event,original_status from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and fingerprint=$2`, [C, sameContent.fingerprint]),
+  { ambiguous_of: root.id, duplicate_event: true, original_status: 'ignored' },
+  'archive retains the leaf parent, duplicate flag, and reviewed outcome');
+  equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where id=$1', [root.id])).count,
+    1, 'root remains available for all existing and newly pending references');
+  const recoveredSameContent = await receive(sameContent);
+  equal(recoveredSameContent.status, 'pending', 'repeated no-ID content remains a distinct reviewable arrival');
+  equal(recoveredSameContent.duplicate, true, 'recovery does not forget the duplicate content');
+  equal(await txCount(), beforeAmbiguityCapacity, 'capacity recovery never changes financial rows');
+  const recoveredLegacy = await receive(event('legacy-overlap-recovery', { hash: hashE }));
+  equal(recoveredLegacy.status, 'pending', 'capacity recovers even with an overlapping legacy fp receipt');
+  equal((await one(`select count(*)::integer count from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and fingerprint=$2 and inbox_id=any($3::uuid[])`,
+  [E, contentFingerprint, [legacyFirst.id, legacyLater.id]])).count,
+  2, 'both distinct no-ID arrivals keep permanent receipts instead of overwriting evidence');
+  equal(await one(`select event_key,original_event_key from finance_private.shortcut_inbox_receipts where inbox_id=$1`,
+    [legacyLater.id]), { event_key: `amb:${legacyLater.id}`, original_event_key: legacyContent.key },
+  'per-arrival archive key retains the original reused event key as evidence');
+
+  // A 10,000-row fixture with a cross-connection root, a terminal middle/leaf
+  // chain, and a pending child. Archive leaves before their parents; preserve
+  // the pending child and its root until the owner explicitly ignores it.
+  const hashD = sha('synthetic-ambiguity-chain-a');
+  const hashD2 = sha('synthetic-ambiguity-chain-b');
+  const connectionD = await createConnection(D, hashD);
+  const connectionD2 = await createConnection(D, hashD2);
+  const groupKey = `id:${sha('synthetic-cross-connection-chain')}`;
+  const groupFingerprint = sha('synthetic-chain-payload');
+  const chainRoot = await one(`insert into public.finance_shortcut_inbox
+    (user_id,connection_id,event_key,fingerprint,payload,status,reason,created_at)
+    values($1,$2,$3,$4,$5,'ignored','ignored_by_owner','2000-01-01') returning id`,
+  [D, connectionD.id, groupKey, groupFingerprint, sameContent.payload]);
+  const chainMiddle = await one(`insert into public.finance_shortcut_inbox
+    (user_id,connection_id,event_key,fingerprint,payload,status,reason,duplicate_event,ambiguous_of,created_at)
+    values($1,$2,$3,$4,$5,'ignored','ignored_by_owner',true,$6,'2000-01-02') returning id`,
+  [D, connectionD2.id, groupKey, groupFingerprint, sameContent.payload, chainRoot.id]);
+  const chainLeaf = await one(`insert into public.finance_shortcut_inbox
+    (user_id,connection_id,event_key,fingerprint,payload,status,reason,duplicate_event,ambiguous_of,created_at)
+    values($1,$2,'amb:' || gen_random_uuid()::text,$3,$4,'ignored','ignored_by_owner',true,$5,'2000-01-03') returning id`,
+  [D, connectionD2.id, groupFingerprint, sameContent.payload, chainMiddle.id]);
+  const pendingChild = await one(`insert into public.finance_shortcut_inbox
+    (user_id,connection_id,event_key,fingerprint,payload,status,reason,duplicate_event,ambiguous_of,created_at)
+    values($1,$2,'amb:' || gen_random_uuid()::text,$3,$4,'pending','possible_duplicate',true,$5,'2000-01-04') returning id`,
+  [D, connectionD.id, groupFingerprint, sameContent.payload, chainRoot.id]);
+  await db.query(`insert into public.finance_shortcut_inbox
+    (user_id,connection_id,event_key,fingerprint,payload,status,reason)
+    select $1,$2,'id:' || md5('chain-filler-' || n::text) || md5('chain-filler-' || n::text),$3,$4,'pending','pending_fixture'
+    from generate_series(1,9996) n`, [D, connectionD.id, sha('pending-chain-filler'), sameContent.payload]);
+  for (const [seed, expectedArchived] of [['peel-leaf', chainLeaf.id], ['peel-middle', chainMiddle.id]]) {
+    equal((await receive(event(seed, { hash: hashD }))).status, 'pending', 'terminal chain frees one slot per receive');
+    equal((await one('select count(*)::integer count from finance_private.shortcut_inbox_receipts where inbox_id=$1',
+      [expectedArchived])).count, 1, 'chain is archived from leaves toward the root');
+  }
+  equal(await receive(event('pending-reference-protects-root', { hash: hashD })), { error: 'shortcut_inbox_limit' },
+    'backpressure preserves a terminal root referenced by pending work');
+  equal((await one('select status,ambiguous_of from public.finance_shortcut_inbox where id=$1', [pendingChild.id])),
+    { status: 'pending', ambiguous_of: chainRoot.id }, 'pending child and its comparison reference are untouched');
+  await review(D, pendingChild.id, 'ignore');
+  equal((await receive(event('peel-reviewed-child', { hash: hashD }))).status, 'pending', 'reviewed child can now be archived');
+  equal((await receive(event('peel-final-root', { hash: hashD }))).status, 'pending', 'final terminal root can be archived after all its children');
+  equal((await one(`select count(*)::integer count from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and inbox_id=any($2::uuid[])`, [D, [chainRoot.id, chainMiddle.id, chainLeaf.id, pendingChild.id]])).count,
+    4, 'every row of the terminal chain is retained as evidence');
+  equal((await one('select count(*)::integer count from public.finance_shortcut_inbox where user_id=$1', [D])).count,
+    10000, 'chain recovery retains all 9,996 unrelated pending items and four new pending arrivals');
+  equal(await receive(event('archived-chain-replay', { hash: hashD, key: groupKey, fingerprint: groupFingerprint })),
+    { status: 'ignored', id: chainRoot.id, duplicate: true, archived: true }, 'archived chain root still deduplicates a stable ID');
+  equal(await receive(event('archived-chain-other-connection', { hash: hashD2, key: groupKey, fingerprint: groupFingerprint })),
+    { status: 'ignored', id: chainMiddle.id, duplicate: true, archived: true }, 'cross-connection stable ID history remains independently deduplicated');
+  const replayContentAfterArchive = await receive(event('no-id-after-chain-archive', {
+    hash: hashD2, key: `fp:${groupFingerprint}`, fingerprint: groupFingerprint,
+  }));
+  equal(replayContentAfterArchive, { error: 'shortcut_inbox_limit' }, 'all-pending inbox still refuses to discard pending work');
+  const pendingReplacement = await one(`select id from public.finance_shortcut_inbox
+    where user_id=$1 and event_key=$2`, [D, event('peel-final-root').key]);
+  await review(D, pendingReplacement.id, 'ignore');
+  const recoveredArchivedContent = await receive(event('no-id-after-chain-archive', {
+    hash: hashD2, key: `fp:${groupFingerprint}`, fingerprint: groupFingerprint,
+  }));
+  equal(recoveredArchivedContent.status, 'pending', 'ignoring one pending replacement restores a slot');
+  equal(recoveredArchivedContent.duplicate, true, 'no-ID duplicate detection includes archived fingerprint receipts');
+  equal(await one('select reason,duplicate_event,ambiguous_of from public.finance_shortcut_inbox where id=$1',
+    [recoveredArchivedContent.id]), { reason: 'possible_duplicate', duplicate_event: true, ambiguous_of: null },
+  'archived duplicate remains reviewable without a dangling foreign key');
+  equal((await one(`select count(*)::integer count from finance_private.shortcut_inbox_receipts
+    where user_id=$1 and ambiguous_of=any($2::uuid[]) and duplicate_event`,
+  [D, [chainRoot.id, chainMiddle.id]])).count, 3, 'all archived chain edges and duplicate flags remain available');
+  const hashF = sha('synthetic-receipt-owner-isolation');
+  await createConnection(F, hashF);
+  const otherOwnerArrival = await receive(event('other-owner-archived-content', {
+    hash: hashF, key: `fp:${groupFingerprint}`, fingerprint: groupFingerprint,
+  }));
+  equal(otherOwnerArrival.duplicate, false, 'another owner archived fingerprint cannot mark an arrival duplicate');
+  const hashE2 = sha('synthetic-receipt-connection-isolation');
+  await createConnection(E, hashE2);
+  await review(E, recoveredLegacy.id, 'ignore');
+  const otherConnectionArrival = await receive({ ...legacyContent, hash: hashE2 });
+  equal(otherConnectionArrival.status, 'pending', 'another connection fingerprint arrival remains reviewable at capacity');
+  equal(otherConnectionArrival.duplicate, false, 'same-owner receipts from another connection cannot mark no-ID content duplicate');
+  equal(await txCount(), beforeAmbiguityCapacity, 'isolated duplicate checks leave financial data unchanged');
+  await rejects(() => receive(event('new-migration-owner-intake'), 'authenticated', A), /permission denied/,
+    'updated intake remains inaccessible to authenticated Data API users');
+  await rejects(() => receive(event('new-migration-anonymous-intake'), 'anon', null), /permission denied/,
+    'updated intake remains inaccessible to anonymous Data API users');
+  equal((await one(`select has_table_privilege('authenticated','finance_private.shortcut_inbox_receipts','SELECT') granted`)).granted,
+    false, 'new receipt evidence does not gain client table access');
+
   const intakeDef = (await one("select pg_get_functiondef('finance_private.shortcut_receive(text,text,text,jsonb,numeric,text,timestamptz,text,boolean,text)'::regprocedure) as body")).body;
   const listInboxDef = (await one("select pg_get_functiondef('finance_private.shortcut_list_inbox()'::regprocedure) as body")).body;
   const reviewDef = (await one("select pg_get_functiondef('finance_private.shortcut_review(uuid,text,text,text,numeric,text,timestamptz)'::regprocedure) as body")).body;
@@ -445,7 +647,8 @@ try {
   assert.match(intakeDef, /insert into finance_private\.shortcut_inbox_receipts[\s\S]+delete from public\.finance_shortcut_inbox/); assertions += 1;
   assert.match(intakeDef, /reference_row\.ambiguous_of = finance_shortcut_inbox\.id/); assertions += 1;
   assert.match(reviewDef, /not item\.duplicate_event/); assertions += 1;
-  assert.match(intakeDef, /not exists \([\s\S]+other\.fingerprint = finance_shortcut_inbox\.fingerprint/); assertions += 1;
+  assert.match(intakeDef, /perform 1 from finance_private\.shortcut_inbox_receipts[\s\S]+fingerprint = p_fingerprint/); assertions += 1;
+  assert.doesNotMatch(intakeDef, /other\.fingerprint = finance_shortcut_inbox\.fingerprint/); assertions += 1;
   assert.match(listInboxDef, /order by created_at desc, id desc limit 100/); assertions += 1;
   assert.match(listInboxDef, /jsonb_agg[\s\S]+order by i\.created_at desc, i\.id desc/); assertions += 1;
   assert.match(reviewDef, /pg_advisory_xact_lock[\s\S]+for update/); assertions += 1;
