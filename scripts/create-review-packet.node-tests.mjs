@@ -281,6 +281,7 @@ function credentialUris() {
     ['postgresql', '%3A%2F%2Ffixture-user%3A', credential, '%40db.example.invalid/fixture'].join('').replaceAll('/', '\\/'),
     ['postgresql', '://fixture-user:', credential, '%zz@db.example.invalid/fixture'].join(''),
     ['unrelated%zz ', uri].join(''),
+    ['postgresql', '://fixture-user:', credential, "!$&'()*+,;=@[::1]/fixture"].join(''),
   ] };
 }
 

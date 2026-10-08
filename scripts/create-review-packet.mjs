@@ -50,7 +50,7 @@ function credentialUri(value) {
   // Encoded delimiters are conservative: an ambiguous match aborts the packet.
   // Consume each complete authority once; requiring @ in the main expression
   // would repeatedly rescan nested encoded scheme prefixes with no userinfo.
-  const pattern = /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*(?::|%3a)(?:\/|%2f){2}([^\s/?#"'<>`\\]*)/gi;
+  const pattern = /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*(?::|%3a)(?:\/|%2f){2}([^\s/?#"<>`\\]*)/gi;
   let view = value;
   for (let depth = 0; depth < 3; depth++) {
     for (const [, authority] of view.matchAll(pattern)) {
