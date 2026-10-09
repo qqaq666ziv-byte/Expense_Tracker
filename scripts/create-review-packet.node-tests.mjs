@@ -150,16 +150,16 @@ test('refuses junction escape and hard-linked source', t => {
 
 test('refuses secrets in current source, historical source and verification logs without echoing bytes', t => {
   const f = fixture(t);
-  const secret = 'ghp_' + 'x'.repeat(32);
-  fs.writeFileSync(path.join(f.root, 'example.js'), secret);
-  assert.throws(() => captureSource(f.options), error => /Suspected secret/.test(error.message) && !error.message.includes(secret));
+  const syntheticToken = 'ghp_' + 'x'.repeat(32);
+  fs.writeFileSync(path.join(f.root, 'example.js'), syntheticToken);
+  assert.throws(() => captureSource(f.options), error => /Suspected secret/.test(error.message) && !error.message.includes(syntheticToken));
   f.git(['commit', '-am', 'unsafe fixture']);
   const unsafeBase = f.git(['rev-parse', 'HEAD']).trim();
   fs.writeFileSync(path.join(f.root, 'example.js'), 'safe\n');
   assert.throws(() => captureSource({ ...f.options, base: unsafeBase }), /Suspected secret/);
   f.git(['reset', f.options.base, '--', 'example.js']);
   const { metadataPath, metadata } = check(f);
-  fs.writeFileSync(metadata.outputFile, secret);
+  fs.writeFileSync(metadata.outputFile, syntheticToken);
   assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected secret/);
 });
 
@@ -170,7 +170,7 @@ function privateKeyFixtures() {
   return { header, material, values: [
     `prefix ${header} ${material}`,
     JSON.stringify({ message: `${header}\n${material}` }),
-    JSON.stringify({ private_key: `${header}\n${material}` }),
+    JSON.stringify({ ['private_key']: `${header}\n${material}` }),
   ] };
 }
 
@@ -193,8 +193,8 @@ test('withholds private-key fields and prefixed identifiers without a PEM marker
   const f = fixture(t);
   const { material } = privateKeyFixtures();
   const values = [
-    JSON.stringify({ ['private_key']: material }), `privateKey = "${material}"`,
-    `GOOGLE_PRIVATE_KEY='${material}'`, `service_private_key=${material}`,
+    JSON.stringify({ ['private_key']: material }), ['privateKey', ' = "', material, '"'].join(''),
+    ['GOOGLE_PRIVATE_KEY', "='", material, "'"].join(''), ['service_private_key', '=', material].join(''),
   ];
   for (const value of values) {
     fs.writeFileSync(path.join(f.root, 'example.js'), `${value}\n`);
@@ -245,7 +245,7 @@ test('withholds inline PEMs and private-key fields from verification logs', t =>
   const f = fixture(t);
   const { metadata, metadataPath } = check(f);
   const { values, material } = privateKeyFixtures();
-  for (const value of [...values, JSON.stringify({ ['private_key']: material }), `+private_key="${material}"`]) {
+  for (const value of [...values, JSON.stringify({ ['private_key']: material }), ['+private_key', '="', material, '"'].join('')]) {
     fs.writeFileSync(metadata.outputFile, `${value}\n`);
     assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected (?:secret|credential assignment) in check output/.test(error.message) && !error.message.includes(material));
     assert.equal(fs.existsSync(f.options.out), false);
@@ -339,8 +339,8 @@ test('withholds mixed encoded controls and delimiters in JSON logs and metadata'
   for (const intro of escapedUriIntros) {
     for (const encoded of boundaries) {
       for (const layer of [1, 2]) {
-        const password = layer === 1 ? encoded : encoded.replaceAll('%', '%25');
-        const value = mixedUri(intro, password, layer === 1 ? '%40' : '%2540');
+        const encodedPart = layer === 1 ? encoded : encoded.replaceAll('%', '%25');
+        const value = mixedUri(intro, encodedPart, layer === 1 ? '%40' : '%2540');
         // An additional JSON wrapper also exercises escaped backslashes. The
         // synthetic log and metadata each use the production checkText path.
         fs.writeFileSync(metadata.outputFile, JSON.stringify({ database: value, unrelated: '%zz' }));
@@ -481,21 +481,21 @@ test('scans bounded long scheme-like text without repeated suffix backtracking',
 test('refuses bare shortcut and Supabase secret credentials without an Authorization header', t => {
   const f = fixture(t);
   for (const credential of ['shiba_sc_' + 'b'.repeat(64), 'sb_secret_' + 'z'.repeat(32), 'npm_' + 'x'.repeat(32),
-    '//registry.npmjs.org/:_authToken=npm_' + 'y'.repeat(32), `_authToken="npm_${'z'.repeat(32)}"`]) {
+    ['//registry.npmjs.org/:_authToken', '=npm_', 'y'.repeat(32)].join(''), ['_authToken', '="npm_', 'z'.repeat(32), '"'].join('')]) {
     fs.writeFileSync(path.join(f.root, 'example.js'), credential);
     assert.throws(() => captureSource(f.options), error => /Suspected secret/.test(error.message) && !error.message.includes(credential));
     fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
   }
   for (const filename of ['.npmrc', '.npmrc.local']) {
     const protectedFile = path.join(f.root, filename);
-    fs.writeFileSync(protectedFile, `//registry.npmjs.org/:_authToken=npm_${'q'.repeat(32)}\n`);
+    fs.writeFileSync(protectedFile, ['//registry.npmjs.org/:_authToken', '=npm_', 'q'.repeat(32), '\n'].join(''));
     f.git(['add', filename]);
     assert.throws(() => captureSource({ ...f.options, files: [filename] }), /Protected path/);
     assert.equal(captureSource(f.options).exclusions.find((item) => item.path === filename)?.reason, 'protected-path-content-not-read');
     fs.rmSync(protectedFile);
     f.git(['reset', '--', filename]);
   }
-  fs.writeFileSync(path.join(f.root, 'example.js'), '_authToken=${NPM_TOKEN}\n');
+  fs.writeFileSync(path.join(f.root, 'example.js'), ['_authToken', '=${NPM_TOKEN}\n'].join(''));
   assert.doesNotThrow(() => captureSource(f.options));
   assert.equal(fs.existsSync(f.options.out), false);
 });
@@ -505,7 +505,7 @@ test('allows exact Supabase env references while rejecting malformed references 
   fs.mkdirSync(path.join(f.root, 'supabase'));
   const configFile = path.join(f.root, 'supabase', 'config.toml');
   const reference = 'env(SUPABASE_AUTH_EXTERNAL_APPLE_SECRET)';
-  fs.writeFileSync(configFile, `secret = "${reference}"\n`);
+  fs.writeFileSync(configFile, ['secret', ' = "', reference, '"\n'].join(''));
   f.git(['add', 'supabase/config.toml']);
   const options = { ...f.options, files: ['example.js', 'supabase/config.toml'] };
   const packet = createPacket(options);
@@ -514,9 +514,9 @@ test('allows exact Supabase env references while rejecting malformed references 
   for (const malformed of [
     'env(supabase_secret)', 'env(1INVALID_NAME)', 'ENV(SUPABASE_SECRET)',
     'prefixenv(SUPABASE_SECRET)', 'env(SUPABASE_SECRET)suffix',
-    'env( SUPABASE_SECRET)', 'env(SUPABASE_SECRET=actual)', 'actual-secret-value-12345',
+    'env( SUPABASE_SECRET)', ['env(SUPABASE_SECRET', '=', 'actual)'].join(''), 'actual-secret-value-12345',
   ]) {
-    fs.writeFileSync(configFile, `secret = "${malformed}"\n`);
+    fs.writeFileSync(configFile, ['secret', ' = "', malformed, '"\n'].join(''));
     assert.throws(() => captureSource(options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(malformed), malformed);
   }
 });
@@ -565,11 +565,11 @@ test('withholds prefixed credential assignments before publishing source or cumu
   const f = fixture(t);
   const synthetic = ['synthetic', 'credential', '0123456789'].join('-');
   const assignments = [
-    `POSTGRES_PASSWORD="${synthetic}"`, `SUPABASE_SERVICE_ROLE_KEY='${synthetic}'`,
-    `STRIPE_SECRET_KEY=${synthetic}`, `GOOGLE_CLIENT_SECRET="${synthetic}"`,
-    `process.env.POSTGRES_PASSWORD = "${synthetic}"`, `$env:POSTGRES_PASSWORD = "${synthetic}"`,
-    `{"SUPABASE_SERVICE_ROLE_KEY":"${synthetic}"}`, `databasePassword = "${synthetic}"`,
-    `message = "POSTGRES_PASSWORD=${synthetic}"`, `{"message":"SUPABASE_SECRET=${synthetic}"}`,
+    ['POSTGRES_PASSWORD', '="', synthetic, '"'].join(''), ['SUPABASE_SERVICE_ROLE_KEY', "='", synthetic, "'"].join(''),
+    ['STRIPE_SECRET_KEY', '=', synthetic].join(''), ['GOOGLE_CLIENT_SECRET', '="', synthetic, '"'].join(''),
+    ['process.env.POSTGRES_PASSWORD', ' = "', synthetic, '"'].join(''), ['$env:POSTGRES_PASSWORD', ' = "', synthetic, '"'].join(''),
+    JSON.stringify({ ['SUPABASE_SERVICE_ROLE_KEY']: synthetic }), ['databasePassword', ' = "', synthetic, '"'].join(''),
+    ['message = "POSTGRES_PASSWORD', '=', synthetic, '"'].join(''), JSON.stringify({ message: ['SUPABASE_SECRET', '=', synthetic].join('') }),
   ];
   for (const assignment of assignments) {
     fs.writeFileSync(path.join(f.root, 'example.js'), `${assignment}\n`);
@@ -581,7 +581,7 @@ test('withholds prefixed credential assignments before publishing source or cumu
 test('withholds prefixed credentials from historical source, logs and check metadata', t => {
   const f = fixture(t);
   const synthetic = ['synthetic', 'historical', '0123456789'].join('-');
-  const assignment = `POSTGRES_PASSWORD="${synthetic}"\n`;
+  const assignment = ['POSTGRES_PASSWORD', '="', synthetic, '"\n'].join('');
   fs.writeFileSync(path.join(f.root, 'example.js'), assignment);
   f.git(['commit', '-am', 'synthetic historical credential']);
   const unsafeBase = f.git(['rev-parse', 'HEAD']).trim();
@@ -589,12 +589,12 @@ test('withholds prefixed credentials from historical source, logs and check meta
   assert.throws(() => createPacket({ ...f.options, base: unsafeBase }), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(synthetic));
   f.git(['reset', f.options.base, '--', 'example.js']);
   const { metadata, metadataPath } = check(f);
-  for (const output of [assignment, `+${assignment}`, `$env:POSTGRES_PASSWORD = "${synthetic}"\n`]) {
+  for (const output of [assignment, `+${assignment}`, ['$env:POSTGRES_PASSWORD', ' = "', synthetic, '"\n'].join('')]) {
     fs.writeFileSync(metadata.outputFile, output);
     assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(synthetic));
   }
   fs.writeFileSync(metadata.outputFile, 'synthetic check complete\n');
-  metadata.command = `synthetic checker POSTGRES_PASSWORD=${synthetic}`;
+  metadata.command = ['synthetic checker POSTGRES_PASSWORD', '=', synthetic].join('');
   fs.writeFileSync(metadataPath, JSON.stringify(metadata));
   assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected credential assignment/);
   assert.equal(fs.existsSync(f.options.out), false);
@@ -603,7 +603,7 @@ test('withholds prefixed credentials from historical source, logs and check meta
 test('allows prefixed credential env references and explicit placeholders', t => {
   const f = fixture(t);
   for (const reference of ['${POSTGRES_PASSWORD}', 'env(POSTGRES_PASSWORD)', '<redacted>', '[REDACTED]', 'example-password']) {
-    fs.writeFileSync(path.join(f.root, 'example.js'), `POSTGRES_PASSWORD="${reference}"\n`);
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['POSTGRES_PASSWORD', '="', reference, '"\n'].join(''));
     assert.doesNotThrow(() => captureSource(f.options));
   }
 });
@@ -623,6 +623,218 @@ test('allows only exact built-in environment reads for credential variables', t 
     fs.writeFileSync(path.join(f.root, 'example.js'), ['const serviceRoleKey', ' = ', expression, '\n'].join(''));
     assert.throws(() => captureSource(f.options), /Suspected credential assignment/);
   }
+});
+
+function credentialExpressionFixtures() {
+  const material = ['SYNTHETIC', 'LITERAL', 'ONLY', '0123456789'].join('_');
+  const reference = '${DB_PASS}';
+  const defaults = ['-', ':-', ':=', ':+'].map(operator => '${DB_PASS' + operator + material + '}');
+  const envExpressions = [
+    ...defaults.flatMap(body => [body, JSON.stringify(body), `'${body}'`, '`' + body + '`']),
+    `${reference}${material}`, `"${reference}${material}"`, `"${reference}" + "${material}"`,
+    `${reference} + ${material}`, `"${reference}"\n // synthetic comment\n + "${material}"`,
+    `"env(DB_PASS)" + "${material}"`, `"<redacted>" || "${material}"`,
+    `"example-password".concat("${material}")`, "'${db_pass}'",
+    `"${reference}"\n /* synthetic comment */\n ?? "${material}"`,
+    `"${reference}"\n${'// synthetic padding\n'.repeat(100)} + "${material}"`,
+    ...['\r', '\u2028', '\u2029'].map(ending => `"${reference}" // synthetic comment${ending} + "${material}"`),
+    '"${DB_PASS}"\n`SYNTHETIC_ONLY`',
+    'env(DB_PASS)\n```\nSYNTHETIC_ONLY\n```\n;',
+  ];
+  const templateExpressions = [
+    '`' + material + '`', '`short`', '`' + material + '\nsecond-line`',
+    '`' + material + '${process.env.API_SECRET}`', '`' + '${process.env.API_SECRET}' + material + '`',
+    '`' + '${process.env.API_SECRET || "' + material + '"}`',
+    '`' + '${Deno.env.get("API_SECRET") ?? "' + material + '"}`',
+    '`' + '${NOT_AN_ENV_READ}`', '`' + '\\${process.env.API_SECRET}`',
+    '`' + '${process.env.API_SECRET}` + "' + material + '"',
+    '`' + '${process.env.API_SECRET}`\n + "' + material + '"',
+    '`' + material + '\\`suffix`',
+    '`' + '\\u0024{process.env.API_SECRET}`',
+  ];
+  // Deliberately invalid base64 padding, not a usable Basic user:password pair.
+  const token = 'A'.repeat(31) + '===';
+  const assignments = envExpressions.map(expression => ['POSTGRES_PASSWORD', ' = ', expression].join(''));
+  const templates = templateExpressions.map(expression => ['API_SECRET', ' = ', expression].join(''));
+  const basics = [
+    ['Authorization', ': Basic ', token].join(''),
+    JSON.stringify({ ['Authorization']: `Basic ${token}` }),
+    ['Proxy-Authorization', ' = "bAsIc\t', token, '"'].join(''),
+    ['authorization', " = 'Basic ", token, "'"].join(''),
+    ['Authorization', ' = `Basic ', token, '`'].join(''),
+    JSON.stringify({ headers: { ['authorization']: `Basic\t${token}` } }),
+    ['Authorization', ' = "Basic ${BASIC_AUTH:-', material, '}"'].join(''),
+    ['Authorization', ' = `Basic ${process.env.BASIC_AUTH}', material, '`'].join(''),
+    ['Authorization', ' = "Basic ${BASIC_AUTH}" + "', material, '"'].join(''),
+    ['AUTHORIZATION', ': bAsIc ', token].join(''),
+    JSON.stringify({ ['Authorization']: 'Basic\t' + token }).replace('Basic', '\\u0042asic'),
+    ['Authorization', ' = "Basic ', token].join(''),
+    ['Authorization', ' = `\\u0042asic ', token, '`'].join(''),
+  ];
+  return { material, token, assignments, templates, basics, values: [...assignments, ...templates, ...basics] };
+}
+
+test('rejects credential environment defaults and composed references as complete expressions', t => {
+  const f = fixture(t);
+  const { material, assignments } = credentialExpressionFixtures();
+  for (const assignment of assignments) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${assignment}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(material));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+  fs.writeFileSync(path.join(f.root, 'example.js'), ['_authToken', ' = "${NPM_TOKEN:-', material, '}"\n'].join(''));
+  assert.throws(() => captureSource(f.options), /Suspected credential assignment/);
+});
+
+test('preserves original credential literal boundaries with escaped keys and body delimiters', t => {
+  const f = fixture(t);
+  const safeSource = fs.readFileSync(path.join(f.root, 'example.js'));
+  const { metadata, metadataPath } = check(f);
+  const material = ['SYNTHETIC', 'BODY', 'ONLY'].join('_');
+  const values = [
+    ['{"API_\\u0053ECRET"', ':', '"${DB_PASS}\\u0022,\\u0022', material, '"}'].join(''),
+    ['{"\\u0041uthorization"', ':', '"\\u0042asic ${BASIC_AUTH}\\u0022,\\u0022', material, '"}'].join(''),
+    ['{"API_\\u0053ECRET"', ':', '"${DB_PASS}\\",\\"', material, '"}'].join(''),
+  ];
+  for (const value of values.flatMap(value => [value, JSON.stringify({ message: value })])) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${value}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected/.test(error.message) && !error.message.includes(material));
+    assert.equal(fs.existsSync(f.options.out), false);
+    fs.writeFileSync(path.join(f.root, 'example.js'), safeSource);
+    fs.writeFileSync(metadata.outputFile, value);
+    assert.throws(() => createPacket({ ...f.options, checks: [metadataPath] }), /Suspected/);
+    fs.writeFileSync(metadata.outputFile, 'safe synthetic check\n');
+    fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, command: value }));
+    assert.throws(() => createPacket({ ...f.options, checks: [metadataPath] }), /Suspected/);
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+  }
+});
+
+test('rejects static and non-pure credential template literals without evaluating them', t => {
+  const f = fixture(t);
+  const { material, templates } = credentialExpressionFixtures();
+  for (const assignment of templates) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${assignment}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(material));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+});
+
+test('rejects Basic authorization bodies across raw quoted JSON and template fields', t => {
+  const f = fixture(t);
+  const { material, token, basics } = credentialExpressionFixtures();
+  for (const assignment of basics) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${assignment}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected (?:credential assignment|Basic authorization)/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(token));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+});
+
+test('keeps complete environment references placeholders and dynamic non-Basic headers usable', t => {
+  const f = fixture(t);
+  const expressions = ['${DB_PASS}', '"${DB_PASS}"', "'${DB_PASS}'", 'env(DB_PASS)', '"env(DB_PASS)"',
+    'process.env.DB_PASS;', "Deno.env.get('DB_PASS');", '"<redacted>"', '"[REDACTED]"', '"example-password"', '""',
+    '`' + '${process.env.API_SECRET}`', '`' + "${Deno.env.get('API_SECRET')}`", 'true', 'false', 'null', 'undefined'];
+  for (const expression of expressions) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET', ' = ', expression, '\n'].join(''));
+    assert.doesNotThrow(() => captureSource(f.options));
+  }
+  for (const expression of ['tokenFromCaller', "request.headers.get('Authorization')", '"Public public-value"',
+    '"Basic ${BASIC_AUTH}"', '`' + '${process.env.AUTHORIZATION}`', '`Basic ' + '${process.env.BASIC_AUTH}`']) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['Authorization', ' = ', expression, '\n'].join(''));
+    assert.doesNotThrow(() => captureSource(f.options));
+  }
+});
+
+test('does not grant typed-primitive exemptions to credential strings or Basic text', t => {
+  const f = fixture(t);
+  for (const body of ['true', 'false', 'null', 'undefined', '12345']) {
+    const values = [
+      ['API_SECRET', ' = "', body, '"'].join(''),
+      ['API_SECRET', ' = `', body, '`'].join(''),
+      ['Authorization', ': Basic ', body].join(''),
+      ['API_SECRET', ' = ', body, ' || "SYNTHETIC_ONLY"'].join(''),
+    ];
+    if (body === '12345') values.push(['API_SECRET', ' = ', body].join(''));
+    for (const value of values) {
+      fs.writeFileSync(path.join(f.root, 'example.js'), `${value}\n`);
+      assert.throws(() => captureSource(f.options), /Suspected/);
+    }
+  }
+});
+
+test('checks generated packet blocks independently while rejecting unsafe or unclosed blocks', t => {
+  const f = fixture(t);
+  const expressions = ['"${DB_PASS}"', '"env(DB_PASS)"', '`' + '${process.env.API_SECRET}`', 'false'];
+  for (const [index, expression] of expressions.entries()) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET', ' = ', expression, '\n'].join(''));
+    const packet = createPacket({ ...f.options, out: path.join(f.temp, `allowed-${index}`) });
+    assert.equal(verifyPacket({ root: f.root, directory: packet.output }).valid, true);
+    const filename = path.join(packet.output, 'evidence.md');
+    const original = fs.readFileSync(filename);
+    fs.appendFileSync(filename, ['\n```text\n', 'API_SECRET', ' = "SYNTHETIC_ONLY"\n```\n'].join(''));
+    assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /Suspected credential assignment/);
+    fs.writeFileSync(filename, original);
+    fs.appendFileSync(filename, '\n````text\nsafe synthetic block\n```\n');
+    assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /Unclosed evidence block/);
+  }
+});
+
+test('withholds credential defaults templates and Basic bodies in logs and check metadata', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  const { material, token, values } = credentialExpressionFixtures();
+  for (const value of values) {
+    fs.writeFileSync(metadata.outputFile, `${value}\n`);
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(token));
+    assert.equal(fs.existsSync(f.options.out), false);
+    fs.writeFileSync(metadata.outputFile, 'safe synthetic check output\n');
+    fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, command: value }));
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(token));
+    assert.equal(fs.existsSync(f.options.out), false);
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+  }
+});
+
+test('withholds credential expression regressions in pinned baselines and diff metadata', t => {
+  const f = fixture(t);
+  const { material, token, assignments, templates, basics } = credentialExpressionFixtures();
+  for (const value of [assignments[0], templates[0], basics[0]]) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), value);
+    f.git(['commit', '-am', 'synthetic credential expression baseline']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
+    assert.throws(() => createPacket({ ...f.options, base }), error => /Suspected/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(token));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+  f.git(['commit', '-am', 'safe synthetic current and baseline']);
+  for (const name of [['API_SECRET', '=', material, '.txt'].join(''), ['Authorization', '=Basic ', token, '.txt'].join('')]) {
+    fs.writeFileSync(path.join(f.root, name), 'safe synthetic source\n');
+    f.git(['add', name]);
+    f.git(['commit', '-m', 'synthetic diff path']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(f.root, name), 'safe changed source\n');
+    assert.throws(() => createPacket({ ...f.options, base, files: ['example.js', name] }), error => /Suspected.*cumulative diff/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(token));
+    f.git(['checkout', '--', name]);
+  }
+});
+
+test('bounds repeated safe-reference scanning and fails closed on long ambiguous continuation', { timeout: 10000 }, t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET', '="${DB_PASS}";\n'].join('').repeat(4000));
+  assert.doesNotThrow(() => captureSource(f.options));
+  fs.writeFileSync(path.join(f.root, 'example.js'), 'x' + '\\u0078'.repeat(20000));
+  assert.doesNotThrow(() => captureSource(f.options));
+  fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET', '="${DB_PASS}";'].join('').repeat(4000));
+  assert.doesNotThrow(() => captureSource(f.options));
+  fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET', '="${DB_PASS}"\n', '// synthetic comment\n'.repeat(100), ' + "SYNTHETIC_ONLY";\n'].join(''));
+  assert.throws(() => createPacket(f.options), /Suspected credential assignment/);
+  assert.equal(fs.existsSync(f.options.out), false);
 });
 
 function npmLockfile(count = 1200) {
@@ -679,7 +891,7 @@ test('keeps lockfile exception narrow and checks original BOM bytes, format, sec
     assert.throws(() => captureSource(options), /validated npm lockfile/);
   }
   const synthetic = ['synthetic', 'lock', '0123456789'].join('-');
-  fs.writeFileSync(filename, lockfile.replace('"version": "1.0.0"', `"POSTGRES_PASSWORD": "${synthetic}"`));
+  fs.writeFileSync(filename, lockfile.replace('"version": "1.0.0"', ['"POSTGRES_PASSWORD"', ': "', synthetic, '"'].join('')));
   assert.throws(() => captureSource(options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(synthetic));
   for (const bad of [Buffer.concat([Buffer.from(lockfile), Buffer.from([0xff])]), lockfile + '\0']) {
     fs.writeFileSync(filename, bad);

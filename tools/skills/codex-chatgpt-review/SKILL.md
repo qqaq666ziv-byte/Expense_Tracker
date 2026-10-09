@@ -120,6 +120,10 @@ credential URI 檢查涵蓋一般 scheme 的 authority userinfo，包含 databas
 
 URI 偵測在每輪 JSON escape 與 percent 正規化之間先掃描。percent 只解出 unreserved ASCII、scheme／userinfo 識別字元與下一層 percent；其餘 octets 保留編碼，避免空白、控制字元、引號、backslash 或 URI delimiters 在 userinfo 中变成截斷點。percent 包住 JSON escape 時也按 escape token 處理，帶 percent 來源的邊界仍保留編碼；原始 JSON path delimiter 可以還原。偵測視圖最多正規化兩輪，不改寫原始證據；有歧義的編碼內容仍可能保守中止。
 
+credential assignment 的 quoted／bare／backtick 值共用完整 body 與 expression 邊界檢查；只有完整 uppercase `${NAME}`／`env(NAME)`、既有精確終止的 built-in env read、完整 placeholder，或單一明確 built-in env interpolation 可豁免。未加引號的 exact `true`／`false`／`null`／`undefined` 可作 typed config／absence 值，仍須完整終止；此例外不適用 quoted／backtick、數字或 HTTP Basic body。default literal、拼接、prefix／suffix、非 env interpolation 不能沿用引用豁免；template 不會被執行。CR／LF／Unicode line terminator 與 comment 後的 continuation 亦拒絕，歧義 lookahead 超過 1024 字元會保守拒絕。`_authToken` 共用此判準。Basic 僅在 Authorization／Proxy-Authorization 欄位啟用 scheme／body 檢查，保留其他動態 header 行為；不解碼 base64。escaped key 會個別正規化，quoted body 在原始 literal 邊界完整擷取後才解碼；nested JSON string 最多再檢查兩層，避免 escaped quote／comma 製造假的安全截斷，template 豁免保留原始 interpolation 位元組。來源、diff、goal、logs、check metadata 與 manifest 都在 rendering 前完整檢查；生成的 Markdown 容器重查全文大小／UTF-8／token／URI，並以完整、精確配對的 fence 分開檢查各原始 block 與 headings；create／verify 共用判準，不把 fence 當成原始程式的 RHS 邊界，未閉合／錯配會拒絕。原始證據中的 fence 不會獲得額外豁免。這仍是輔助過濾與有限語法識別，可能誤攔截，也不能保證沒有任何秘密；每次分享前必須人工確認完整來源、logs／metadata 與資料均適合分享。
+
+Windows 的 case-only rename 尚未原生驗收、目前不宣告支援；case-sensitive Git scope/index 與 case-insensitive filesystem 的差異可能以 incomplete-scope／untracked 拒絕，不應縮減 scope 繞過。0700／0600 是 POSIX mode，現行工具沒有 Windows DACL 驗證或 ACL fail-closed gate，不能以 Linux 測試宣稱 Windows 隱私保證。Windows case-only rename／ACL 驗收與正式使用需另有明確授權的原生 Windows 任務；本流程不會自動修改使用者 ACL 或安裝 trusted tool。
+
 拒絕漏列的非保護路徑變更、秘密格式（含 `POSTGRES_PASSWORD` 等前綴 credential key）、保護路徑、junction／symlink／hardlink、越界、二進位、無效 UTF-8、過大資料與 stale checks。一般來源與 check log 上限仍是 256 KiB；只有 repo 根目錄的 `package-lock.json` 可在 UTF-8／秘密檢查與 npm v2/v3 JSON 結構核對後使用 512 KiB 上限，完整來源、diff、雜湊與 4 MiB 總封包上限照常適用，不因 lockfile 過大而漏列它。被 Git 忽略或受保護的私人檔案內容完全不讀，其內容變化不在 scopeDigest 的保證內；若此限制使必要驗收無法成立，狀態是缺證據。
 
 ## INIT → PLAN → EXECUTED → REVIEW → 修正／交付
