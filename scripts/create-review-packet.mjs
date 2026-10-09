@@ -309,13 +309,21 @@ function protectedMetadata(root, baseline, head, index, indexStat) {
   });
 }
 
-function visibleUntracked(root) {
-  // Without exclusion flags Git enumerates names only and does not open
-  // per-directory .gitignore files. Expand public directories ourselves, then
-  // check ignores at the first protected prefix, never inside that subtree.
-  const initial = nulList(git(root, ['ls-files', '--others', '--directory', '-z']));
+function visibleUntracked(root, tracked) {
+  // Git's directory discovery can read a nested .git file even without ignore
+  // traversal. Start with filesystem names in the authorized root instead;
+  // descend only after the public-parent ignore/protected checks below.
+  const initial = fs.readdirSync(root).filter(file => file !== '.git');
   const result = [];
   const visit = candidates => {
+    candidates = candidates.filter(file => {
+      if (!tracked.has(file.replace(/\/$/, ''))) return true;
+      // Do not let trust flags or ignores hide blob-to-directory uncertainty.
+      // Git's later diff can probe its .git, so reject before any traversal.
+      if (fs.lstatSync(path.join(root, file)).isDirectory()) incompleteProtected();
+      return false;
+    });
+    if (!candidates.length) return;
     const prefixes = candidates.map(file => {
       const parts = relativeFile(file.replace(/\/$/, '')).split('/');
       return parts.map((_part, i) => parts.slice(0, i + 1).join('/')).find(protectedPath) ?? parts.join('/');
@@ -385,9 +393,19 @@ export function captureSource({ root, base, files }) {
   }));
   const protectedState = protectedMetadata(root, baseline, head, index, indexStat);
   if (canonical(statIdentity(indexStat)) !== canonical(statIdentity(fs.lstatSync(indexPath, { bigint: true })))) incompleteProtected();
-  const untracked = visibleUntracked(root);
-  const selectedSet = new Set(selected);
   const publicPaths = [...new Set([...index.keys(), ...baseline.keys(), ...head.keys()])].filter(file => !protectedPath(file)).sort();
+  // An ignored ancestor must not hide a known blob replaced by a directory:
+  // even a name-only Git diff can probe that directory's protected .git file.
+  for (const file of publicPaths) {
+    const absolute = safeAbsolute(path.join(root, file));
+    try {
+      if (fs.lstatSync(absolute).isDirectory()) incompleteProtected();
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  const untracked = visibleUntracked(root, tracked);
+  const selectedSet = new Set(selected);
   // Never turn an empty public path list into Git's whole-repository scope.
   const changed = publicPaths.length ? [
     ...nulList(git(root, ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--', ...publicPaths])),

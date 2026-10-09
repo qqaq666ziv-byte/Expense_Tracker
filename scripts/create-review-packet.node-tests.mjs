@@ -280,6 +280,108 @@ test('rejects control-character Git names instead of truncating a protected subt
   assert.equal(fs.existsSync(options.out), false);
 });
 
+test('blocks protected directory discovery before subprocess gitfile I/O', { skip: process.platform !== 'linux' && 'Linux strace regression; other platforms unverified' }, async t => {
+  for (const parent of ['', 'public/']) {
+    for (const ignored of [false, true]) {
+      await t.test(`${parent}private, ${ignored ? 'ignored' : 'unignored'}`, sub => {
+        const f = fixture(sub);
+        const relative = `${parent}private`;
+        if (parent) {
+          fs.mkdirSync(path.join(f.root, 'public'));
+          fs.writeFileSync(path.join(f.root, 'public', 'anchor.txt'), 'public synthetic baseline\n');
+          f.git(['add', 'public/anchor.txt']);
+        }
+        if (ignored) {
+          fs.writeFileSync(path.join(f.root, '.gitignore'), `${relative}/\n`);
+          f.git(['add', '.gitignore']);
+        }
+        if (parent || ignored) f.git(['commit', '-m', 'synthetic discovery baseline']);
+        const options = { ...f.options, base: f.git(['rev-parse', 'HEAD']).trim() };
+        const directory = path.join(f.root, relative);
+        fs.mkdirSync(directory);
+        fs.writeFileSync(path.join(directory, '.git'), 'gitdir: ../missing-synthetic-git-dir\n');
+        fs.writeFileSync(path.join(directory, '.gitignore'), 'fixture.txt\n');
+        fs.writeFileSync(path.join(directory, 'fixture.txt'), 'SYNTHETIC_PRIVATE_FIXTURE\n');
+        const globalConfig = path.join(f.temp, 'synthetic-global-config');
+        fs.writeFileSync(globalConfig, '');
+        const trace = (name, command, args) => {
+          const output = path.join(f.temp, `${name}.trace`);
+          execFileSync('strace', ['-f', '-yy', '-e', 'trace=open,openat,read,pread64,mmap', '-o', output, command, ...args],
+            { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+              env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: globalConfig } });
+          return fs.readFileSync(output, 'utf8').split('\n').filter(line => line.includes(`${directory}/`) || line.includes(`<${directory}>`));
+        };
+        // Positive control proves the tracer observes Git's indirect reads;
+        // a parent-only fs.readFileSync trap would miss these syscalls.
+        const unsafe = trace('unsafe-discovery', 'git', ['-C', f.root, 'ls-files', '--others', '--directory', '-z']);
+        assert.ok(unsafe.some(line => line.includes(`${directory}/.git`) && /\bread\(/.test(line)));
+        const program = `import { createPacket, verifyPacket } from ${JSON.stringify(new URL('./create-review-packet.mjs', import.meta.url).href)};
+          const options = ${JSON.stringify(options)};
+          ${ignored ? 'const packet = createPacket(options); if (!verifyPacket({root: options.root, directory: packet.output}).valid) throw Error("invalid synthetic packet");'
+            : 'let incomplete = false; try { createPacket(options); } catch (error) { incomplete = /INCOMPLETE.*protected/i.test(error.message); } if (!incomplete) throw Error("expected protected INCOMPLETE");'}`;
+        const accesses = trace('packet-discovery', process.execPath, ['--input-type=module', '-e', program]);
+        assert.deepEqual(accesses, [], 'packet and its subprocesses must not open/read a protected subtree');
+        if (!ignored) assert.equal(fs.existsSync(options.out), false);
+      });
+    }
+  }
+});
+
+test('does not let index trust flags hide a directory replacing a tracked public file', async t => {
+  for (const flag of ['assume-unchanged', 'skip-worktree']) {
+    await t.test(flag, sub => {
+      const f = fixture(sub);
+      const container = path.join(f.root, 'container.txt');
+      fs.writeFileSync(container, 'public synthetic baseline\n');
+      f.git(['add', 'container.txt']);
+      f.git(['commit', '-m', 'tracked public file']);
+      const options = { ...f.options, base: f.git(['rev-parse', 'HEAD']).trim() };
+      f.git(['update-index', `--${flag}`, 'container.txt']);
+      fs.rmSync(container);
+      const directory = path.join(container, 'private');
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, '.git'), 'gitdir: ../missing-synthetic-git-dir\n');
+      const originalRead = fs.readFileSync;
+      sub.mock.method(fs, 'readFileSync', (file, ...args) => {
+        assert.equal(String(file).startsWith(directory + path.sep), false, 'protected bytes must not be read');
+        return originalRead(file, ...args);
+      });
+      assert.throws(() => createPacket(options), /INCOMPLETE.*protected/i);
+      assert.equal(fs.existsSync(options.out), false);
+    });
+  }
+});
+
+test('rejects a tracked-file directory replacement under an ignored ancestor before subprocess gitfile I/O', { skip: process.platform !== 'linux' && 'Linux strace regression; other platforms unverified' }, t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.root, 'public'));
+  fs.writeFileSync(path.join(f.root, 'public', 'container.txt'), 'public synthetic baseline\n');
+  fs.writeFileSync(path.join(f.root, '.gitignore'), 'public/\n');
+  f.git(['add', '-f', 'public/container.txt', '.gitignore']);
+  f.git(['commit', '-m', 'tracked file under ignored ancestor']);
+  const options = { ...f.options, base: f.git(['rev-parse', 'HEAD']).trim() };
+  const container = path.join(f.root, 'public', 'container.txt');
+  fs.rmSync(container);
+  fs.mkdirSync(container);
+  fs.writeFileSync(path.join(container, '.git'), 'gitdir: ../missing-synthetic-git-dir\n');
+  const globalConfig = path.join(f.temp, 'synthetic-global-config');
+  fs.writeFileSync(globalConfig, '');
+  const trace = (name, command, args) => {
+    const output = path.join(f.temp, `${name}.trace`);
+    execFileSync('strace', ['-f', '-yy', '-e', 'trace=open,openat,read,pread64,mmap', '-o', output, command, ...args],
+      { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: globalConfig } });
+    return fs.readFileSync(output, 'utf8').split('\n').filter(line => line.includes(`${container}/.git`));
+  };
+  const unsafe = trace('unsafe-diff', 'git', ['-C', f.root, 'diff', '--name-only', options.base, '--', 'public/container.txt']);
+  assert.ok(unsafe.some(line => /\bread\(/.test(line)));
+  const program = `import {createPacket} from ${JSON.stringify(new URL('./create-review-packet.mjs', import.meta.url).href)};
+    let incomplete = false; try {createPacket(${JSON.stringify(options)});} catch (error) {incomplete = /INCOMPLETE.*protected/i.test(error.message);}
+    if (!incomplete) throw Error("expected protected INCOMPLETE");`;
+  assert.deepEqual(trace('packet-diff', process.execPath, ['--input-type=module', '-e', program]), []);
+  assert.equal(fs.existsSync(options.out), false);
+});
+
 test('uses literal Git pathspecs for bracket names and never includes a matched protected path', t => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.root, 'choice[1].txt'), 'old literal choice\n');

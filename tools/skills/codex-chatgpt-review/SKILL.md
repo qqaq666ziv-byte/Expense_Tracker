@@ -128,7 +128,7 @@ Windows 的 case-only rename 尚未原生驗收、目前不宣告支援；case-s
 
 受保護路徑不是完整性檢查的豁免。工具只核對其 baseline／HEAD／index blob ID 與 mode、Git cached stat 及 filesystem stat 中繼資料；新增、刪除、staged／committed／working 改動、信任 flags、同秒 racily-clean 或無法解析的 stat 均回報 `INCOMPLETE`，不讀／雜湊／秘密掃描私人內容。允許的未改動受保護項目會在排除清單記錄 `changed: false`、metadata 與保守的 stat assurance，納入 scopeDigest，create／verify 重算。Git 的 32-bit cached dev／inode 等欄位按其表示核對，完整 filesystem stat 同時保留於身份；這是非 racy stat metadata 判定，不能宣稱私人位元組已被密碼學核對。
 
-diff／status 一律限定公開 literal paths，空清單不退回全 repo。未追蹤路徑先只列 metadata，再從公開父目錄判斷 ignore；不进入受保護子目錄或讀其 `.gitignore`。未被忽略的受保護路徑使封包 `INCOMPLETE`。被 repo ignore rules 排除的私人項目與子目錄仍不讀、不展開，其內容變化不在 scopeDigest 保證內；停用個人 core.excludesFile，避免個人規則暗中縮小 scope。若必要驗收依賴此類私人內容，仍屬缺證據，不能以封包有效宣稱完整。
+diff／status 一律限定公開 literal paths，空清單不退回全 repo。未追蹤路徑從 authorized root 的 filesystem 名稱 metadata 開始，只遞迴公開目錄，並以 index 已知路徑區分 tracked 項目；不使用可能讀取 nested `.git` 的 Git directory discovery。Git diff 前先以 metadata 核對所有已知公開路徑的 filesystem 型別；blob 路徑被換成目錄（即使有 trust flags 或 ignored ancestor）直接 `INCOMPLETE`，不交給 Git 探查其 `.git`。從公開父目錄先判斷 ignore／protected 邊界，不进入受保護子目錄或讀其 `.git`／`.gitignore`。未被忽略的受保護項目、或無法安全判定的 protected 子目錄即回報 `INCOMPLETE`；已有 tracked protected 檔案仍須先通過上述 metadata 核對。被 repo ignore rules 排除的私人項目與子目錄仍不讀、不展開，其內容變化不在 scopeDigest 保證內；停用個人 core.excludesFile，避免個人規則暗中縮小 scope。Linux 回歸以 strace 追蹤父／子程序 I/O（須有 strace；其他平台此項未驗證），不能只靠父程序讀檔 API 攔截宣稱此邊界成立。若必要驗收依賴此類私人內容，仍屬缺證據，不能以封包有效宣稱完整。
 
 ## INIT → PLAN → EXECUTED → REVIEW → 修正／交付
 
