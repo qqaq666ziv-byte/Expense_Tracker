@@ -1,6 +1,8 @@
 // Run with node --test; the filename intentionally stays outside Vitest's defaults.
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
 import { execFileSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -40,6 +42,31 @@ function check(fixture) {
   const metadataPath = path.join(fixture.temp, 'check.json');
   fs.writeFileSync(metadataPath, JSON.stringify(metadata));
   return { metadata, metadataPath };
+}
+
+function privateFixture(t) {
+  const f = fixture(t);
+  const privateFile = path.join(f.root, '.env.example');
+  fs.writeFileSync(privateFile, 'SYNTHETIC_PRIVATE_FIXTURE');
+  fs.utimesSync(privateFile, 1, 1);
+  f.git(['add', '.env.example']);
+  f.git(['commit', '-m', 'private metadata baseline']);
+  f.options.base = f.git(['rev-parse', 'HEAD']).trim();
+  return { ...f, privateFile };
+}
+
+function forbidPrivateReads(t, f) {
+  let reads = 0;
+  const originalRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    const name = String(file);
+    if (name === f.privateFile || name.startsWith(path.join(f.root, 'private') + path.sep)) {
+      reads++;
+      throw new Error('private bytes must not be read');
+    }
+    return originalRead(file, ...args);
+  });
+  return () => assert.equal(reads, 0);
 }
 
 test('captures dirty tracked bytes, baseline and cumulative diff with a verifiable identity', t => {
@@ -99,24 +126,180 @@ test('refuses omitted dirty, untracked and committed changes while allowing unch
   assert.throws(() => captureSource({ ...f.options, files: ['example.js', 'unrelated.js'] }), /missing.js/);
 });
 
+test('rejects changed protected scope without reading or exporting its content', t => {
+  const f = fixture(t);
+  const privateFile = path.join(f.root, '.env.example');
+  fs.writeFileSync(privateFile, 'SYNTHETIC_PRIVATE_FIXTURE');
+  fs.utimesSync(privateFile, 1, 1);
+  f.git(['add', '.env.example']);
+  f.git(['commit', '-m', 'private metadata baseline']);
+  const options = { ...f.options, base: f.git(['rev-parse', 'HEAD']).trim() };
+  fs.writeFileSync(privateFile, 'SYNTHETIC_CHANGED_FIXTURE');
+  let reads = 0;
+  const originalRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    if (file === privateFile) { reads++; throw new Error('private bytes must not be read'); }
+    return originalRead(file, ...args);
+  });
+  assert.throws(() => createPacket(options), /INCOMPLETE.*protected/i);
+  assert.equal(reads, 0);
+  assert.equal(fs.existsSync(options.out), false);
+});
+
+test('binds unchanged protected metadata and rejects same-size edits with restored mtime', t => {
+  const f = privateFixture(t);
+  const assertUnread = forbidPrivateReads(t, f);
+  const source = captureSource(f.options);
+  const excluded = source.exclusions.find(item => item.path === '.env.example');
+  assert.equal(excluded.metadata.changed, false);
+  assert.equal(excluded.metadata.assurance, 'unchanged-non-racy-git-stat-metadata');
+  assert.equal(excluded.metadata.index.objectId, excluded.metadata.baseline.objectId);
+  const packet = createPacket(f.options);
+  assert.equal(verifyPacket({ root: f.root, directory: packet.output }).valid, true);
+  fs.writeFileSync(f.privateFile, 'X'.repeat(Number(excluded.metadata.workingStat.size)));
+  // Same byte length and cached mtime still cannot hide the changed ctime.
+  assert.equal(fs.statSync(f.privateFile).size, Number(excluded.metadata.workingStat.size));
+  fs.utimesSync(f.privateFile, 1, 1);
+  assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /INCOMPLETE.*protected/i);
+  assertUnread();
+});
+
+test('rejects staged and committed protected changes including a HEAD hidden by baseline index and worktree', t => {
+  const f = privateFixture(t);
+  const assertUnread = forbidPrivateReads(t, f);
+  fs.writeFileSync(f.privateFile, 'synthetic changed staging');
+  f.git(['add', '.env.example']);
+  fs.writeFileSync(f.privateFile, 'SYNTHETIC_PRIVATE_FIXTURE');
+  fs.utimesSync(f.privateFile, 1, 1);
+  assert.throws(() => captureSource(f.options), /INCOMPLETE.*protected/i);
+  f.git(['commit', '-m', 'changed protected HEAD']);
+  f.git(['restore', `--source=${f.options.base}`, '--staged', '--worktree', '--', '.env.example']);
+  assert.throws(() => captureSource(f.options), /INCOMPLETE.*protected/i);
+  assert.equal(fs.existsSync(f.options.out), false);
+  assertUnread();
+});
+
+test('rejects protected additions, deletions, executable changes and index trust flags', async t => {
+  for (const mutation of ['add', 'delete', 'mode', 'assume-unchanged', 'skip-worktree']) {
+    await t.test(mutation, sub => {
+      const f = privateFixture(sub);
+      const assertUnread = forbidPrivateReads(sub, f);
+      if (mutation === 'add') { fs.writeFileSync(path.join(f.root, '.npmrc'), 'synthetic fixture'); f.git(['add', '.npmrc']); }
+      if (mutation === 'delete') { f.git(['rm', '.env.example']); fs.writeFileSync(f.privateFile, 'synthetic ignored replacement'); }
+      if (mutation === 'mode') f.git(['update-index', '--chmod=+x', '.env.example']);
+      if (mutation === 'assume-unchanged' || mutation === 'skip-worktree') f.git(['update-index', `--${mutation}`, '.env.example']);
+      assert.throws(() => createPacket(f.options), /INCOMPLETE.*protected/i);
+      assert.equal(fs.existsSync(f.options.out), false);
+      assertUnread();
+    });
+  }
+});
+
+test('rejects racily-clean protected stats, parser uncertainty and mid-capture metadata changes', t => {
+  const f = privateFixture(t);
+  const assertUnread = forbidPrivateReads(t, f);
+  const indexPath = path.join(f.root, '.git', 'index');
+  const indexTime = fs.statSync(indexPath).mtime;
+  fs.utimesSync(indexPath, 1, 1);
+  assert.throws(() => captureSource(f.options), /INCOMPLETE.*protected/i);
+  fs.utimesSync(indexPath, indexTime, indexTime);
+  const originalExec = childProcess.execFileSync;
+  childProcess.execFileSync = (command, args, ...options) => {
+    const result = originalExec(command, args, ...options);
+    if (command === 'git' && args.includes('--debug')) return Buffer.from(`${result}  unknown: 1\n`);
+    return result;
+  };
+  syncBuiltinESMExports();
+  try { assert.throws(() => captureSource(f.options), /INCOMPLETE.*protected/i); }
+  finally { childProcess.execFileSync = originalExec; syncBuiltinESMExports(); }
+  const originalRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    const bytes = originalRead(file, ...args);
+    if (file === path.join(f.root, 'example.js')) fs.utimesSync(f.privateFile, 1, 1);
+    return bytes;
+  });
+  assert.throws(() => createPacket(f.options), /INCOMPLETE.*protected/i);
+  assert.equal(fs.existsSync(f.options.out), false);
+  assertUnread();
+});
+
+test('rejects untracked protected scope before Git can read a private ignore file and skips ignored private subtrees', t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.root, 'private'));
+  fs.writeFileSync(path.join(f.root, 'private', '.gitignore'), 'fixture.txt\n');
+  fs.writeFileSync(path.join(f.root, 'private', 'fixture.txt'), 'SYNTHETIC_PRIVATE_FIXTURE');
+  const assertUnread = forbidPrivateReads(t, f);
+  const originalExec = childProcess.execFileSync;
+  let publicDiffs = 0;
+  childProcess.execFileSync = (command, args, ...options) => {
+    if (command === 'git') {
+      assert.equal(args.includes('--exclude-standard'), false);
+      if (args.includes('diff') || args.includes('status')) {
+        const paths = args.slice(args.indexOf('--') + 1);
+        assert.ok(paths.length > 0);
+        assert.ok(paths.every(file => !file.includes('private') && !file.startsWith('.env')));
+        publicDiffs++;
+      }
+      if (args.includes('show')) assert.ok(args.every(arg => !arg.includes('.env') && !arg.includes('private/')));
+      if (args.includes('check-ignore')) {
+        assert.ok(!String(options[0].input).includes('private/'));
+      }
+    }
+    return originalExec(command, args, ...options);
+  };
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => createPacket(f.options), /INCOMPLETE.*protected/i);
+    fs.writeFileSync(path.join(f.root, '.gitignore'), 'private/\n.env\n');
+    f.git(['add', '.gitignore']); f.git(['commit', '-m', 'ignore private fixture']);
+    const options = { ...f.options, base: f.git(['rev-parse', 'HEAD']).trim() };
+    fs.writeFileSync(path.join(f.root, '.env'), 'SYNTHETIC_IGNORED_FIXTURE');
+    const packet = createPacket(options);
+    assert.equal(verifyPacket({ root: f.root, directory: packet.output }).valid, true);
+    assert.ok(publicDiffs > 0);
+  } finally { childProcess.execFileSync = originalExec; syncBuiltinESMExports(); }
+  assertUnread();
+});
+
+test('rejects control-character Git names instead of truncating a protected subtree at a tab', t => {
+  const f = fixture(t);
+  const privateDirectory = path.join(f.root, 'public\t', 'private');
+  fs.mkdirSync(privateDirectory, { recursive: true });
+  const privateFile = path.join(privateDirectory, 'fixture.txt');
+  fs.writeFileSync(privateFile, 'SYNTHETIC_PRIVATE_FIXTURE');
+  f.git(['add', 'public\t/private/fixture.txt']);
+  f.git(['commit', '-m', 'unsupported path metadata']);
+  const options = { ...f.options, base: f.git(['rev-parse', 'HEAD']).trim() };
+  fs.writeFileSync(privateFile, 'SYNTHETIC_PRIVATE_CHANGE');
+  const originalRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    assert.notEqual(file, privateFile, 'private bytes must never be read');
+    return originalRead(file, ...args);
+  });
+  assert.throws(() => createPacket(options), /INCOMPLETE.*Git path metadata/i);
+  assert.equal(fs.existsSync(options.out), false);
+});
+
 test('uses literal Git pathspecs for bracket names and never includes a matched protected path', t => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.root, 'choice[1].txt'), 'old literal choice\n');
   fs.writeFileSync(path.join(f.root, '.en[v]'), 'old public source\n');
   fs.writeFileSync(path.join(f.root, '.env'), 'old protected fixture\n');
+  fs.utimesSync(path.join(f.root, '.env'), 1, 1);
   f.git(['--literal-pathspecs', 'add', 'choice[1].txt', '.en[v]', '.env']);
   f.git(['commit', '-m', 'literal baseline']);
   const base = f.git(['rev-parse', 'HEAD']).trim();
   fs.writeFileSync(path.join(f.root, 'choice[1].txt'), 'new literal choice\n');
   fs.writeFileSync(path.join(f.root, '.en[v]'), 'new public source\n');
   const withheld = 'UNSELECTED-SYNTHETIC-CONTENT';
-  fs.writeFileSync(path.join(f.root, '.env'), withheld);
   const result = createPacket({ ...f.options, base, files: ['example.js', 'choice[1].txt', '.en[v]'] });
   const evidence = fs.readFileSync(path.join(result.output, 'evidence.md'), 'utf8');
   assert.match(evidence, /\+new literal choice/);
   assert.match(evidence, /\+new public source/);
   assert.equal(evidence.includes(withheld), false);
   assert.equal(verifyPacket({ root: f.root, directory: result.output }).valid, true);
+  fs.writeFileSync(path.join(f.root, '.env'), withheld);
+  assert.throws(() => verifyPacket({ root: f.root, directory: result.output }), /INCOMPLETE.*protected/i);
 });
 
 test('retains deleted baseline source and committed feature differences', t => {
@@ -491,7 +674,7 @@ test('refuses bare shortcut and Supabase secret credentials without an Authoriza
     fs.writeFileSync(protectedFile, ['//registry.npmjs.org/:_authToken', '=npm_', 'q'.repeat(32), '\n'].join(''));
     f.git(['add', filename]);
     assert.throws(() => captureSource({ ...f.options, files: [filename] }), /Protected path/);
-    assert.equal(captureSource(f.options).exclusions.find((item) => item.path === filename)?.reason, 'protected-path-content-not-read');
+    assert.throws(() => captureSource(f.options), /INCOMPLETE.*protected/i);
     fs.rmSync(protectedFile);
     f.git(['reset', '--', filename]);
   }

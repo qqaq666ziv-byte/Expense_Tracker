@@ -1,13 +1,15 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { webcrypto } from 'node:crypto';
+import { useState } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createInitialState } from '../../app/state';
+import { calculateFinancials } from '../../domain/financeEngine';
 import type { FinanceSyncOutcome } from '../../app/useFinanceApp';
 import type { ShortcutApi, ShortcutConnection, ShortcutInboxItem } from './types';
-import { ShortcutsPanel } from './ShortcutsPanel';
+import { ShortcutsPanel, type ShortcutsPanelProps } from './ShortcutsPanel';
 
 vi.mock('../../lib/supabaseClient', () => ({
   supabase: null,
@@ -399,6 +401,41 @@ describe('iPhone shortcuts panel', () => {
     expect(document.body.textContent).not.toContain('private sync details');
   });
 
+  it('explicitly pulls an older cloud import outside the newest 100 notifications and updates the ledger', async () => {
+    const data = createInitialState('owner-a').data;
+    const recent = Array.from({ length: 100 }, (_, index): ShortcutInboxItem => ({
+      ...notice, id: `newer-${index}`, status: index % 3 === 0 ? 'pending' : index % 3 === 1 ? 'test' : 'ignored',
+      merchant: `Newer notification ${index}`, transaction_id: null,
+    }));
+    const api = makeApi([], recent);
+    const oldTransaction = { ...data.transactions[0], id: 'older-cloud-import', accountId: data.accounts[0].id, amount: 125.5 };
+    const initialBalance = calculateFinancials(data).accountBalances.find((row) => row.accountId === oldTransaction.accountId)!.balance;
+    const onSync = vi.fn<ShortcutsPanelProps['onSync']>();
+    function LedgerFixture() {
+      const [ledger, setLedger] = useState(data);
+      onSync.mockImplementation(async () => {
+        setLedger({ ...data, transactions: [...data.transactions, oldTransaction] });
+        return { status: 'synced', confirmedTransactionIds: [] };
+      });
+      return <><output aria-label="合成帳本支出">{ledger.transactions.filter((row) => row.id === oldTransaction.id).reduce((total, row) => total + row.amount, 0)}</output>
+        <output aria-label="合成帳戶餘額">{calculateFinancials(ledger).accountBalances.find((row) => row.accountId === oldTransaction.accountId)!.balance}</output>
+        <ShortcutsPanel ownerId="owner-a" data={ledger} api={api} onSync={onSync} /></>;
+    }
+    const user = userEvent.setup();
+    render(<LedgerFixture />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    expect(onSync).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: /通知收件匣/ }));
+    expect(screen.getByLabelText('合成帳本支出')).toHaveTextContent('0');
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    await waitFor(() => expect(screen.getByLabelText('合成帳本支出')).toHaveTextContent('125.5'));
+    expect(onSync).toHaveBeenCalledExactlyOnceWith([]);
+    expect(screen.getByLabelText('合成帳戶餘額')).toHaveTextContent(String(initialBalance - oldTransaction.amount));
+    expect(api.review).not.toHaveBeenCalled();
+    expect(api.listInbox).toHaveBeenCalledTimes(2);
+    expect(recent).toHaveLength(100);
+  });
+
   it('syncs imported notifications discovered by refresh once and coalesces repeated refreshes', async () => {
     const imported = { ...notice, status: 'imported' as const, transaction_id: 'transaction-refresh' };
     const api = makeApi([], [imported]);
@@ -406,8 +443,84 @@ describe('iPhone shortcuts panel', () => {
     const { user } = await openInbox(api, onSync);
     expect(onSync).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole('button', { name: '重新整理' }));
-    expect(onSync).toHaveBeenCalledTimes(1);
+    expect(onSync).toHaveBeenCalledTimes(2);
+    expect(onSync).toHaveBeenLastCalledWith([]);
     expect(api.listPending).toHaveBeenCalled();
+  });
+
+  it.each(['partial', 'skipped', 'uncommitted'] as const)('keeps an explicit empty-ID %s outcome retryable', async (status) => {
+    const api = makeApi([], []);
+    const onSync = vi.fn().mockResolvedValueOnce({ status, confirmedTransactionIds: [] })
+      .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: [] });
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={onSync} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(await screen.findByText(/操作結果尚未確認/)).toBeInTheDocument();
+    expect(onSync).toHaveBeenCalledExactlyOnceWith([]);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    await waitFor(() => expect(screen.queryByText(/操作結果尚未確認/)).not.toBeInTheDocument());
+    expect(onSync).toHaveBeenCalledTimes(2);
+    expect(onSync).toHaveBeenLastCalledWith([]);
+  });
+
+  it('awaits a queued explicit refresh, coalesces clicks and does not start a render sync loop', async () => {
+    const api = makeApi();
+    const queued = deferred<FinanceSyncOutcome>();
+    const onSync = vi.fn(() => queued.promise);
+    const { data, user, view } = await openInbox(api, onSync);
+    const refresh = screen.getByRole('button', { name: '重新整理' });
+    await user.click(refresh);
+    await waitFor(() => expect(onSync).toHaveBeenCalledExactlyOnceWith([]));
+    expect(refresh).toBeDisabled();
+    fireEvent.click(refresh); fireEvent.click(refresh);
+    expect(onSync).toHaveBeenCalledTimes(1);
+    view.rerender(<ShortcutsPanel ownerId="owner-a" data={{ ...data, transactions: [...data.transactions] }} api={api} onSync={onSync} />);
+    expect(api.listInbox).toHaveBeenCalledTimes(2);
+    await act(async () => queued.resolve({ status: 'synced', confirmedTransactionIds: [] }));
+    await waitFor(() => expect(refresh).toBeEnabled());
+    expect(onSync).toHaveBeenCalledTimes(1);
+    expect(api.listInbox).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not start an old owner ledger pull after their explicit inbox refresh completes', async () => {
+    const api = makeApi();
+    const pending = deferred<ShortcutInboxItem[]>();
+    const onSync = successfulSync();
+    const { user, view } = await openInbox(api, onSync);
+    api.listInbox.mockImplementationOnce(() => pending.promise);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    view.rerender(<ShortcutsPanel ownerId="owner-b" data={createInitialState('owner-b').data} api={api} onSync={onSync} />);
+    await act(async () => pending.resolve([{ ...notice, status: 'imported', transaction_id: 'old-owner-tx' }]));
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    expect(onSync).not.toHaveBeenCalled();
+  });
+
+  it('keeps an explicit rejected ledger pull retryable without exposing private error details', async () => {
+    const api = makeApi();
+    const onSync = vi.fn().mockRejectedValueOnce(new Error('synthetic private failure detail'))
+      .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: [] });
+    const { user } = await openInbox(api, onSync);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(await screen.findByText(/操作結果尚未確認/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('synthetic private failure detail');
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(onSync).toHaveBeenCalledTimes(2);
+    expect(onSync).toHaveBeenLastCalledWith([]);
+  });
+
+  it('retains only confirmed imported IDs while retrying the remaining subset', async () => {
+    const imports = ['one', 'two'].map((id) => ({ ...notice, id, merchant: id === 'one' ? notice.merchant : 'Second service',
+      status: 'imported' as const, transaction_id: `tx-${id}` }));
+    const api = makeApi([], imports);
+    const onSync = vi.fn().mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: ['tx-one'] })
+      .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: ['tx-two'] });
+    const { user } = await openInbox(api, onSync);
+    expect(onSync).toHaveBeenCalledExactlyOnceWith(['tx-one', 'tx-two']);
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    expect(onSync).toHaveBeenLastCalledWith(['tx-two']);
+    expect(api.review).not.toHaveBeenCalled();
   });
 
   it('retries after partial or skipped sync outcomes and only suppresses a confirmed import', async () => {
@@ -417,7 +530,8 @@ describe('iPhone shortcuts panel', () => {
       .mockResolvedValueOnce({ status: 'partial', confirmedTransactionIds: ['transaction-retry'] })
       .mockResolvedValueOnce({ status: 'skipped', confirmedTransactionIds: [] })
       .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: [] })
-      .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: ['transaction-retry'] });
+      .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: ['transaction-retry'] })
+      .mockResolvedValueOnce({ status: 'synced', confirmedTransactionIds: [] });
     const { user } = await openInbox(api, onSync);
     expect(onSync).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole('button', { name: '重新整理' }));
@@ -426,8 +540,10 @@ describe('iPhone shortcuts panel', () => {
     expect(onSync).toHaveBeenCalledTimes(3);
     await user.click(screen.getByRole('button', { name: '重新整理' }));
     expect(onSync).toHaveBeenCalledTimes(4);
+    expect(onSync).toHaveBeenLastCalledWith(['transaction-retry']);
     await user.click(screen.getByRole('button', { name: '重新整理' }));
-    expect(onSync).toHaveBeenCalledTimes(4);
+    expect(onSync).toHaveBeenCalledTimes(5);
+    expect(onSync).toHaveBeenLastCalledWith([]);
   });
 
   it('keeps imported recent results and exposes older pending items with a server exact count', async () => {

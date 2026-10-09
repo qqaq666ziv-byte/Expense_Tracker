@@ -53,6 +53,8 @@ function OwnerShortcutsPanel({
   const busyRef = useRef(false);
   const syncedImportsRef = useRef(new Set<string>());
   const syncingImportsRef = useRef(new Set<string>());
+  const financeRef = useRef({ transactions: data.transactions, onSync });
+  financeRef.current = { transactions: data.transactions, onSync };
   const locksRef = useRef(locked);
   locksRef.current = locked;
   const parents = shortcutParents(data, ownerId, lockedAccountIds, lockedCategoryIds);
@@ -62,23 +64,26 @@ function OwnerShortcutsPanel({
     return () => { alive.current = false; };
   }, []);
 
-  const syncImported = useCallback(async (items: ShortcutInboxItem[]) => {
+  const syncImported = useCallback(async (items: ShortcutInboxItem[], pullLedger = false) => {
     const transactionIds = [...new Set(items.filter((item) => item.status === 'imported' && item.transaction_id)
-      .map((item) => item.transaction_id!))].filter((id) => !data.transactions.some((row) => row.id === id)
+      .map((item) => item.transaction_id!))].filter((id) => !financeRef.current.transactions.some((row) => row.id === id)
         && !syncedImportsRef.current.has(id) && !syncingImportsRef.current.has(id));
-    if (!transactionIds.length) return;
+    // An explicit refresh must also pull imports older than the recent inbox.
+    // Automatic discovery keeps its bounded, confirmed-ID retry behavior.
+    if (!transactionIds.length && !pullLedger) return;
     transactionIds.forEach((id) => syncingImportsRef.current.add(id));
     try {
-      const outcome = await onSync(transactionIds);
+      const outcome = await financeRef.current.onSync(transactionIds);
+      if (!alive.current) return;
       const confirmed = new Set(outcome.status === 'synced' ? outcome.confirmedTransactionIds : []);
       transactionIds.filter((id) => confirmed.has(id)).forEach((id) => syncedImportsRef.current.add(id));
-      if (transactionIds.some((id) => !confirmed.has(id))) throw new Error('finance_sync_not_confirmed');
+      if (outcome.status !== 'synced' || transactionIds.some((id) => !confirmed.has(id))) throw new Error('finance_sync_not_confirmed');
     } finally {
       transactionIds.forEach((id) => syncingImportsRef.current.delete(id));
     }
-  }, [data.transactions, onSync]);
+  }, []);
 
-  const refreshData = useCallback(async () => {
+  const refreshData = useCallback(async (pullLedger = false) => {
     const [nextConnections, nextInbox, pending] = await Promise.all([
       api.listConnections(ownerId), api.listInbox(ownerId), api.listPending(ownerId, null),
     ]);
@@ -91,7 +96,7 @@ function OwnerShortcutsPanel({
     setPendingCursor(pending.has_more && pending.next_created_at && pending.next_id
       ? { created_at: pending.next_created_at, id: pending.next_id } : null);
     setLoaded(true);
-    await syncImported(nextInbox);
+    await syncImported(nextInbox, pullLedger);
   }, [api, ownerId, syncImported]);
 
   const loadMorePending = useCallback(async () => {
@@ -266,13 +271,13 @@ function OwnerShortcutsPanel({
       </section>}
       {section === 'test' && <LocalNotificationTest />}
       {section === 'inbox' && <section className="card shortcut-stack">
-        <div className="section-heading"><div><p className="eyebrow">先核對，餘額才會改變</p><h2><Inbox size={21} aria-hidden="true" /> 通知收件匣</h2></div><button type="button" className="secondary-button" disabled={guest || busy} onClick={() => void run(refreshData, false)}><RefreshCw size={16} aria-hidden="true" />重新整理</button></div>
+        <div className="section-heading"><div><p className="eyebrow">先核對，餘額才會改變</p><h2><Inbox size={21} aria-hidden="true" /> 通知收件匣</h2></div><button type="button" className="secondary-button" disabled={guest || busy} onClick={() => void run(() => refreshData(true), false)}><RefreshCw size={16} aria-hidden="true" />重新整理</button></div>
         <p className="shortcut-muted">顯示最近 100 筆接收結果及所有待確認項目（每頁最多 100 筆）。只有「已入帳」會影響帳本；未收到通知或捷徑失敗時，請比對支付明細補記。</p>
         {guest ? <p className="empty-state">登入後即可查看你的通知收件匣。</p> : !loaded ? <p className="empty-state">{busy ? '正在讀取通知…' : '尚未取得收件匣，請重新整理。'}</p> : inbox.length === 0 ? <p className="empty-state">還沒有通知。先從 iPhone 傳入一則測試，再按重新整理。</p> : inbox.map((item) => <Fragment key={`${item.id}:${item.status}`}><InboxCard item={item} parents={parents} disabled={busy || locked} onReview={review} /></Fragment>)}
         {pendingHasMore && <button type="button" className="secondary-button" disabled={busy || guest} onClick={() => void run(loadMorePending, false)}>載入更多待確認項目</button>}
       </section>}
       {section === 'connections' && <section className="card shortcut-stack">
-        <div className="section-heading"><div><p className="eyebrow">每支手機各用一組金鑰</p><h2><ShieldCheck size={21} aria-hidden="true" /> 連線管理</h2></div><button type="button" className="secondary-button" disabled={guest || busy} onClick={() => void run(refreshData, false)}><RefreshCw size={16} aria-hidden="true" />重新整理</button></div>
+        <div className="section-heading"><div><p className="eyebrow">每支手機各用一組金鑰</p><h2><ShieldCheck size={21} aria-hidden="true" /> 連線管理</h2></div><button type="button" className="secondary-button" disabled={guest || busy} onClick={() => void run(() => refreshData(true), false)}><RefreshCw size={16} aria-hidden="true" />重新整理</button></div>
         <p className="shortcut-muted">只可有一個啟用自動入帳的連線，其他連線使用待確認。要更換手機，請先把舊連線改為「先確認再入帳」，不會替你停用其他連線。</p>
         {guest ? <p className="empty-state">請登入後建立連線。</p> : connections.length === 0 ? <p className="empty-state">{busy ? '正在讀取連線…' : '尚無可顯示的連線，可從「連接 iPhone」開始。'}</p> : connections.map((item) => <Fragment key={`${item.id}:${item.account_id}:${item.category_id}:${item.mode}:${item.verified_at}:${item.revoked_at}`}><ConnectionCard item={item} parents={parents} disabled={busy || locked} revokeDisabled={busy} anotherAutoConnection={connections.some((other) => other.id !== item.id && !other.revoked_at && other.mode === 'auto')} onConfigure={configure} onRevoke={revoke} /></Fragment>)}
       </section>}

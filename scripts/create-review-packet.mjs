@@ -250,15 +250,106 @@ function sourceText(bytes, file, label) {
   return value;
 }
 
-function git(root, args) {
-  return execFileSync('git', ['--no-replace-objects', '--literal-pathspecs', '-c', 'core.fsmonitor=false', '-C', root, ...args], {
-    encoding: null, windowsHide: true, timeout: 30_000, maxBuffer: MAX_EVIDENCE * 2,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+function git(root, args, { input, noMatch = false } = {}) {
+  try {
+    return execFileSync('git', ['--no-replace-objects', '--no-optional-locks', '--literal-pathspecs', '-c', 'core.fsmonitor=false',
+      '-c', 'core.excludesFile=', '-C', root, ...args], {
+      input, encoding: null, windowsHide: true, timeout: 30_000, maxBuffer: MAX_EVIDENCE * 2,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    if (noMatch && error.status === 1) return error.stdout;
+    throw error;
+  }
 }
 
 const gitText = (root, args) => decoder.decode(git(root, args));
 const nulList = bytes => decoder.decode(bytes).split('\0').filter(Boolean);
+const gitEntry = entry => {
+  const separator = entry.indexOf('\t');
+  if (separator < 0) fail('INCOMPLETE: unsupported Git path metadata; content withheld.');
+  const file = entry.slice(separator + 1);
+  try { relativeFile(file); } catch { fail('INCOMPLETE: unsupported Git path metadata; content withheld.'); }
+  return [entry.slice(0, separator), file];
+};
+
+const incompleteProtected = () => fail('INCOMPLETE: protected scope changed or its metadata is uncertain; content not read.');
+const statIdentity = info => Object.fromEntries(['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'ctimeNs', 'mtimeNs']
+  .map(key => [key, info[key].toString()]));
+
+function protectedMetadata(root, baseline, head, index, indexStat) {
+  const paths = [...new Set([...baseline.keys(), ...head.keys(), ...index.keys()])].filter(protectedPath).sort();
+  return paths.map(file => {
+    const pinned = baseline.get(file);
+    if (!pinned || canonical(pinned) !== canonical(head.get(file)) || canonical(pinned) !== canonical(index.get(file))) incompleteProtected();
+    let info;
+    try {
+      info = fs.lstatSync(safeAbsolute(path.join(root, relativeFile(file))), { bigint: true });
+    } catch { incompleteProtected(); }
+    if (!info.isFile() || info.nlink !== 1n || !['100644', '100755'].includes(pinned.mode)
+      || (process.platform !== 'win32' && ((info.mode & 0o100n) ? '100755' : '100644') !== pinned.mode)) incompleteProtected();
+    // --debug is not a stable porcelain format. Accept only the exact known
+    // framing; unknown fields, extended flags or ambiguous stats fail closed.
+    const debug = decoder.decode(git(root, ['ls-files', '--debug', '-z', '--', file]));
+    const prefix = `${file}\0`;
+    const match = debug.startsWith(prefix) && /^  ctime: (\d+):(\d+)\n  mtime: (\d+):(\d+)\n  dev: (\d+)\tino: (\d+)\n  uid: (\d+)\tgid: (\d+)\n  size: (\d+)\tflags: 0\n$/.exec(debug.slice(prefix.length));
+    if (!match) incompleteProtected();
+    const [ctimeSec, ctimeNsec, mtimeSec, mtimeNsec, dev, ino, uid, gid, size] = match.slice(1).map(BigInt);
+    const uint32 = value => BigInt.asUintN(32, value);
+    if (!ctimeSec || !mtimeSec || ctimeNsec >= 1_000_000_000n || mtimeNsec >= 1_000_000_000n
+      || [dev, ino, uid, gid, size].some(value => value > 0xffff_ffffn)
+      || ctimeSec * 1_000_000_000n + ctimeNsec !== info.ctimeNs || mtimeSec * 1_000_000_000n + mtimeNsec !== info.mtimeNs
+      || dev !== uint32(info.dev) || ino !== uint32(info.ino) || uid !== uint32(info.uid) || gid !== uint32(info.gid)
+      || size !== info.size
+      // Git may read racily-clean content despite matching stat data. Reject
+      // the entire same-second boundary without invoking that fallback.
+      || info.mtimeNs / 1_000_000_000n >= indexStat.mtimeNs / 1_000_000_000n) incompleteProtected();
+    return { path: file, baseline: pinned, head: head.get(file), index: index.get(file),
+      cachedStat: match.slice(1), workingStat: statIdentity(info), changed: false, assurance: 'unchanged-non-racy-git-stat-metadata' };
+  });
+}
+
+function visibleUntracked(root) {
+  // Without exclusion flags Git enumerates names only and does not open
+  // per-directory .gitignore files. Expand public directories ourselves, then
+  // check ignores at the first protected prefix, never inside that subtree.
+  const initial = nulList(git(root, ['ls-files', '--others', '--directory', '-z']));
+  const result = [];
+  const visit = candidates => {
+    const prefixes = candidates.map(file => {
+      const parts = relativeFile(file.replace(/\/$/, '')).split('/');
+      return parts.map((_part, i) => parts.slice(0, i + 1).join('/')).find(protectedPath) ?? parts.join('/');
+    });
+    for (const prefix of prefixes) {
+      const parts = prefix.split('/');
+      for (let depth = 0; depth < parts.length; depth++) {
+        const ignore = path.join(root, ...parts.slice(0, depth), '.gitignore');
+        if (fs.existsSync(ignore)) {
+          const info = fs.lstatSync(safeAbsolute(ignore));
+          if (!info.isFile() || info.nlink !== 1) incompleteProtected();
+        }
+      }
+    }
+    // check-ignore consumes literal filenames on stdin and rejects Git's
+    // global literal-pathspec magic; disable that flag only for this command.
+    const ignored = new Set(nulList(git(root, ['--no-literal-pathspecs', 'check-ignore', '--no-index', '-z', '--stdin'],
+      { input: Buffer.from(`${prefixes.join('\0')}\0`), noMatch: true })));
+    if ([...ignored].some(file => !prefixes.includes(file))) incompleteProtected();
+    for (let i = 0; i < candidates.length; i++) {
+      if (ignored.has(prefixes[i])) continue;
+      if (protectedPath(prefixes[i])) incompleteProtected();
+      const file = candidates[i].replace(/\/$/, '');
+      const absolute = safeAbsolute(path.join(root, file));
+      const info = fs.lstatSync(absolute);
+      if (info.isDirectory()) {
+        const children = fs.readdirSync(absolute).map(child => `${file}/${child}`);
+        if (children.length) visit(children);
+      } else result.push(file);
+    }
+  };
+  if (initial.length) visit(initial);
+  return new Set(result);
+}
 
 export function captureSource({ root, base, files }) {
   root = safeAbsolute(root);
@@ -270,26 +361,39 @@ export function captureSource({ root, base, files }) {
   git(root, ['merge-base', '--is-ancestor', baseCommit, headCommit]);
   const selected = [...new Set((files ?? []).map(relativeFile))].sort();
   if (!selected.length || selected.length > 200 || selected.length !== files.length) fail('Select 1-200 distinct explicit file paths.');
+  if (selected.some(protectedPath)) fail('Protected path cannot be included; content not read.');
+  const indexPath = safeAbsolute(path.resolve(root, gitText(root, ['rev-parse', '--git-path', 'index']).trim()));
+  const indexStat = fs.lstatSync(indexPath, { bigint: true });
+  if (!indexStat.isFile() || indexStat.nlink !== 1n) incompleteProtected();
   const index = new Map();
   for (const entry of nulList(git(root, ['ls-files', '--stage', '-z']))) {
-    const [metadata, file] = entry.split('\t');
+    const [metadata, file] = gitEntry(entry);
     const [mode, objectId, stage] = metadata.split(' ');
     if (index.has(file) || stage !== '0') fail('Unmerged index cannot be captured as review evidence.');
     index.set(file, { mode, objectId });
   }
   const tracked = new Set(index.keys());
   const baseline = new Map(nulList(git(root, ['ls-tree', '-r', '-z', baseCommit])).map(entry => {
-    const [metadata, file] = entry.split('\t');
+    const [metadata, file] = gitEntry(entry);
     const [mode, _type, objectId] = metadata.split(' ');
     return [file, { mode, objectId }];
   }));
-  const untracked = new Set(nulList(git(root, ['ls-files', '--others', '--exclude-standard', '-z'])));
+  const head = new Map(nulList(git(root, ['ls-tree', '-r', '-z', headCommit])).map(entry => {
+    const [metadata, file] = gitEntry(entry);
+    const [mode, _type, objectId] = metadata.split(' ');
+    return [file, { mode, objectId }];
+  }));
+  const protectedState = protectedMetadata(root, baseline, head, index, indexStat);
+  if (canonical(statIdentity(indexStat)) !== canonical(statIdentity(fs.lstatSync(indexPath, { bigint: true })))) incompleteProtected();
+  const untracked = visibleUntracked(root);
   const selectedSet = new Set(selected);
-  const changed = [
-    ...nulList(git(root, ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--'])),
-    ...nulList(git(root, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--'])),
-  ];
-  const omitted = [...new Set([...changed, ...untracked])].filter(file => !selectedSet.has(file) && !protectedPath(file)).sort();
+  const publicPaths = [...new Set([...index.keys(), ...baseline.keys(), ...head.keys()])].filter(file => !protectedPath(file)).sort();
+  // Never turn an empty public path list into Git's whole-repository scope.
+  const changed = publicPaths.length ? [
+    ...nulList(git(root, ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--', ...publicPaths])),
+    ...nulList(git(root, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', baseCommit, '--', ...publicPaths])),
+  ] : [];
+  const omitted = [...new Set([...changed, ...untracked])].filter(file => !selectedSet.has(file)).sort();
   if (omitted.length) {
     const labels = checkText(Buffer.from(omitted.slice(0, 20).join(', ')), 'omitted path metadata');
     fail(`Stale or incomplete scope: allowlist omits changed/untracked files: ${labels}`);
@@ -322,11 +426,14 @@ export function captureSource({ root, base, files }) {
   const exclusions = [...new Set([...tracked, ...baseline.keys(), ...untracked])].filter(file => !selectedSet.has(file)).sort().map(file => ({
     path: file,
     reason: protectedPath(file) ? 'protected-path-content-not-read' : untracked.has(file) ? 'untracked-outside-explicit-scope' : 'outside-explicit-affected-scope',
+    ...(protectedPath(file) ? { metadata: protectedState.find(item => item.path === file) } : {}),
   }));
   const status = gitText(root, ['status', '--porcelain=v1', '--untracked-files=no', '--', ...selected]);
   const diffBytes = git(root, ['-c', 'core.quotePath=false', 'diff', '--no-renames', '--no-ext-diff', '--no-textconv', '--no-color', baseCommit, '--', ...selected]);
   const diff = checkText(diffBytes, 'cumulative diff', MAX_EVIDENCE);
   const cumulativeDiffSha256 = hash(diffBytes);
+  if (protectedState.length && (canonical(protectedMetadata(root, baseline, head, index, indexStat)) !== canonical(protectedState)
+    || canonical(statIdentity(indexStat)) !== canonical(statIdentity(fs.lstatSync(indexPath, { bigint: true }))))) incompleteProtected();
   const sourceDigest = hash(canonical({ files: entries.map(({ path: file, current, index: staged }) => ({
     path: file, sha256: current?.sha256 ?? null, gitMode: current?.gitMode ?? null, index: staged,
   })), status, cumulativeDiffSha256 }));

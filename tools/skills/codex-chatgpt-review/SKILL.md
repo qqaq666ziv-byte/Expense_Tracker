@@ -124,7 +124,11 @@ credential assignment 的 quoted／bare／backtick 值共用完整 body 與 expr
 
 Windows 的 case-only rename 尚未原生驗收、目前不宣告支援；case-sensitive Git scope/index 與 case-insensitive filesystem 的差異可能以 incomplete-scope／untracked 拒絕，不應縮減 scope 繞過。0700／0600 是 POSIX mode，現行工具沒有 Windows DACL 驗證或 ACL fail-closed gate，不能以 Linux 測試宣稱 Windows 隱私保證。Windows case-only rename／ACL 驗收與正式使用需另有明確授權的原生 Windows 任務；本流程不會自動修改使用者 ACL 或安裝 trusted tool。
 
-拒絕漏列的非保護路徑變更、秘密格式（含 `POSTGRES_PASSWORD` 等前綴 credential key）、保護路徑、junction／symlink／hardlink、越界、二進位、無效 UTF-8、過大資料與 stale checks。一般來源與 check log 上限仍是 256 KiB；只有 repo 根目錄的 `package-lock.json` 可在 UTF-8／秘密檢查與 npm v2/v3 JSON 結構核對後使用 512 KiB 上限，完整來源、diff、雜湊與 4 MiB 總封包上限照常適用，不因 lockfile 過大而漏列它。被 Git 忽略或受保護的私人檔案內容完全不讀，其內容變化不在 scopeDigest 的保證內；若此限制使必要驗收無法成立，狀態是缺證據。
+拒絕漏列的非保護路徑變更、秘密格式（含 `POSTGRES_PASSWORD` 等前綴 credential key）、保護路徑、junction／symlink／hardlink、越界、二進位、無效 UTF-8、過大資料與 stale checks。一般來源與 check log 上限仍是 256 KiB；只有 repo 根目錄的 `package-lock.json` 可在 UTF-8／秘密檢查與 npm v2/v3 JSON 結構核對後使用 512 KiB 上限，完整來源、diff、雜湊與 4 MiB 總封包上限照常適用，不因 lockfile 過大而漏列它。
+
+受保護路徑不是完整性檢查的豁免。工具只核對其 baseline／HEAD／index blob ID 與 mode、Git cached stat 及 filesystem stat 中繼資料；新增、刪除、staged／committed／working 改動、信任 flags、同秒 racily-clean 或無法解析的 stat 均回報 `INCOMPLETE`，不讀／雜湊／秘密掃描私人內容。允許的未改動受保護項目會在排除清單記錄 `changed: false`、metadata 與保守的 stat assurance，納入 scopeDigest，create／verify 重算。Git 的 32-bit cached dev／inode 等欄位按其表示核對，完整 filesystem stat 同時保留於身份；這是非 racy stat metadata 判定，不能宣稱私人位元組已被密碼學核對。
+
+diff／status 一律限定公開 literal paths，空清單不退回全 repo。未追蹤路徑先只列 metadata，再從公開父目錄判斷 ignore；不进入受保護子目錄或讀其 `.gitignore`。未被忽略的受保護路徑使封包 `INCOMPLETE`。被 repo ignore rules 排除的私人項目與子目錄仍不讀、不展開，其內容變化不在 scopeDigest 保證內；停用個人 core.excludesFile，避免個人規則暗中縮小 scope。若必要驗收依賴此類私人內容，仍屬缺證據，不能以封包有效宣稱完整。
 
 ## INIT → PLAN → EXECUTED → REVIEW → 修正／交付
 
