@@ -1,0 +1,51 @@
+.shortcut-panel { display: grid; gap: 16px; min-width: 0; }
+.shortcut-panel h2 { display: flex; align-items: center; gap: 8px; }
+.shortcut-panel h3 { margin: 0; font-size: 1rem; font-weight: 800; }
+.shortcut-panel p { margin: 0; line-height: 1.75; font-size: .84rem; overflow-wrap: anywhere; }
+.shortcut-intro > p { margin-bottom: 10px; }
+.shortcut-muted { color: var(--muted); }
+.shortcut-stack { display: grid; gap: 14px; min-width: 0; }
+.shortcut-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; padding: 5px; border: 1px solid var(--line); border-radius: 15px; background: var(--paper); }
+.shortcut-badge { display: inline-block; flex-shrink: 0; border: 1px solid var(--line); border-radius: 99px; padding: 4px 9px; font-size: .7rem; color: var(--muted); }
+.shortcut-badge-pending { color: #88410d; background: #fff1dd; }
+.shortcut-badge-imported { color: #087054; background: #e4f4ec; }
+.shortcut-item { padding: 18px; border: 1px solid var(--line); border-radius: 15px; }
+.shortcut-item-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.shortcut-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.shortcut-inline-form { display: flex; align-items: end; gap: 12px; flex-wrap: wrap; }
+.shortcut-inline-form > label { flex: 1 1 200px; }
+.shortcut-panel .field { margin-top: 5px; }
+.shortcut-panel textarea { display: block; resize: vertical; font: inherit; min-width: 0; }
+.shortcut-panel textarea:focus-visible { outline: 3px solid rgba(217,101,18,.3); outline-offset: 3px; }
+.shortcut-panel details > summary { cursor: pointer; font-size: .83rem; color: var(--orange-dark); }
+.shortcut-guide { border-color: #e8d2b6; }
+.shortcut-guide > div h2 { margin: 0 0 6px; font-size: 1.05rem; }
+.shortcut-guide details > summary { min-height: 44px; display: flex; align-items: center; font-weight: 750; }
+.shortcut-guide-content { display: grid; gap: 10px; padding-top: 10px; }
+.shortcut-guide-content h3 { margin-top: 6px; }
+.shortcut-guide-list { margin: 0; padding-left: 22px; font-size: .84rem; line-height: 1.75; }
+.shortcut-guide-list li + li { margin-top: 8px; }
+.shortcut-guide summary:focus-visible { outline: 3px solid rgba(217,101,18,.3); outline-offset: 3px; border-radius: 5px; }
+.shortcut-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.shortcut-confirmation { display: flex; align-items: flex-start; gap: 10px; padding: 13px; border: 1px solid var(--line); border-radius: 11px; font-size: .82rem; line-height: 1.7; }
+.shortcut-confirmation input { flex-shrink: 0; margin-top: 5px; width: 17px; height: 17px; accent-color: var(--orange); }
+.shortcut-confirmation small { display: block; color: var(--muted); font-size: .75rem; }
+.shortcut-secret { padding: 16px; border: 1px solid #e8b875; border-radius: 13px; background: #fff3df; }
+.shortcut-code { font-family: ui-monospace, monospace !important; font-size: .76rem !important; overflow-wrap: anywhere; white-space: pre-wrap; }
+.shortcut-panel pre { max-width: 100%; margin: 10px 0 0; border-radius: 10px; padding: 14px; background: var(--cream); }
+.shortcut-steps { margin: 10px 0 0; padding-left: 24px; font-size: .83rem; line-height: 1.85; }
+.shortcut-steps li + li { margin-top: 9px; }
+.shortcut-notice { margin-top: 12px; padding: 14px; border-radius: 10px; background: var(--cream); font-size: .8rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.shortcut-test-result { padding: 16px; border: 1px solid #c1ddd4; border-radius: 13px; background: #eef8f4; }
+.shortcut-test-result dl { margin: 0; display: grid; gap: 8px; font-size: .85rem; }
+.shortcut-test-result dl > div { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 10px; }
+.shortcut-test-result dt { color: var(--muted); }
+.shortcut-test-result dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 520px) {
+  .shortcut-fields { grid-template-columns: minmax(0, 1fr); }
+  .shortcut-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .shortcut-panel .card { padding: 16px; }
+  .shortcut-item { padding: 13px; }
+  .shortcut-panel .section-heading { flex-wrap: wrap; }
+  .shortcut-intro .info-banner { flex-wrap: wrap; }
+}

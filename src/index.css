@@ -218,3 +218,4 @@ body[data-tutorial-target="sync-panel"] [data-tutorial="sync-panel"] { position:
 @media (max-width:380px) { .category-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }.asset-overview { align-items:start; }.asset-donut { width:82px; height:82px; }.asset-donut b { font-size:1rem; }.today-mini { max-width:100px; }.metric-grid { grid-template-columns:1fr; } }
 
 @media (prefers-reduced-motion:reduce) { *,*::before,*::after { scroll-behavior:auto!important; animation-duration:.01ms!important; animation-iteration-count:1!important; transition-duration:.01ms!important; } }
+.shortcut-dialog { margin:0; border:0; padding:0; width:100%; max-width:none; height:100%; max-height:none; color:var(--ink); }

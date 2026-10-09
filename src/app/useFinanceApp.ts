@@ -96,16 +96,25 @@ export interface FinanceAppController {
   softDelete<E extends FinanceEntityName>(entity: E, record: FinanceData[E][number]): Promise<boolean>;
   confirmTransferAccounts(record: Transfer): Promise<boolean>;
   acceptRemoteConflict(entity: FinanceEntityName, recordId: string): Promise<boolean>;
-  syncNow(): Promise<void>;
+  syncNow(transactionIds?: readonly string[]): Promise<FinanceSyncOutcome>;
   signIn(): Promise<void>;
   signOut(): Promise<void>;
 }
 
 export type LegacyBootstrapDecision = 'import-candidate' | 'keep-cloud';
 
+export interface FinanceSyncOutcome {
+  status: SyncReport['status'] | 'skipped' | 'uncommitted';
+  confirmedTransactionIds: string[];
+}
+
 export interface OwnerActionContext {
   ownerId: string;
   generation: number;
+}
+
+interface FinanceSyncToken extends OwnerActionContext {
+  id: symbol;
 }
 
 /** Ignore every outcome from a persistence request whose owner has switched. */
@@ -443,7 +452,16 @@ export function useFinanceApp(
   const activeOwnerRef = useRef(state.ownerId);
   const storageRecoveryRef = useRef<LocalStateRecovery | undefined>(initialLoad.recovery);
   const ownerGenerationRef = useRef(0);
-  const syncTokenRef = useRef<{ generation: number; ownerId: string; id: symbol } | null>(null);
+  const mountedRef = useRef(false);
+  const syncTokenRef = useRef<FinanceSyncToken | null>(null);
+  const queuedSyncRef = useRef<{
+    generation: number;
+    transactionIds: Set<string>;
+    promise: Promise<FinanceSyncOutcome>;
+    resolve: (outcome: FinanceSyncOutcome) => void;
+    reject: (reason: unknown) => void;
+  } | null>(null);
+  const syncNowRef = useRef<((transactionIds?: readonly string[]) => Promise<FinanceSyncOutcome>) | null>(null);
   const durableOwnerRef = useRef<string>();
   const durabilityBlockedRef = useRef<string>();
   const financialWritePendingRef = useRef(false);
@@ -541,13 +559,43 @@ export function useFinanceApp(
     }
   }, [commitState]);
 
+  const cancelSyncRequests = useCallback(() => {
+    syncTokenRef.current = null;
+    const queued = queuedSyncRef.current;
+    queuedSyncRef.current = null;
+    queued?.resolve({ status: 'skipped', confirmedTransactionIds: [] });
+  }, []);
+
+  const releaseSyncToken = useCallback((token: FinanceSyncToken) => {
+    if (syncTokenRef.current !== token) return;
+    syncTokenRef.current = null;
+    setSyncBusy(false);
+    const queued = queuedSyncRef.current;
+    if (!queued) return;
+    queuedSyncRef.current = null;
+    const skipped: FinanceSyncOutcome = { status: 'skipped', confirmedTransactionIds: [] };
+    if (!mountedRef.current
+      || queued.generation !== token.generation
+      || ownerGenerationRef.current !== token.generation
+      || activeOwnerRef.current !== token.ownerId) {
+      queued.resolve(skipped);
+      return;
+    }
+    try {
+      const trailing = syncNowRef.current?.([...queued.transactionIds]) ?? Promise.resolve(skipped);
+      void trailing.then(queued.resolve, queued.reject);
+    } catch (error) {
+      queued.reject(error);
+    }
+  }, []);
+
   const activateOwner = useCallback((nextOwnerId: string) => {
     if (activeOwnerRef.current === nextOwnerId && stateRef.current.ownerId === nextOwnerId) return;
     ownerGenerationRef.current += 1;
     activeOwnerRef.current = nextOwnerId;
     const generation = ownerGenerationRef.current;
     const provisional = createInitialState(nextOwnerId);
-    syncTokenRef.current = null;
+    cancelSyncRequests();
     durableOwnerRef.current = undefined;
     durabilityBlockedRef.current = undefined;
     storageRecoveryRef.current = undefined;
@@ -563,7 +611,15 @@ export function useFinanceApp(
     setLegacyBootstrapNotice(undefined);
     setSafetyNotice(undefined);
     void loadDurableOwner(nextOwnerId, generation);
-  }, [loadDurableOwner]);
+  }, [cancelSyncRequests, loadDurableOwner]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      cancelSyncRequests();
+    };
+  }, [cancelSyncRequests]);
 
   useEffect(() => {
     void loadDurableOwner(activeOwnerRef.current, ownerGenerationRef.current);
@@ -619,13 +675,24 @@ export function useFinanceApp(
     };
   }, [activateOwner]);
 
-  const syncNow = useCallback(async () => {
-    if (!supabase) return;
+  const syncNow = useCallback(async (transactionIds: readonly string[] = []): Promise<FinanceSyncOutcome> => {
+    const skipped: FinanceSyncOutcome = { status: 'skipped', confirmedTransactionIds: [] };
+    if (!supabase || !mountedRef.current) return skipped;
     const started = stateRef.current;
     const generation = ownerGenerationRef.current;
     const ownerId = activeOwnerRef.current;
-    if (started.ownerId === 'guest' || started.ownerId !== ownerId) return;
-    if (syncTokenRef.current?.generation === generation) return;
+    if (started.ownerId === 'guest' || started.ownerId !== ownerId) return skipped;
+    if (syncTokenRef.current?.generation === generation) {
+      if (!queuedSyncRef.current || queuedSyncRef.current.generation !== generation) {
+        let resolve!: (outcome: FinanceSyncOutcome) => void;
+        let reject!: (reason: unknown) => void;
+        const promise = new Promise<FinanceSyncOutcome>((finish, fail) => { resolve = finish; reject = fail; });
+        queuedSyncRef.current = { generation, transactionIds: new Set(transactionIds), promise, resolve, reject };
+      } else {
+        transactionIds.forEach((id) => queuedSyncRef.current?.transactionIds.add(id));
+      }
+      return queuedSyncRef.current.promise;
+    }
     const token = { generation, ownerId, id: Symbol('sync') };
     syncTokenRef.current = token;
     setSyncBusy(true);
@@ -641,8 +708,10 @@ export function useFinanceApp(
             : createTransferReadOnlyRemoteAdapter(remote);
         },
       );
-      if (!result) return;
-      if (ownerGenerationRef.current !== generation || activeOwnerRef.current !== ownerId) return;
+      if (!result) return skipped;
+      if (syncTokenRef.current !== token
+        || ownerGenerationRef.current !== generation
+        || activeOwnerRef.current !== ownerId) return skipped;
       const committed = await commitState(`sync:${crypto.randomUUID()}`, (current) => {
         const merged = applySyncCompletion(started, current, result.state, ownerId);
         // A durable legacy decision made while this sync was in flight wins
@@ -656,15 +725,22 @@ export function useFinanceApp(
         }
         return merged;
       });
-      if (!committed) return;
+      if (syncTokenRef.current !== token) return skipped;
+      if (!committed) return { status: 'uncommitted', confirmedTransactionIds: [] };
       setSyncReport(result.report);
+      const fullySynced = result.report.ownerId === ownerId
+        && result.report.status === 'synced'
+        && result.report.failures.length === 0;
+      const committedIds = new Set(committed.data.transactions.map((transaction) => transaction.id));
+      return {
+        status: result.report.status,
+        confirmedTransactionIds: fullySynced ? transactionIds.filter((id) => committedIds.has(id)) : [],
+      };
     } finally {
-      if (syncTokenRef.current === token) {
-        syncTokenRef.current = null;
-        setSyncBusy(false);
-      }
+      releaseSyncToken(token);
     }
-  }, [commitState]);
+  }, [commitState, releaseSyncToken]);
+  syncNowRef.current = syncNow;
 
   useEffect(() => {
     if (state.ownerId === 'guest' || authLoading || durabilityLoading) return;
@@ -1064,9 +1140,10 @@ export function useFinanceApp(
     entity: FinanceEntityName,
     recordId: string,
   ): Promise<boolean> => {
-    let resolutionToken: { generation: number; ownerId: string; id: symbol } | undefined;
+    let resolutionToken: FinanceSyncToken | undefined;
     try {
       assertRenderedOwnerContext();
+      if (!mountedRef.current) return false;
       if (!supabase || stateRef.current.ownerId === 'guest') {
         throw new Error('目前沒有可用的雲端帳本。');
       }
@@ -1077,6 +1154,7 @@ export function useFinanceApp(
       syncTokenRef.current = resolutionToken;
       setSyncBusy(true);
       const response = await createSupabaseRemoteAdapter(supabase).pull(startedOwnerId);
+      if (syncTokenRef.current !== resolutionToken) return false;
       const pull = 'records' in response
         ? response
         : { records: [...response], issues: [] };
@@ -1120,20 +1198,19 @@ export function useFinanceApp(
         remoteRecord,
         pull.records,
       ));
-      if (!committed) return false;
+      if (!committed || syncTokenRef.current !== resolutionToken) return false;
       setSafetyNotice(undefined);
       setSyncReport(null);
       return true;
     } catch (error) {
-      setSafetyNotice(`同步衝突未解除：${error instanceof Error ? error.message : String(error)}`);
+      if (mountedRef.current && (!resolutionToken || syncTokenRef.current === resolutionToken)) {
+        setSafetyNotice(`同步衝突未解除：${error instanceof Error ? error.message : String(error)}`);
+      }
       return false;
     } finally {
-      if (resolutionToken && syncTokenRef.current === resolutionToken) {
-        syncTokenRef.current = null;
-        setSyncBusy(false);
-      }
+      if (resolutionToken) releaseSyncToken(resolutionToken);
     }
-  }, [assertRenderedOwnerContext, commitState]);
+  }, [assertRenderedOwnerContext, commitState, releaseSyncToken]);
 
   useEffect(() => {
     if (storageRecovery

@@ -55,6 +55,12 @@ beforeEach(() => {
   localStorage.clear();
   localStorage.setItem('shiba-finance:onboarding:v1', 'completed');
   Object.defineProperty(window, 'scrollTo', { configurable: true, value: vi.fn() });
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+    configurable: true, value: function (this: HTMLDialogElement) { this.open = true; },
+  });
+  Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+    configurable: true, value: function (this: HTMLDialogElement) { this.open = false; },
+  });
   vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
     callback(0);
     return 1;
@@ -67,6 +73,28 @@ afterEach(() => {
 });
 
 describe('App owner boundary', () => {
+  it('discards the notification import dialog and raw draft when the owner changes', async () => {
+    const user = userEvent.setup();
+    financeAppMock.current = financeAppFor('owner-a');
+    const view = render(<ThemeProvider><App /></ThemeProvider>);
+
+    await user.click(screen.getByRole('button', { name: /帳戶與同步/ }));
+    await user.click(screen.getByRole('button', { name: /iPhone 捷徑記帳/ }));
+    expect(await screen.findByRole('dialog', { name: 'iPhone 捷徑記帳' })).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: '通知測試' }));
+    await user.type(screen.getByRole('textbox', { name: '通知內文' }), 'owner-a synthetic draft');
+
+    financeAppMock.current = financeAppFor('owner-b');
+    view.rerender(<ThemeProvider><App /></ThemeProvider>);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue('owner-a synthetic draft')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /帳戶與同步/ }));
+    await user.click(screen.getByRole('button', { name: /iPhone 捷徑記帳/ }));
+    await user.click(await screen.findByRole('button', { name: '通知測試' }));
+    expect(screen.getByRole('textbox', { name: '通知內文' })).toHaveValue('');
+  });
+
   it('preserves the owner-independent tab while discarding the previous owner Assets draft', async () => {
     const user = userEvent.setup();
     financeAppMock.current = financeAppFor('owner-a');
