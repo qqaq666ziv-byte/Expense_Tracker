@@ -26,7 +26,13 @@ describe('useFinanceApp durable commit boundary', () => {
       recover: vi.fn(basePersistence.recover),
     };
     const { result } = renderHook(() => useFinanceApp(persistence));
-    await waitFor(() => expect(persistence.load).toHaveBeenCalledWith('guest'));
+    await waitFor(() => expect(result.current.authLoading).toBe(false));
+    // Loading also schedules the initial recurrence commit. Finish setup before
+    // injecting the fault so the assertion counts only the attempted user write.
+    await act(async () => {
+      await Promise.all(persistence.commit.mock.results.map((call) => call.value));
+    });
+    persistence.commit.mockClear();
     const before = structuredClone(result.current.state);
     const category = before.data.categories.find((candidate) => candidate.kind === 'expense')!;
     const account = before.data.accounts[0];
