@@ -2,6 +2,7 @@ import {
   Fragment,
   lazy,
   Suspense,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -340,7 +341,7 @@ function OwnerScopedApp({
 
   const activeTutorial = tutorial?.status === "active" ? tutorial : null;
 
-  const tutorialRecordState = (
+  const tutorialRecordState = useCallback((
     progress: TutorialProgress,
   ): "active" | "deleted" | "missing" => {
     if (!progress.recordId) return "missing";
@@ -349,7 +350,7 @@ function OwnerScopedApp({
     );
     if (!record) return "missing";
     return record.deletedAt ? "deleted" : "active";
-  };
+  }, [data.transactions]);
 
   useEffect(() => {
     if (tutorialResumeChecked.current || app.authLoading) return;
@@ -359,7 +360,7 @@ function OwnerScopedApp({
         ? prepareTutorialResume(current, tutorialRecordState(current))
         : current,
     );
-  }, [app.authLoading]);
+  }, [app.authLoading, tutorialRecordState]);
 
   const handleTutorialEvent = (event: TutorialEvent) =>
     setTutorial((current) =>
@@ -404,9 +405,10 @@ function OwnerScopedApp({
     );
   };
 
+  const activeTutorialStep = activeTutorial?.step;
   useEffect(() => {
-    if (!activeTutorial) return;
-    const step = activeTutorial.step;
+    if (!activeTutorialStep) return;
+    const step = activeTutorialStep;
     if (
       [
         "welcome",
@@ -439,7 +441,7 @@ function OwnerScopedApp({
     } else if (step === "tour-sync") {
       setShowSystem(true);
     }
-  }, [activeTutorial?.step]);
+  }, [activeTutorialStep, setShowSystem, setTab]);
 
   const initialBootstrap = app.state.initialBootstrap;
   const pending = app.state.outbox.length

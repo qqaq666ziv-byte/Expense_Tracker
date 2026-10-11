@@ -25,7 +25,8 @@ interface StoredOwnerState {
 export interface OwnerStateStore {
   transact(
     ownerId: OwnerId,
-    update: (current: StoredOwnerState | undefined) => StoredOwnerState,
+    /** Stored bytes remain untrusted until validated; only undefined means no row. */
+    update: (current: unknown) => StoredOwnerState,
   ): Promise<StoredOwnerState>;
 }
 
@@ -80,26 +81,32 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function safeRecoveryRevision(value: StoredOwnerState | undefined): number {
-  return value && Number.isSafeInteger(value.revision) && value.revision >= 0
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function safeRecoveryRevision(value: unknown): number {
+  return isRecord(value) && typeof value.revision === 'number'
+    && Number.isSafeInteger(value.revision) && value.revision >= 0
     ? value.revision
     : 0;
 }
 
-function safeRecoveryAttemptIds(value: StoredOwnerState | undefined): string[] {
-  if (!value || !Array.isArray(value.appliedAttemptIds)) return [];
+function safeRecoveryAttemptIds(value: unknown): string[] {
+  if (!isRecord(value) || !Array.isArray(value.appliedAttemptIds)) return [];
   const ids = value.appliedAttemptIds.filter(
     (attemptId): attemptId is string => typeof attemptId === 'string' && attemptId.length > 0,
   );
   return [...new Set(ids)];
 }
 
-function cloneEnvelope(value: StoredOwnerState | undefined): StoredOwnerState | undefined {
+function cloneEnvelope(value: unknown): unknown {
   return value === undefined ? undefined : structuredClone(value);
 }
 
-function assertStoredEnvelope(ownerId: OwnerId, value: StoredOwnerState): StoredOwnerState {
-  if (!value || value.ownerId !== ownerId || value.state.ownerId !== ownerId) {
+function assertStoredEnvelope(ownerId: OwnerId, value: unknown): StoredOwnerState {
+  if (!isRecord(value) || value.ownerId !== ownerId
+    || !isRecord(value.state) || value.state.ownerId !== ownerId) {
     throw new RecoveryLockedError({
       state: createInitialState(ownerId),
       recovery: {
@@ -109,11 +116,12 @@ function assertStoredEnvelope(ownerId: OwnerId, value: StoredOwnerState): Stored
       },
     });
   }
-  if (!Number.isSafeInteger(value.revision) || value.revision < 0
-    || !Array.isArray(value.appliedAttemptIds)
-    || value.appliedAttemptIds.some((attemptId) => typeof attemptId !== 'string' || !attemptId)
-    || new Set(value.appliedAttemptIds).size !== value.appliedAttemptIds.length
-    || (value.legacySourceRaw !== null && typeof value.legacySourceRaw !== 'string')) {
+  const { revision, appliedAttemptIds, legacySourceRaw } = value;
+  if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0
+    || !Array.isArray(appliedAttemptIds)
+    || !appliedAttemptIds.every((attemptId): attemptId is string => typeof attemptId === 'string' && attemptId.length > 0)
+    || new Set(appliedAttemptIds).size !== appliedAttemptIds.length
+    || (legacySourceRaw !== null && typeof legacySourceRaw !== 'string')) {
     throw new RecoveryLockedError({
       state: createInitialState(ownerId),
       recovery: {
@@ -130,7 +138,11 @@ function assertStoredEnvelope(ownerId: OwnerId, value: StoredOwnerState): Stored
   if (loaded.recovery) throw new RecoveryLockedError(loaded);
   return {
     ...value,
+    ownerId,
+    revision,
     state: loaded.state,
+    appliedAttemptIds,
+    legacySourceRaw: typeof legacySourceRaw === 'string' ? legacySourceRaw : null,
   };
 }
 
@@ -216,7 +228,7 @@ export function createFinancePersistence(
     async load(ownerId) {
       try {
         const stored = await store.transact(ownerId, (current) => (
-          current
+          current !== undefined
             ? assertLegacySourceUnchanged(
               ownerId,
               assertStoredEnvelope(ownerId, current),
@@ -242,7 +254,7 @@ export function createFinancePersistence(
       let replayed = false;
       try {
         const stored = await store.transact(ownerId, (current) => {
-          const envelope = current
+          const envelope = current !== undefined
             ? assertLegacySourceUnchanged(
               ownerId,
               assertStoredEnvelope(ownerId, current),
@@ -318,7 +330,7 @@ export function createFinancePersistence(
       try {
         const stored = await store.transact(ownerId, (current) => {
           let observedRecovery: LocalStateRecovery | undefined;
-          if (current) {
+          if (current !== undefined) {
             try {
               assertLegacySourceUnchanged(
                 ownerId,
@@ -482,7 +494,7 @@ export function createIndexedDbOwnerStateStore(
         };
         read.onsuccess = () => {
           try {
-            result = update(cloneEnvelope(read.result as StoredOwnerState | undefined));
+            result = update(cloneEnvelope(read.result));
             const write = objectStore.put(result, ownerId);
             write.onerror = () => {
               failure = write.error ?? new Error('IndexedDB owner state write failed');

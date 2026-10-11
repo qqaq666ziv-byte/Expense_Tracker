@@ -25,6 +25,8 @@ jobs:
       - name: Clean install
         run: npm ci
       - name: Typecheck
+        run: npm run typecheck
+      - name: Lint React Hooks
         run: npm run lint
       - name: Domain and data-integrity tests
         run: npm test

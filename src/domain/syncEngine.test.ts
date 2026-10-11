@@ -19,11 +19,122 @@ import {
   confirmTransferDependencyConflict,
   compareSyncRecords,
   enqueueSyncRecord,
+  hasTransferDependencyConflict,
+  hasUnresolvedPayloadConflict,
   syncFinanceState,
   UNRESOLVED_PAYLOAD_CONFLICT_PREFIX,
 } from './syncEngine';
 
 const NOW = '2026-08-21T10:00:00.000Z';
+
+describe('structured pending conflict metadata', () => {
+  it('keeps transfer dependency behavior independent from display wording', () => {
+    const pending = {
+      ...transferOperation(transfer('typed-transfer', 'user-a', 1, 'typed-transfer-op')),
+      lastError: '帳戶需要重新確認',
+      conflict: { kind: 'transfer-dependency' as const, accountIds: ['bank', 'cash'] },
+    };
+    expect(hasTransferDependencyConflict(pending)).toBe(true);
+  });
+
+  it('does not interpret a modern display message as a transfer dependency conflict', () => {
+    const pending = {
+      ...transferOperation(transfer('display-transfer', 'user-a', 1, 'display-transfer-op')),
+      lastError: 'transfer selected account changed before cloud write: accounts=bank,cash; diagnostic only',
+      conflict: null,
+    };
+    expect(hasTransferDependencyConflict(pending)).toBe(false);
+  });
+
+  it('keeps a typed payload conflict locked after the display message changes', () => {
+    const pending = {
+      ...operation(account('typed-account', 'user-a', 1, 'typed-account-op')),
+      lastError: '請明確選擇雲端版本',
+      conflict: { kind: 'payload' as const },
+    };
+    expect(hasUnresolvedPayloadConflict([pending], 'accounts', 'typed-account')).toBe(true);
+  });
+
+  it('rejects invalid structured metadata before making any remote call', async () => {
+    const record = account('invalid-conflict', 'user-a', 1, 'invalid-conflict-op');
+    const pending = {
+      ...operation(record),
+      conflict: { kind: 'unknown-kind' },
+    } as unknown as PendingOperation;
+    const remote: RemoteAdapter = { pull: vi.fn(async () => []), apply: vi.fn(async () => {}) };
+
+    const result = await syncFinanceState(state('user-a', [record], [pending]), 'user-a', remote);
+
+    expect(result.report.status).toBe('rejected');
+    expect(remote.pull).not.toHaveBeenCalled();
+    expect(remote.apply).not.toHaveBeenCalled();
+  });
+
+  it('persists a typed payload lock across an equal cloud pull without relying on a separate key list', async () => {
+    const record = account('typed-lock', 'user-a', 1, 'typed-lock-op');
+    const pending: PendingOperation = {
+      ...operation(record),
+      conflict: { kind: 'payload' },
+      lastError: '顯示文字已翻譯',
+    };
+    const remote: RemoteAdapter = {
+      pull: vi.fn(async () => [{ entity: 'accounts' as const, record }]),
+      apply: vi.fn(async () => {}),
+    };
+
+    const result = await syncFinanceState(state('user-a', [record], [pending]), 'user-a', remote);
+
+    expect(remote.apply).not.toHaveBeenCalled();
+    expect(result.state.outbox[0].conflict).toEqual({ kind: 'payload' });
+    expect(result.state.unresolvedSyncRecordKeys).toEqual(['accounts:typed-lock']);
+  });
+
+  it('treats a new remote error containing an old conflict prefix as a retryable diagnostic', async () => {
+    const record = account('diagnostic-only', 'user-a', 1, 'diagnostic-op');
+    const message = `${UNRESOLVED_PAYLOAD_CONFLICT_PREFIX}: remote diagnostic only`;
+    const remote: RemoteAdapter = {
+      pull: vi.fn(async () => []),
+      apply: vi.fn(async () => { throw new Error(message); }),
+    };
+    const first = await syncFinanceState(state('user-a', [record], [operation(record)]), 'user-a', remote);
+    const reloaded = JSON.parse(JSON.stringify(first.state)) as PersistedFinanceState;
+
+    const retried = await syncFinanceState(reloaded, 'user-a', remote);
+
+    expect(remote.apply).toHaveBeenCalledTimes(2);
+    expect(retried.state.outbox[0]).toMatchObject({ conflict: null, lastError: message, attempts: 2 });
+    expect(retried.state.unresolvedSyncRecordKeys).toBeUndefined();
+    expect(hasUnresolvedPayloadConflict(retried.state.outbox, 'accounts', record.id)).toBe(false);
+  });
+
+  it('keeps all typed batch members blocked until explicit cloud acceptance, independent of display text', async () => {
+    const beforeA = account('typed-batch-a', 'user-a', 1, 'create-a');
+    const beforeB = account('typed-batch-b', 'user-a', 1, 'create-b');
+    const a = { ...beforeA, version: 2, name: 'renamed a', lastOperationId: 'update-a' };
+    const b = { ...beforeB, version: 2, name: 'renamed b', lastOperationId: 'update-b' };
+    const pending: PendingOperation[] = [{
+      ...operation(a), batchId: 'typed-batch', batchBeforeRecord: beforeA,
+      conflict: { kind: 'batch' }, lastError: '批次需要明確確認',
+    }, {
+      ...operation(b), batchId: 'typed-batch', batchBeforeRecord: beforeB, conflict: null,
+    }];
+    const records: RemoteRecord[] = [{ entity: 'accounts', record: a }, { entity: 'accounts', record: b }];
+    const remote: RemoteAdapter = {
+      pull: vi.fn(async () => records), apply: vi.fn(async () => {}),
+    };
+
+    const result = await syncFinanceState(state('user-a', [a, b], pending), 'user-a', remote);
+
+    expect(remote.apply).not.toHaveBeenCalled();
+    expect(result.state.outbox).toHaveLength(2);
+    expect(result.state.outbox[0].conflict).toEqual({ kind: 'batch' });
+    const reloaded = JSON.parse(JSON.stringify(result.state)) as PersistedFinanceState;
+    reloaded.outbox[0].lastError = '新的翻譯文字';
+    const accepted = acceptRemoteConflictRecord(reloaded, { entity: 'accounts', record: a }, records);
+    expect(accepted.outbox).toEqual([]);
+    expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
+  });
+});
 
 function emptyData(): FinanceData {
   return {
@@ -592,6 +703,9 @@ describe('offline sync engine', () => {
     expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers')).toEqual([]);
     expect(blocked.state.data.accounts.find((item) => item.id === 'bank')).toEqual(remoteBank);
     expect(blocked.state.outbox[0].lastError).toMatch(/^transfer selected account changed before cloud write/);
+    expect(blocked.state.outbox[0].conflict).toEqual({
+      kind: 'transfer-dependency', accountIds: ['bank', 'cash'],
+    });
     expect(blocked.state.unresolvedSyncRecordKeys).toContain('transfers:pending-transfer');
 
     const remoteCash = {
@@ -603,9 +717,11 @@ describe('offline sync engine', () => {
     };
     await remote.apply('user-a', operation(remoteCash));
     const reloaded = JSON.parse(JSON.stringify(blocked.state)) as PersistedFinanceState;
+    reloaded.outbox[0].lastError = '請明確重新確認轉帳帳戶';
     const retried = await syncFinanceState(reloaded, 'user-a', remote);
     expect((await remote.pull('user-a')).filter((item) => item.entity === 'transfers')).toEqual([]);
-    expect(retried.state.outbox[0].lastError).toMatch(/^transfer selected account changed before cloud write/);
+    expect(retried.state.outbox[0].lastError).toBe('請明確重新確認轉帳帳戶');
+    expect(retried.state.outbox[0].conflict).toEqual(blocked.state.outbox[0].conflict);
     expect(retried.state.unresolvedSyncRecordKeys).toContain('transfers:pending-transfer');
 
     const refreshed = {
@@ -633,6 +749,7 @@ describe('offline sync engine', () => {
       id: 'transfer-reconfirmed',
       record: refreshed,
       attempts: 0,
+      conflict: null,
       lastError: undefined,
     })]);
 
@@ -1109,15 +1226,15 @@ describe('offline sync engine', () => {
 
     const afterCreate = enqueueSyncRecord(state('user-a', [], []), 'accounts', created, NOW);
     expect(afterCreate.data.accounts).toEqual([created]);
-    expect(afterCreate.outbox).toEqual([operation(created)]);
+    expect(afterCreate.outbox).toEqual([{ ...operation(created), conflict: null }]);
 
     const afterUpdate = enqueueSyncRecord(afterCreate, 'accounts', updated, NOW);
     expect(afterUpdate.data.accounts).toEqual([updated]);
-    expect(afterUpdate.outbox).toEqual([operation(updated)]);
+    expect(afterUpdate.outbox).toEqual([{ ...operation(updated), conflict: null }]);
 
     const afterDelete = enqueueSyncRecord(afterUpdate, 'accounts', deleted, NOW);
     expect(afterDelete.data.accounts).toEqual([deleted]);
-    expect(afterDelete.outbox).toEqual([operation(deleted)]);
+    expect(afterDelete.outbox).toEqual([{ ...operation(deleted), conflict: null }]);
   });
 
   it('retries an acknowledged create idempotently and clears it only after success', async () => {
@@ -2042,6 +2159,8 @@ describe('offline sync engine', () => {
         queuedAt: batchedRule.updatedAt,
         batchId: 'rename-account-batch',
         batchBeforeRecord: preBatchRule,
+        conflict: { kind: 'batch' },
+        lastError: '批次需要確認',
       }],
       unresolvedSyncRecordKeys: [`accounts:${localAccount.id}`],
     };
@@ -2065,6 +2184,7 @@ describe('offline sync engine', () => {
       record: preBatchRule,
       batchId: undefined,
       batchBeforeRecord: undefined,
+      conflict: null,
     })]);
     expect(accepted.unresolvedSyncRecordKeys).toBeUndefined();
 
@@ -2860,6 +2980,7 @@ describe('offline sync engine', () => {
     expect(result.state.outbox[0]).toMatchObject({
       id: 'op-same-clock',
       attempts: 1,
+      conflict: { kind: 'payload' },
       lastError: expect.stringContaining('unresolved same-clock payload conflict'),
     });
     expect(result.state.unresolvedSyncRecordKeys).toEqual(['accounts:wallet']);

@@ -4,6 +4,7 @@ import type { DurableCommitResult, FinancePersistence } from './localDurability'
 import {
   createInitialState,
   loadFinanceStateWithRecovery,
+  putCategoryWithDependents,
   putRecord,
   storageKey,
 } from './state';
@@ -131,6 +132,30 @@ describe('unresolved sync conflict mutation lock', () => {
 
     expect(targets).toEqual([{ entity: 'categories', recordId: replacement.id }]);
     expect(() => assertSyncRecordMutationsAllowed(state, targets)).not.toThrow();
+  });
+
+  it.each([0, 1, 99])('locks exactly the categories written when moving to order %s', (sortOrder) => {
+    const state = createInitialState('guest');
+    state.data.categories = state.data.categories.map((category, index) => ({
+      ...category,
+      sortOrder: index < 2 ? 4 : index * 2,
+      isActive: index !== 1,
+    }));
+    const previous = state.data.categories.filter((category) => category.kind === 'expense').at(-1)!;
+    const edited = {
+      ...previous, sortOrder, version: previous.version + 1,
+      updatedAt: '2026-09-27T00:00:00.000Z', lastOperationId: 'reorder-category',
+    };
+    const before = structuredClone(state);
+
+    const targets = syncMutationTargets(state, 'categories', edited);
+    const next = putCategoryWithDependents(state, edited);
+    const writtenIds = next.data.categories.filter((category) => (
+      JSON.stringify(category) !== JSON.stringify(state.data.categories.find((item) => item.id === category.id))
+    )).map(({ id }) => id).sort();
+
+    expect(targets.map(({ recordId }) => recordId).sort()).toEqual(writtenIds);
+    expect(state).toEqual(before);
   });
 
   it('expands a persisted conflict lock to every still-pending batch member', () => {

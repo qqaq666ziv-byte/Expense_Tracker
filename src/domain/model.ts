@@ -143,6 +143,12 @@ export interface LegacyAuthenticatedBootstrap {
   unsyncedTransactionIds: string[];
 }
 
+export type PendingSyncConflict =
+  | { kind: 'payload' }
+  | { kind: 'transfer-dependency'; accountIds: string[] }
+  | { kind: 'batch' }
+  | { kind: 'unresolved' };
+
 export interface PendingOperation {
   id: string;
   entity: FinanceEntityName;
@@ -163,6 +169,9 @@ export interface PendingOperation {
    * historical-import server path, never by an ordinary table upsert.
    */
   historicalImportBatchId?: string;
+  /** Undefined is legacy; null explicitly means the display error has no conflict meaning. */
+  conflict?: PendingSyncConflict | null;
+  /** Display text only for operations carrying structured conflict metadata. */
   lastError?: string;
 }
 

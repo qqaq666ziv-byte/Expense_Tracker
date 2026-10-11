@@ -157,11 +157,11 @@ describe('owner-scoped durable finance persistence', () => {
     await store.transact('guest', () => envelope);
 
     await expect(store.transact('guest', (current) => ({
-      ...current!,
+      ...(current as typeof envelope),
       revision: 1,
       uncloneable: () => undefined,
     }) as never)).rejects.toMatchObject({ name: 'DataCloneError' });
-    const afterAbort = await store.transact('guest', (current) => current!);
+    const afterAbort = await store.transact('guest', (current) => current as typeof envelope);
 
     expect(afterAbort.revision).toBe(0);
     expect(afterAbort.state).toEqual(initial);
@@ -445,7 +445,7 @@ describe('owner-scoped durable finance persistence', () => {
       storageKey('guest'),
       ...legacyStorageKeys('guest'),
     ].map((key) => [key, null])));
-    let corrupted: any = {
+    let corrupted: unknown = {
       ownerId: 'guest',
       revision: -1,
       state: createInitialState('guest'),
@@ -454,8 +454,9 @@ describe('owner-scoped durable finance persistence', () => {
     };
     const store: Parameters<typeof createFinancePersistence>[0] = {
       async transact(_ownerId, update) {
-        corrupted = update(structuredClone(corrupted));
-        return structuredClone(corrupted);
+        const next = update(structuredClone(corrupted));
+        corrupted = next;
+        return structuredClone(next);
       },
     };
     const persistence = createFinancePersistence(store, localStorage);
@@ -470,6 +471,66 @@ describe('owner-scoped durable finance persistence', () => {
     );
 
     expect(recovered).toMatchObject({ ok: true, revision: 1 });
+    expect((await persistence.load('guest')).recovery).toBeUndefined();
+  });
+
+  it.each([
+    { name: 'missing', fields: {} },
+    { name: 'null', fields: { state: null } },
+  ])('preserves and explicitly repairs an IndexedDB envelope with $name state', async ({ fields }) => {
+    const factory = new IDBFactory();
+    const store = createIndexedDbOwnerStateStore(factory, 'malformed-envelope-test');
+    const corrupted = {
+      ownerId: 'guest',
+      revision: 3,
+      appliedAttemptIds: ['previous-attempt'],
+      legacySourceRaw: null,
+      preservedMarker: 'keep-the-entire-recovery-source',
+      ...fields,
+    };
+    await store.transact('guest', () => corrupted as never);
+    const originalRaw = JSON.stringify(corrupted);
+    const persistence = createFinancePersistence(store, localStorage);
+
+    const locked = await persistence.load('guest');
+
+    expect(locked.recovery?.raw).toBe(originalRaw);
+    const update = vi.fn((latest: PersistedFinanceState) => latest);
+    expect(await persistence.commit('guest', 'blocked-mutation', update))
+      .toMatchObject({ ok: false, code: 'RECOVERY_LOCKED', lockWrites: true });
+    expect(update).not.toHaveBeenCalled();
+    const replacement = createInitialState('guest');
+    replacement.data.transactions = [transaction(replacement, 'recovered-envelope', 75)];
+    expect(await persistence.recover('guest', 'stale-repair', '{changed-source}', replacement))
+      .toMatchObject({ ok: false, code: 'DOMAIN_REJECTED' });
+    expect((await persistence.load('guest')).recovery?.raw).toBe(originalRaw);
+
+    const repaired = await persistence.recover('guest', 'exact-repair', originalRaw, replacement);
+
+    expect(repaired).toMatchObject({ ok: true, revision: 4 });
+    const reloaded = await persistence.load('guest');
+    expect(reloaded.recovery).toBeUndefined();
+    expect(reloaded.state).toEqual(replacement);
+  });
+
+  it.each([null, false, 0, ''])('does not replace a malformed falsy envelope %j with an initial ledger', async (corrupted) => {
+    let stored: unknown = corrupted;
+    const store: Parameters<typeof createFinancePersistence>[0] = {
+      async transact(_ownerId, update) {
+        const next = update(structuredClone(stored));
+        stored = next;
+        return structuredClone(next);
+      },
+    };
+    const persistence = createFinancePersistence(store, localStorage);
+    const originalRaw = JSON.stringify(corrupted);
+
+    const locked = await persistence.load('guest');
+
+    expect(locked.recovery?.raw).toBe(originalRaw);
+    expect((await persistence.load('guest')).recovery?.raw).toBe(originalRaw);
+    expect(await persistence.recover('guest', 'repair-falsy-envelope', originalRaw, createInitialState('guest')))
+      .toMatchObject({ ok: true, revision: 1 });
     expect((await persistence.load('guest')).recovery).toBeUndefined();
   });
 });
