@@ -98,12 +98,15 @@ npm.cmd run dev
 ## 驗證
 
 ```powershell
+npm.cmd run typecheck
 npm.cmd run lint
 npm.cmd test
 npm.cmd run verify:migration
 npm.cmd run build
 npm.cmd audit --audit-level=high
 ```
+
+`typecheck` 執行 TypeScript（包含 `strictNullChecks`）；`lint` 執行 ESLint 的 React Hooks 呼叫規則及依賴陣列檢查。兩者由 CI 分開執行。
 
 目前測試涵蓋財務金額、日期區間、預算、週期規則、備份還原、舊資料轉換、同步衝突、owner isolation、遠端 adapter 與主要 UI 呈現。CI 會在 pull request、`main` 與 `codex/**` push 執行乾淨安裝與 release checks。
 

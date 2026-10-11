@@ -664,6 +664,70 @@ describe('transfer fee analytics', () => {
     updatedAt: '2026-08-21T04:00:00.000Z', lastOperationId: 'transfer-create',
   };
 
+  it('keeps cash-flow rounding, category names and ties consistent across all summaries', () => {
+    const transaction = (id: string, amount: number, categoryId: string, categoryName: string) => ({
+      id, ownerId: 'guest', amount, type: 'expense' as const, categoryId, categoryName,
+      accountId: 'cash', accountName: '現金', occurredAt: transfer.occurredAt,
+      version: 1, updatedAt: transfer.updatedAt, lastOperationId: id,
+    });
+    const data: FinanceData = {
+      ...baseData,
+      categories: [
+        { ...baseData.categories[0], name: '飲食', isActive: false },
+        { ...baseData.categories[0], id: 'removed-category', name: '不應顯示', deletedAt: transfer.updatedAt },
+      ],
+      transactions: [
+        transaction('missing-category-first', 0.1, 'missing-category', '歷史分類'),
+        transaction('removed-category', 0.2, 'removed-category', '刪除前分類'),
+        transaction('missing-category-next', 0.1, 'missing-category', '較晚快照'),
+        transaction('midpoint-one', 0.005, 'food', '餐飲'),
+        transaction('midpoint-two', 0.005, 'food', '餐飲'),
+        { ...transaction('income-one', 0.1, 'income', '收入'), type: 'income' },
+        { ...transaction('income-two', 0.2, 'income', '收入'), type: 'income' },
+        { ...transaction('tutorial', 999, 'food', '餐飲'), note: TUTORIAL_RECORD_NOTE },
+        { ...transaction('deleted', 888, 'food', '餐飲'), deletedAt: transfer.updatedAt },
+      ],
+      transfers: [{ ...transfer, fee: 0.11 }],
+    };
+    const original = structuredClone(data);
+    const expected = {
+      income: 0.3, expense: 0.53, net: -0.23,
+      expenseByCategory: [
+        { categoryId: 'missing-category', name: '歷史分類', amount: 0.2 },
+        { categoryId: 'removed-category', name: '刪除前分類', amount: 0.2 },
+        { categoryId: 'system:transfer-fee', name: '手續費', amount: 0.11 },
+        { categoryId: 'food', name: '飲食', amount: 0.02 },
+      ],
+    };
+    const insights = calculateInsights(data, { period: 'month', reference: new Date(2026, 7, 21, 15) });
+
+    expect(calculateFinancials(data).allTime).toEqual(expected);
+    expect(insights.period).toMatchObject(expected);
+    expect(insights.today).toEqual({
+      income: expected.income, expense: expected.expense, net: expected.net,
+      topExpenseCategory: expected.expenseByCategory[0],
+    });
+    expect(data).toEqual(original);
+  });
+
+  it('keeps today, current and previous ranges independent when they share analytics records', () => {
+    const data: FinanceData = {
+      ...baseData,
+      transfers: [
+        { ...transfer, id: 'today', fee: 1 },
+        { ...transfer, id: 'earlier-this-month', fee: 2, occurredAt: '2026-08-01 12:00' },
+        { ...transfer, id: 'previous-month', fee: 4, occurredAt: '2026-07-01 12:00' },
+      ],
+    };
+    const insights = calculateInsights(data, { period: 'month', reference: new Date(2026, 7, 21, 15) });
+
+    expect(calculateFinancials(data).allTime.expense).toBe(7);
+    expect(insights.today.expense).toBe(1);
+    expect(insights.period.expense).toBe(3);
+    expect(insights.previousPeriod.expense).toBe(4);
+    expect(insights.comparison.expenseDelta).toBe(-1);
+  });
+
   it('deducts principal plus fee once from source and counts only fees in cash flow', () => {
     const data: FinanceData = { ...baseData, transfers: [transfer] };
     const summary = calculateFinancials(data);
