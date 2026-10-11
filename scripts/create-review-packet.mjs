@@ -135,7 +135,11 @@ function checkCredentialAssignments(value, label) {
     const decodedKey = unescapeJsonText(key);
     const normalized = decodedKey.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
     const sensitive = /^_authToken$/i.test(decodedKey)
-      || /(?:^|[_-])(?:password|passwd|secret|api[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|service[_-]?role[_-]?key)(?:$|[_-])/i.test(normalized);
+      || /(?:^|[_-])(?:password|passwd|secret|api[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|service[_-]?role[_-]?key)(?:$|[_-])/i.test(normalized)
+      // Generic credential identifiers are TOKEN or service-prefixed *_TOKEN.
+      // A separate token_hash RPC parameter is not a credential assignment;
+      // literal service-token signatures are still checked under any key.
+      || /(?:^|[_-])token$/i.test(normalized);
     const authorization = /^(?:proxy[_-])?authorization$/i.test(normalized);
     if (!sensitive && !authorization) continue;
     const expression = value.slice(match.index + prefix.length);
@@ -171,6 +175,9 @@ function checkCredentialAssignments(value, label) {
 }
 
 function checkCredentialText(value, label, depth = 0) {
+  // Inspect the same complete JSON-decoded literals for Slack signatures too;
+  // a benign message key must not conceal an escaped token prefix.
+  if (/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/.test(value)) fail(`Suspected secret in ${label}; content withheld.`);
   checkCredentialAssignments(value, label);
   if (depth === 2) return;
   // Nested JSON/log strings are inspected as whole decoded contents, rather
@@ -193,6 +200,7 @@ function checkText(bytes, label, max = MAX_FILE, scanAssignments = true) {
     /-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/,
     /\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|shiba_sc_[0-9a-f]{64}|sb_secret_[A-Za-z0-9_-]{20,})\b/,
     /\bnpm_[A-Za-z0-9_-]{20,}\b/,
+    /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
     /\bBearer\s+[A-Za-z0-9._~-]{20,}/i,
     /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
   ];
@@ -252,7 +260,7 @@ function sourceText(bytes, file, label) {
 
 function git(root, args, { input, noMatch = false } = {}) {
   try {
-    return execFileSync('git', ['--no-replace-objects', '--no-optional-locks', '--literal-pathspecs', '-c', 'core.fsmonitor=false',
+    return execFileSync('git', ['--no-replace-objects', '--no-optional-locks', '--literal-pathspecs', '-c', 'diff.autoRefreshIndex=false', '-c', 'core.fsmonitor=false',
       '-c', 'core.excludesFile=', '-C', root, ...args], {
       input, encoding: null, windowsHide: true, timeout: 30_000, maxBuffer: MAX_EVIDENCE * 2,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -307,6 +315,23 @@ function protectedMetadata(root, baseline, head, index, indexStat) {
     return { path: file, baseline: pinned, head: head.get(file), index: index.get(file),
       cachedStat: match.slice(1), workingStat: statIdentity(info), changed: false, assurance: 'unchanged-non-racy-git-stat-metadata' };
   });
+}
+
+function rejectPublicIndexTrustFlags(root, index) {
+  // -v is metadata only: cached entries are H; assume-unchanged lowercases
+  // the tag and skip-worktree uses S. Validate the complete index, before
+  // any diff/status can hide omitted public bytes. Unknown framing fails closed.
+  const seen = new Set();
+  for (const entry of nulList(git(root, ['ls-files', '-v', '-z']))) {
+    if (entry.length < 3 || entry[1] !== ' ') incompleteProtected();
+    const file = relativeFile(entry.slice(2));
+    if (!index.has(file) || seen.has(file)) incompleteProtected();
+    seen.add(file);
+    if (!protectedPath(file) && entry[0] !== 'H') {
+      fail('INCOMPLETE: public index trust flags prevent reliable scope and protected-boundary checks; content withheld.');
+    }
+  }
+  if (seen.size !== index.size) incompleteProtected();
 }
 
 function visibleUntracked(root, tracked) {
@@ -381,6 +406,7 @@ export function captureSource({ root, base, files }) {
     index.set(file, { mode, objectId });
   }
   const tracked = new Set(index.keys());
+  rejectPublicIndexTrustFlags(root, index);
   const baseline = new Map(nulList(git(root, ['ls-tree', '-r', '-z', baseCommit])).map(entry => {
     const [metadata, file] = gitEntry(entry);
     const [mode, _type, objectId] = metadata.split(' ');
@@ -450,8 +476,8 @@ export function captureSource({ root, base, files }) {
   const diffBytes = git(root, ['-c', 'core.quotePath=false', 'diff', '--no-renames', '--no-ext-diff', '--no-textconv', '--no-color', baseCommit, '--', ...selected]);
   const diff = checkText(diffBytes, 'cumulative diff', MAX_EVIDENCE);
   const cumulativeDiffSha256 = hash(diffBytes);
-  if (protectedState.length && (canonical(protectedMetadata(root, baseline, head, index, indexStat)) !== canonical(protectedState)
-    || canonical(statIdentity(indexStat)) !== canonical(statIdentity(fs.lstatSync(indexPath, { bigint: true }))))) incompleteProtected();
+  if (protectedState.length && canonical(protectedMetadata(root, baseline, head, index, indexStat)) !== canonical(protectedState)
+    || canonical(statIdentity(indexStat)) !== canonical(statIdentity(fs.lstatSync(indexPath, { bigint: true })))) incompleteProtected();
   const sourceDigest = hash(canonical({ files: entries.map(({ path: file, current, index: staged }) => ({
     path: file, sha256: current?.sha256 ?? null, gitMode: current?.gitMode ?? null, index: staged,
   })), status, cumulativeDiffSha256 }));

@@ -57,6 +57,8 @@ function OwnerShortcutsPanel({
   financeRef.current = { transactions: data.transactions, onSync };
   const locksRef = useRef(locked);
   locksRef.current = locked;
+  const secretRef = useRef(secret);
+  secretRef.current = secret;
   const parents = shortcutParents(data, ownerId, lockedAccountIds, lockedCategoryIds);
 
   useEffect(() => {
@@ -89,6 +91,12 @@ function OwnerShortcutsPanel({
     ]);
     if (!alive.current) return;
     setConnections(nextConnections);
+    const displayed = secretRef.current;
+    if (displayed && !nextConnections.some((item) => item.id === displayed.connectionId && !item.revoked_at)) {
+      secretRef.current = null;
+      setSecret(null);
+      setMessage('此連線已停用或不在雲端連線列表中，已清除畫面中的金鑰。請確認連線狀態後再設定捷徑；舊金鑰不可繼續使用。');
+    }
     const combined = [...new Map([...pending.items, ...nextInbox].map((item) => [item.id, item])).values()];
     setInbox(combined);
     setPendingCount(pending.pending_count);
@@ -130,12 +138,14 @@ function OwnerShortcutsPanel({
     if (!guest) void run(refreshData, false);
   }, [guest, refreshData, run]);
 
-  const copy = async (value: string, feedback: string) => {
+  const copy = async (value: string, feedback: string, connectionId?: string) => {
+    const current = () => alive.current && (!connectionId || secretRef.current?.connectionId === connectionId);
+    if (!current()) return;
     try {
       await navigator.clipboard.writeText(value);
-      if (alive.current) { setMessage(feedback); setError(''); }
+      if (current()) { setMessage(feedback); setError(''); }
     } catch {
-      if (alive.current) setError('無法自動複製，請選取欄位內容手動複製。');
+      if (current()) setError('無法自動複製，請選取欄位內容手動複製。');
     }
   };
 
@@ -252,19 +262,21 @@ function OwnerShortcutsPanel({
         {secret && <div className="shortcut-secret shortcut-stack">
           <label className="field-label">一次性顯示的捷徑金鑰<textarea className="field shortcut-code" readOnly value={secret.token} rows={2} spellCheck={false} autoComplete="off" /></label>
           <p>請貼入 iPhone 捷徑的 Authorization 標頭，格式為 <code>Bearer 金鑰</code>。複製後請妥善保管；忘記時需停用舊連線再建立新的。</p>
-          <div className="shortcut-actions"><button type="button" className="secondary-button" onClick={() => void copy(`Bearer ${secret.token}`, 'Authorization 標頭已複製，請貼到你的私人捷徑。')}><Copy size={16} aria-hidden="true" />複製 Authorization</button><button type="button" className="secondary-button" onClick={() => setSecret(null)}>已保存，隱藏金鑰</button></div>
+          <div className="shortcut-actions"><button type="button" className="secondary-button" onClick={() => void copy(`Bearer ${secret.token}`, 'Authorization 標頭已複製，請貼到你的私人捷徑。', secret.connectionId)}><Copy size={16} aria-hidden="true" />複製 Authorization</button><button type="button" className="secondary-button" onClick={() => setSecret(null)}>已保存，隱藏金鑰</button></div>
         </div>}
         <div><h3>2. 在 iPhone 建立通知自動化</h3>
           <ol className="shortcut-steps">
-            <li>打開「捷徑」→「自動化」，選擇街口支付的通知觸發。先檢查捷徑是否真的能取得通知標題及內文；若拿不到內文，先停在通知測試，不要開啟自動入帳。</li>
-            <li>加入「取得 URL 的內容」，方法選 POST，將下方接收網址貼入 URL。</li>
-            <li>標頭加入 <code>Content-Type: application/json</code> 及剛才複製的 <code>Authorization: Bearer 金鑰</code>。</li>
-            <li>要求本文選 JSON，依下方範本加入欄位。title 與 text 要插入真正的通知變數，test 要用布林值「真」，不是文字。</li>
-            <li>用真實通知執行一次，回到「通知收件匣」重新整理。測試只留下接收結果，不會記帳。確認欄位完整後，把 test 改成布林值「假」；新通知會先待確認。</li>
+            <li>iOS 27.1：在「捷徑」新增一個捷徑，在同一捷徑內加入 Automation → Apps → Notification 觸發器，選街口支付。通知觸發與下列傳送動作都放在同一捷徑；先不要啟用自動執行。手機實際選項可能不同，請以真機顯示為準。</li>
+            <li>加入「取得 URL 的內容」，方法選 POST，將下方接收網址貼入 URL。標頭加入 <code>Content-Type: application/json</code> 及 <code>Authorization: Bearer 金鑰</code>。</li>
+            <li>要求本文選 JSON，先使用下方合成範本，<code>test</code> 必須是布林值「真」。手動執行後回到收件匣，核對測試列未入帳；合成測試成功只證明接收範本，不能證明通知觸發、鎖定畫面或背景執行成功。</li>
+            <li>再將 <code>title</code> 獨立接到觸發器的 <code>Notification.Title</code>：點通知變數 token，選 Title 屬性。不要假設「Shortcut Input／捷徑輸入」有通知內容，也不要直接傳整個 Notification 物件。</li>
+            <li><code>text</code> 使用 <code>Notification.Subtitle</code> 與 <code>Notification.Body</code>。以「如果」判斷各欄是否有值：兩者都有值時，使用「文字」動作放 Subtitle、換行、Body；只有一欄有值就使用該欄，兩欄皆空就停止傳送並檢查通知權限與欄位。把這份文字動作的輸出接到 JSON 的 text；不要再加入 Title，避免標題重複。</li>
+            <li>保持 <code>test: true</code>，用手機實際通知核對 title 與 text。可靠來源 ID 不存在時省略 <code>eventId</code>，保持待確認；不要產生 UUID。通知時間或目前時間不能代替交易日期；缺少實際交易日期就由你確認。驗證欄位後才改成布林值「假」，新通知仍先待確認。</li>
           </ol>
+          <p className="shortcut-muted">欄位選取方式參考 <a href="https://spenvo.app/setup/" target="_blank" rel="noreferrer">Spenvo 通知設定說明</a>，本 App 將 Title 分開傳入 title，Subtitle 與 Body 合成 text。這是設定指引，尚未在 iPhone 真機驗證。</p>
         </div>
         <label className="field-label">捷徑接收網址<input className="field shortcut-code" readOnly value={api.endpoint ?? ''} placeholder="此環境尚未設定接收網址" /></label>
-        <div className="shortcut-actions"><button type="button" className="secondary-button" disabled={!api.endpoint} onClick={() => void copy(api.endpoint!, '接收網址已複製。')}>複製接收網址</button><button type="button" className="secondary-button" onClick={() => void copy(SHORTCUT_TEST_TEMPLATE, '測試 JSON 範本已複製，請將標題與內文替換為捷徑通知變數。')}>複製測試 JSON</button></div>
+        <div className="shortcut-actions"><button type="button" className="secondary-button" disabled={!api.endpoint} onClick={() => void copy(api.endpoint!, '接收網址已複製。')}>複製接收網址</button><button type="button" className="secondary-button" onClick={() => void copy(SHORTCUT_TEST_TEMPLATE, '合成測試 JSON 已複製。先以 test: true 測接收，再依教學接上 Notification 欄位。')}>複製測試 JSON</button></div>
         <details><summary>查看測試 JSON 範本</summary><pre className="shortcut-code">{SHORTCUT_TEST_TEMPLATE}</pre></details>
         <p className="shortcut-muted">這份範本先使用收件匣確認。只有通知來源提供同一筆消費重送時不變的識別碼，才可加入 eventId；沒有就省略。不要用每次產生的 UUID 或目前時間代替交易識別碼。</p>
         <p className="warning-message">通知沒有銀行實際扣款來源時，需要你指定帳戶。儲值、折抵、退款與多金額通知會保留給你確認；不會把儲值再算一次支出。</p>

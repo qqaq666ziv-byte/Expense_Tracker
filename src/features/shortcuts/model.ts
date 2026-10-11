@@ -63,7 +63,7 @@ export function shortcutReason(reason: string): string {
 export const SHORTCUT_TEST_TEMPLATE = JSON.stringify({
   version: 1,
   source: 'jkopay',
-  title: '[通知標題變數]',
-  text: '[通知內文變數]',
+  title: '合成測試通知',
+  text: 'Example Services\n合成測試：成功扣款 TWD 125.50',
   test: true,
 }, null, 2);

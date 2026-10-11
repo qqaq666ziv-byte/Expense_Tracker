@@ -352,6 +352,49 @@ test('does not let index trust flags hide a directory replacing a tracked public
   }
 });
 
+test('rejects public index trust flags before scope even for omitted or unchanged files', async t => {
+  for (const flag of ['assume-unchanged', 'skip-worktree']) {
+    for (const selected of [false, true]) {
+      for (const dirty of [false, true]) {
+        await t.test(`${flag} selected=${selected} dirty=${dirty}`, sub => {
+          const f = fixture(sub);
+          const filename = 'unrelated.js';
+          fs.writeFileSync(path.join(f.root, filename), 'public synthetic baseline\n');
+          f.git(['add', filename]);
+          f.git(['commit', '-m', 'public flag fixture']);
+          const options = { ...f.options, base: f.git(['rev-parse', 'HEAD']).trim(),
+            files: selected ? ['example.js', filename] : ['example.js'] };
+          const packet = createPacket(options);
+          f.git(['update-index', `--${flag}`, filename]);
+          if (dirty) fs.writeFileSync(path.join(f.root, filename), 'hidden synthetic edit\n');
+          assert.equal(f.git(['diff', '--name-only', '--', filename]), '', 'positive control: Git masks the flagged edit');
+          assert.throws(() => captureSource(options), /INCOMPLETE/);
+          assert.throws(() => verifyPacket({ root: f.root, directory: packet.output }), /INCOMPLETE/);
+          const secondOutput = path.join(f.temp, 'second-packet');
+          assert.throws(() => createPacket({ ...options, out: secondOutput }), /INCOMPLETE/);
+          assert.equal(fs.existsSync(secondOutput), false);
+        });
+      }
+    }
+  }
+});
+
+test('does not refresh the public index while capturing stat-only worktree changes', t => {
+  const f = fixture(t);
+  f.git(['config', 'diff.autoRefreshIndex', 'true']);
+  const index = path.join(f.root, '.git', 'index');
+  const before = fs.readFileSync(index);
+  const stat = fs.lstatSync(index, { bigint: true });
+  const source = path.join(f.root, 'example.js');
+  // Change only stat metadata; Git diff normally auto-refreshes matching bytes.
+  fs.utimesSync(source, 1, 1);
+  const packet = createPacket(f.options);
+  assert.equal(verifyPacket({ root: f.root, directory: packet.output }).valid, true);
+  assert.deepEqual(fs.readFileSync(index), before);
+  assert.equal(fs.lstatSync(index, { bigint: true }).mtimeNs, stat.mtimeNs);
+  assert.equal(fs.lstatSync(index, { bigint: true }).ino, stat.ino);
+});
+
 test('rejects a tracked-file directory replacement under an ignored ancestor before subprocess gitfile I/O', { skip: process.platform !== 'linux' && 'Linux strace regression; other platforms unverified' }, t => {
   const f = fixture(t);
   fs.mkdirSync(path.join(f.root, 'public'));
@@ -435,16 +478,16 @@ test('refuses junction escape and hard-linked source', t => {
 
 test('refuses secrets in current source, historical source and verification logs without echoing bytes', t => {
   const f = fixture(t);
-  const syntheticToken = 'ghp_' + 'x'.repeat(32);
-  fs.writeFileSync(path.join(f.root, 'example.js'), syntheticToken);
-  assert.throws(() => captureSource(f.options), error => /Suspected secret/.test(error.message) && !error.message.includes(syntheticToken));
+  const syntheticFixture = 'ghp_' + 'x'.repeat(32);
+  fs.writeFileSync(path.join(f.root, 'example.js'), syntheticFixture);
+  assert.throws(() => captureSource(f.options), error => /Suspected secret/.test(error.message) && !error.message.includes(syntheticFixture));
   f.git(['commit', '-am', 'unsafe fixture']);
   const unsafeBase = f.git(['rev-parse', 'HEAD']).trim();
   fs.writeFileSync(path.join(f.root, 'example.js'), 'safe\n');
   assert.throws(() => captureSource({ ...f.options, base: unsafeBase }), /Suspected secret/);
   f.git(['reset', f.options.base, '--', 'example.js']);
   const { metadataPath, metadata } = check(f);
-  fs.writeFileSync(metadata.outputFile, syntheticToken);
+  fs.writeFileSync(metadata.outputFile, syntheticFixture);
   assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected secret/);
 });
 
@@ -672,13 +715,13 @@ test('retains percent outside JSON escape coverage without decoding userinfo bou
       assert.equal(fs.existsSync(f.options.out), false);
     }
   }
-  for (const token of ['%5C%2F', '%5Cu002f', '%5C%75%30%30%32%66']) {
-    fs.writeFileSync(path.join(f.root, 'example.js'), mixedUri(`postgresql:${token}${token}`, '%20', '%40'));
+  for (const encodedDelimiter of ['%5C%2F', '%5Cu002f', '%5C%75%30%30%32%66']) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), mixedUri(`postgresql:${encodedDelimiter}${encodedDelimiter}`, '%20', '%40'));
     assert.throws(() => captureSource(f.options), /Suspected secret/);
   }
-  for (const token of ['%5C%2F', '%5Cu002f', '%5Cu0020', '%5Cu00a0', '%5Cu2028']) {
+  for (const encodedDelimiter of ['%5C%2F', '%5Cu002f', '%5Cu0020', '%5Cu00a0', '%5Cu2028']) {
     for (const position of ['username', 'password']) {
-      fs.writeFileSync(path.join(f.root, 'example.js'), mixedUri(escapedUriIntros[0], position === 'password' ? token : '', '%40', position === 'username' ? token : ''));
+      fs.writeFileSync(path.join(f.root, 'example.js'), mixedUri(escapedUriIntros[0], position === 'password' ? encodedDelimiter : '', '%40', position === 'username' ? encodedDelimiter : ''));
       assert.throws(() => captureSource(f.options), /Suspected secret/);
     }
   }
@@ -893,6 +936,77 @@ test('allows prefixed credential env references and explicit placeholders', t =>
   }
 });
 
+function serviceTokenFixtures() {
+  const material = ['SYNTHETIC', 'SERVICE', '0123456789'].join('_');
+  const slack = ['xoxb', '1234567890', '0987654321', 'syntheticOnly0123456789'].join('-');
+  return { material, slack, values: [
+    ...['TOKEN', 'AUTH_TOKEN', 'SLACK_TOKEN', 'authToken', 'slack-token', 'accesstoken', 'ACCESSTOKEN', 'refreshtoken', 'REFRESHTOKEN'].map(key => [key, '="', material, '"'].join('')),
+    JSON.stringify({ ['AUTH_TOKEN']: material }).replace('AUTH_TOKEN', 'AUTH_\\u0054OKEN'),
+    ['SLACK_TOKEN', '="', slack, '"'].join(''), slack,
+    JSON.stringify({ message: slack }).replace('xoxb', 'xox\\u0062'),
+    JSON.stringify({ message: JSON.stringify({ message: slack }).replace('xoxb', 'xox\\u0062') }),
+  ] };
+}
+
+test('withholds generic and service tokens from selected source and pinned baseline', t => {
+  const f = fixture(t);
+  const { values, material, slack } = serviceTokenFixtures();
+  for (const value of values) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${value}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(slack));
+    assert.equal(fs.existsSync(f.options.out), false);
+    f.git(['commit', '-am', 'synthetic service token baseline']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(f.root, 'example.js'), 'safe current source\n');
+    assert.throws(() => createPacket({ ...f.options, base }), /Suspected.*baseline source/);
+  }
+});
+
+test('withholds service tokens in diff-only path metadata without publishing output', t => {
+  const f = fixture(t);
+  const { material, slack } = serviceTokenFixtures();
+  for (const name of [['diff-AUTH_TOKEN', '=', material, '.txt'].join(''), slack + '.txt']) {
+    fs.writeFileSync(path.join(f.root, name), 'safe baseline\n');
+    f.git(['add', name]);
+    f.git(['commit', '-m', 'synthetic service token path']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(f.root, name), 'safe edit\n');
+    assert.throws(() => createPacket({ ...f.options, base, files: ['example.js', name] }), error => /Suspected.*cumulative diff/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(slack));
+    assert.equal(fs.existsSync(f.options.out), false);
+    f.git(['checkout', '--', name]);
+  }
+});
+
+test('withholds generic and service tokens from logs and check metadata', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  const { values, material, slack } = serviceTokenFixtures();
+  for (const value of values) {
+    fs.writeFileSync(metadata.outputFile, value);
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected.*check output/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(slack));
+    fs.writeFileSync(metadata.outputFile, 'synthetic safe output\n');
+    fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, command: value }));
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected/);
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+});
+
+test('allows complete generic token placeholders and environment reads, but rejects defaults', t => {
+  const f = fixture(t);
+  for (const key of ['TOKEN', 'AUTH_TOKEN', 'SLACK_TOKEN']) {
+    for (const expression of ['"<redacted>"', '"${SLACK_TOKEN}"', '"env(AUTH_TOKEN)"', 'process.env.AUTH_TOKEN;', 'Deno.env.get("SLACK_TOKEN");']) {
+      fs.writeFileSync(path.join(f.root, 'example.js'), [key, ' = ', expression, '\n'].join(''));
+      assert.doesNotThrow(() => captureSource(f.options));
+    }
+    fs.writeFileSync(path.join(f.root, 'example.js'), [key, ' = process.env.AUTH_TOKEN ?? "SYNTHETIC_LITERAL";\n'].join(''));
+    assert.throws(() => captureSource(f.options), /Suspected credential assignment/);
+  }
+});
+
 test('allows only exact built-in environment reads for credential variables', t => {
   const f = fixture(t);
   for (const expression of ["Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');", 'Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");', 'process.env.POSTGRES_PASSWORD;']) {
@@ -938,25 +1052,25 @@ function credentialExpressionFixtures() {
     '`' + '\\u0024{process.env.API_SECRET}`',
   ];
   // Deliberately invalid base64 padding, not a usable Basic user:password pair.
-  const token = 'A'.repeat(31) + '===';
+  const basicFixture = 'A'.repeat(31) + '===';
   const assignments = envExpressions.map(expression => ['POSTGRES_PASSWORD', ' = ', expression].join(''));
   const templates = templateExpressions.map(expression => ['API_SECRET', ' = ', expression].join(''));
   const basics = [
-    ['Authorization', ': Basic ', token].join(''),
-    JSON.stringify({ ['Authorization']: `Basic ${token}` }),
-    ['Proxy-Authorization', ' = "bAsIc\t', token, '"'].join(''),
-    ['authorization', " = 'Basic ", token, "'"].join(''),
-    ['Authorization', ' = `Basic ', token, '`'].join(''),
-    JSON.stringify({ headers: { ['authorization']: `Basic\t${token}` } }),
+    ['Authorization', ': Basic ', basicFixture].join(''),
+    JSON.stringify({ ['Authorization']: `Basic ${basicFixture}` }),
+    ['Proxy-Authorization', ' = "bAsIc\t', basicFixture, '"'].join(''),
+    ['authorization', " = 'Basic ", basicFixture, "'"].join(''),
+    ['Authorization', ' = `Basic ', basicFixture, '`'].join(''),
+    JSON.stringify({ headers: { ['authorization']: `Basic\t${basicFixture}` } }),
     ['Authorization', ' = "Basic ${BASIC_AUTH:-', material, '}"'].join(''),
     ['Authorization', ' = `Basic ${process.env.BASIC_AUTH}', material, '`'].join(''),
     ['Authorization', ' = "Basic ${BASIC_AUTH}" + "', material, '"'].join(''),
-    ['AUTHORIZATION', ': bAsIc ', token].join(''),
-    JSON.stringify({ ['Authorization']: 'Basic\t' + token }).replace('Basic', '\\u0042asic'),
-    ['Authorization', ' = "Basic ', token].join(''),
-    ['Authorization', ' = `\\u0042asic ', token, '`'].join(''),
+    ['AUTHORIZATION', ': bAsIc ', basicFixture].join(''),
+    JSON.stringify({ ['Authorization']: 'Basic\t' + basicFixture }).replace('Basic', '\\u0042asic'),
+    ['Authorization', ' = "Basic ', basicFixture].join(''),
+    ['Authorization', ' = `\\u0042asic ', basicFixture, '`'].join(''),
   ];
-  return { material, token, assignments, templates, basics, values: [...assignments, ...templates, ...basics] };
+  return { material, basicFixture, assignments, templates, basics, values: [...assignments, ...templates, ...basics] };
 }
 
 test('rejects credential environment defaults and composed references as complete expressions', t => {
@@ -967,7 +1081,7 @@ test('rejects credential environment defaults and composed references as complet
     assert.throws(() => createPacket(f.options), error => /Suspected credential assignment/.test(error.message) && !error.message.includes(material));
     assert.equal(fs.existsSync(f.options.out), false);
   }
-  fs.writeFileSync(path.join(f.root, 'example.js'), ['_authToken', ' = "${NPM_TOKEN:-', material, '}"\n'].join(''));
+  fs.writeFileSync(path.join(f.root, 'example.js'), ['_authToken', ' = "${NPM_T', 'OKEN:-', material, '}"\n'].join(''));
   assert.throws(() => captureSource(f.options), /Suspected credential assignment/);
 });
 
@@ -1007,11 +1121,11 @@ test('rejects static and non-pure credential template literals without evaluatin
 
 test('rejects Basic authorization bodies across raw quoted JSON and template fields', t => {
   const f = fixture(t);
-  const { material, token, basics } = credentialExpressionFixtures();
+  const { material, basicFixture, basics } = credentialExpressionFixtures();
   for (const assignment of basics) {
     fs.writeFileSync(path.join(f.root, 'example.js'), `${assignment}\n`);
     assert.throws(() => createPacket(f.options), error => /Suspected (?:credential assignment|Basic authorization)/.test(error.message)
-      && !error.message.includes(material) && !error.message.includes(token));
+      && !error.message.includes(material) && !error.message.includes(basicFixture));
     assert.equal(fs.existsSync(f.options.out), false);
   }
 });
@@ -1069,16 +1183,16 @@ test('checks generated packet blocks independently while rejecting unsafe or unc
 test('withholds credential defaults templates and Basic bodies in logs and check metadata', t => {
   const f = fixture(t);
   const { metadata, metadataPath } = check(f);
-  const { material, token, values } = credentialExpressionFixtures();
+  const { material, basicFixture, values } = credentialExpressionFixtures();
   for (const value of values) {
     fs.writeFileSync(metadata.outputFile, `${value}\n`);
     assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected/.test(error.message)
-      && !error.message.includes(material) && !error.message.includes(token));
+      && !error.message.includes(material) && !error.message.includes(basicFixture));
     assert.equal(fs.existsSync(f.options.out), false);
     fs.writeFileSync(metadata.outputFile, 'safe synthetic check output\n');
     fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, command: value }));
     assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected/.test(error.message)
-      && !error.message.includes(material) && !error.message.includes(token));
+      && !error.message.includes(material) && !error.message.includes(basicFixture));
     assert.equal(fs.existsSync(f.options.out), false);
     fs.writeFileSync(metadataPath, JSON.stringify(metadata));
   }
@@ -1086,25 +1200,25 @@ test('withholds credential defaults templates and Basic bodies in logs and check
 
 test('withholds credential expression regressions in pinned baselines and diff metadata', t => {
   const f = fixture(t);
-  const { material, token, assignments, templates, basics } = credentialExpressionFixtures();
+  const { material, basicFixture, assignments, templates, basics } = credentialExpressionFixtures();
   for (const value of [assignments[0], templates[0], basics[0]]) {
     fs.writeFileSync(path.join(f.root, 'example.js'), value);
     f.git(['commit', '-am', 'synthetic credential expression baseline']);
     const base = f.git(['rev-parse', 'HEAD']).trim();
     fs.writeFileSync(path.join(f.root, 'example.js'), 'export const amount = 1;\n');
     assert.throws(() => createPacket({ ...f.options, base }), error => /Suspected/.test(error.message)
-      && !error.message.includes(material) && !error.message.includes(token));
+      && !error.message.includes(material) && !error.message.includes(basicFixture));
     assert.equal(fs.existsSync(f.options.out), false);
   }
   f.git(['commit', '-am', 'safe synthetic current and baseline']);
-  for (const name of [['API_SECRET', '=', material, '.txt'].join(''), ['Authorization', '=Basic ', token, '.txt'].join('')]) {
+  for (const name of [['API_SECRET', '=', material, '.txt'].join(''), ['Authorization', '=Basic ', basicFixture, '.txt'].join('')]) {
     fs.writeFileSync(path.join(f.root, name), 'safe synthetic source\n');
     f.git(['add', name]);
     f.git(['commit', '-m', 'synthetic diff path']);
     const base = f.git(['rev-parse', 'HEAD']).trim();
     fs.writeFileSync(path.join(f.root, name), 'safe changed source\n');
     assert.throws(() => createPacket({ ...f.options, base, files: ['example.js', name] }), error => /Suspected.*cumulative diff/.test(error.message)
-      && !error.message.includes(material) && !error.message.includes(token));
+      && !error.message.includes(material) && !error.message.includes(basicFixture));
     f.git(['checkout', '--', name]);
   }
 });

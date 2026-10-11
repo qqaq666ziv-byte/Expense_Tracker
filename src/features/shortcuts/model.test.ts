@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createInitialState } from '../../app/state';
+import { parseShortcutNotification, validateShortcutPayload } from '../../../supabase/functions/_shared/shortcutNotification';
 import { parseShortcutReviewAmount, reviewTimeInput, reviewTimeIso, shortcutParents, shortcutReason, SHORTCUT_TEST_TEMPLATE } from './model';
 
 describe('shortcut review safety', () => {
@@ -53,6 +54,10 @@ describe('shortcut review safety', () => {
     expect(template).not.toHaveProperty('eventId');
     expect(template).not.toHaveProperty('token');
     expect(template).not.toHaveProperty('occurredAt');
+    const payload = validateShortcutPayload(template);
+    expect(payload.test).toBe(true);
+    expect(payload.text).toContain('合成測試');
+    expect(parseShortcutNotification(payload).occurredAt).toBeNull();
   });
 
   it('explains cross-connection duplicate notifications without promising automatic reconciliation', () => {

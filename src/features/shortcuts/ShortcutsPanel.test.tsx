@@ -107,6 +107,45 @@ describe('iPhone shortcuts panel', () => {
     expect(screen.getByText('展開完整教學與錯誤處理').closest('summary')?.tagName).toBe('SUMMARY');
   });
 
+  it('teaches trigger fields in the same shortcut and starts with synthetic tests', () => {
+    render(<ShortcutsPanel ownerId="guest" data={createInitialState('guest').data} api={makeApi()} onSync={successfulSync()} />);
+    const steps = screen.getByText('2. 在 iPhone 建立通知自動化').parentElement!;
+    expect(steps).toHaveTextContent('同一捷徑');
+    expect(steps).toHaveTextContent('Notification.Title');
+    expect(steps).toHaveTextContent('Notification.Subtitle');
+    expect(steps).toHaveTextContent('Notification.Body');
+    expect(steps).toHaveTextContent('不要假設「Shortcut Input／捷徑輸入」有通知內容');
+    expect(steps).toHaveTextContent('只有一欄有值就使用該欄');
+    expect(steps).toHaveTextContent('不要再加入 Title');
+    expect(steps).toHaveTextContent('先使用下方合成範本');
+    expect(steps).toHaveTextContent('通知時間或目前時間不能代替交易日期');
+    expect(steps).toHaveTextContent('省略 eventId，保持待確認；不要產生 UUID');
+    expect(screen.getByRole('link', { name: 'Spenvo 通知設定說明' })).toHaveAttribute('href', 'https://spenvo.app/setup/');
+  });
+
+  it('does not replace the revocation warning with a late key-copy completion', async () => {
+    const api = makeApi([], []);
+    const user = userEvent.setup();
+    const writing = deferred<void>();
+    const writeText = vi.fn(() => writing.promise);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
+    await screen.findByLabelText('一次性顯示的捷徑金鑰');
+    await user.click(screen.getByRole('button', { name: '複製 Authorization' }));
+    expect(writeText).toHaveBeenCalledTimes(1);
+    api.listConnections.mockResolvedValue([]);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    await screen.findByText(/已清除畫面中的金鑰/);
+    await act(async () => writing.resolve());
+    expect(screen.getByRole('status')).toHaveTextContent('已清除畫面中的金鑰');
+    expect(screen.queryByText(/^Authorization 標頭已複製/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '連接 iPhone' }));
+    expect(screen.queryByRole('button', { name: '複製 Authorization' })).not.toBeInTheDocument();
+  });
+
   it('keeps an undisplayed create key and retry action when the setup guide is collapsed again', async () => {
     const api = makeApi([], []);
     api.create.mockRejectedValueOnce(new Error('simulated offline'));
@@ -153,6 +192,47 @@ describe('iPhone shortcuts panel', () => {
     view.rerender(<ShortcutsPanel ownerId="guest" data={createInitialState('guest').data} api={api} onSync={successfulSync()} />);
     expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain(secret);
+  });
+
+  it.each(['revoked', 'missing'])('clears the displayed key and copy action after a complete %s refresh', async (state) => {
+    const api = makeApi([], []);
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
+    await screen.findByLabelText('一次性顯示的捷徑金鑰');
+    api.listConnections.mockResolvedValue(state === 'revoked' ? [{ ...connection, revoked_at: '2026-10-11T00:00:00.000Z' }] : []);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '重新整理' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '連接 iPhone' }));
+    expect(screen.queryByLabelText('一次性顯示的捷徑金鑰')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '複製 Authorization' })).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('已清除畫面中的金鑰');
+    expect(screen.queryByText(/^連線已建立。/)).not.toBeInTheDocument();
+    expect(api.revoke).not.toHaveBeenCalled();
+    expect(api.create).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['active', 'connections failure', 'inbox failure', 'pending failure'])('retains the displayed key on %s refresh', async (state) => {
+    const api = makeApi([], []);
+    const user = userEvent.setup();
+    render(<ShortcutsPanel ownerId="owner-a" data={createInitialState('owner-a').data} api={api} onSync={successfulSync()} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: '建立連線與金鑰' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '建立連線與金鑰' }));
+    const shownValue = (await screen.findByLabelText('一次性顯示的捷徑金鑰') as HTMLTextAreaElement).value;
+    api.listConnections.mockResolvedValue(state === 'active' ? [connection] : []);
+    if (state === 'connections failure') api.listConnections.mockRejectedValueOnce(new Error('synthetic network failure'));
+    if (state === 'inbox failure') api.listInbox.mockRejectedValueOnce(new Error('synthetic network failure'));
+    if (state === 'pending failure') api.listPending.mockRejectedValueOnce(new Error('synthetic network failure'));
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '重新整理' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '連接 iPhone' }));
+    expect((screen.getByLabelText('一次性顯示的捷徑金鑰') as HTMLTextAreaElement).value).toBe(shownValue);
+    expect(screen.getByRole('button', { name: '複製 Authorization' })).toBeInTheDocument();
+    expect(api.revoke).not.toHaveBeenCalled();
+    expect(api.create).toHaveBeenCalledTimes(1);
   });
 
   it('retries an uncertain create with the same in-memory token hash', async () => {
