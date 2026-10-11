@@ -21,6 +21,7 @@ export interface ShortcutsPanelProps {
 }
 
 type Section = 'setup' | 'test' | 'inbox' | 'connections';
+const clipboardFailureMessage = '無法自動複製，請選取欄位內容手動複製。';
 const sections: { value: Section; label: string }[] = [
   { value: 'setup', label: '連接 iPhone' }, { value: 'test', label: '通知測試' },
   { value: 'inbox', label: '通知收件匣' }, { value: 'connections', label: '連線管理' },
@@ -85,7 +86,7 @@ function OwnerShortcutsPanel({
     }
   }, []);
 
-  const refreshData = useCallback(async (pullLedger = false) => {
+  const refreshCloudState = useCallback(async () => {
     const [nextConnections, nextInbox, pending] = await Promise.all([
       api.listConnections(ownerId), api.listInbox(ownerId), api.listPending(ownerId, null),
     ]);
@@ -104,8 +105,13 @@ function OwnerShortcutsPanel({
     setPendingCursor(pending.has_more && pending.next_created_at && pending.next_id
       ? { created_at: pending.next_created_at, id: pending.next_id } : null);
     setLoaded(true);
-    await syncImported(nextInbox, pullLedger);
-  }, [api, ownerId, syncImported]);
+    return nextInbox;
+  }, [api, ownerId]);
+
+  const refreshData = useCallback(async (pullLedger = false) => {
+    const nextInbox = await refreshCloudState();
+    if (nextInbox && alive.current) await syncImported(nextInbox, pullLedger);
+  }, [refreshCloudState, syncImported]);
 
   const loadMorePending = useCallback(async () => {
     if (!pendingCursor || !pendingHasMore) return;
@@ -143,9 +149,12 @@ function OwnerShortcutsPanel({
     if (!current()) return;
     try {
       await navigator.clipboard.writeText(value);
-      if (current()) { setMessage(feedback); setError(''); }
+      if (current()) {
+        setMessage(feedback);
+        setError((previous) => previous === clipboardFailureMessage ? '' : previous);
+      }
     } catch {
-      if (current()) setError('無法自動複製，請選取欄位內容手動複製。');
+      if (current()) setError((previous) => previous || clipboardFailureMessage);
     }
   };
 
@@ -192,20 +201,28 @@ function OwnerShortcutsPanel({
     if (result.status === 'imported') {
       try {
         const outcome = await onSync(result.transaction_id ? [result.transaction_id] : []);
-        if (result.transaction_id && (outcome.status !== 'synced' || !outcome.confirmedTransactionIds.includes(result.transaction_id))) {
+        if (outcome.status !== 'synced' || (result.transaction_id && !outcome.confirmedTransactionIds.includes(result.transaction_id))) {
           throw new Error('finance_sync_not_confirmed');
         }
+        if (!alive.current) return;
         if (result.transaction_id) syncedImportsRef.current.add(result.transaction_id);
+        setMessage('此筆已在雲端入帳，已要求更新帳本。');
       } catch {
-        if (alive.current) setMessage('此筆已在雲端入帳；本機帳本尚未更新，請恢復連線後同步，勿另行新增同一筆。');
-        return;
+        if (alive.current) setError('此筆已在雲端入帳；本機帳本尚未更新，請恢復連線後同步，勿另行新增同一筆。');
       }
       if (!alive.current) return;
-      setMessage('此筆已在雲端入帳，已要求更新帳本。');
     } else {
       setMessage('此通知已略過，不會影響帳戶餘額。');
     }
-    await refreshData();
+    try {
+      // The review RPC already committed. Reconcile its independent cloud
+      // state even when the ledger pull failed; retry the ledger on refresh.
+      await refreshCloudState();
+    } catch {
+      if (alive.current) setError((previous) => previous
+        ? `${previous} 通知與連線狀態也尚未更新，請重新整理確認。`
+        : `${result.status === 'imported' ? '此筆已在雲端入帳' : '此通知已在雲端略過'}；通知與連線狀態尚未更新，請重新整理確認。`);
+    }
   });
 
   return (

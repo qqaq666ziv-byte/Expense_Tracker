@@ -45,8 +45,9 @@ function makeApi(connections = [connection], notices: ShortcutInboxItem[] = [not
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((finish) => { resolve = finish; });
-  return { promise, resolve };
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<T>((finish, fail) => { resolve = finish; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 beforeEach(() => {
@@ -472,13 +473,163 @@ describe('iPhone shortcuts panel', () => {
 
   it('reports a committed cloud import separately when refreshing the local ledger fails', async () => {
     const onSync = vi.fn(async () => { throw new Error('private sync details'); });
-    const { user, data } = await openInbox(makeApi(), onSync);
+    const api = makeApi();
+    const { user, data } = await openInbox(api, onSync);
+    api.listInbox.mockResolvedValue([{ ...notice, status: 'imported', transaction_id: 'transaction-a' }]);
+    api.listPending.mockResolvedValue({ items: [], pending_count: 0, has_more: false, next_created_at: null, next_id: null });
     await user.selectOptions(screen.getByLabelText('扣款帳戶'), data.accounts[0].id);
     await user.selectOptions(screen.getByLabelText('支出分類'), data.categories.find((row) => row.kind === 'expense')!.id);
     await user.click(screen.getByRole('button', { name: '確認入帳' }));
     expect(await screen.findByText(/此筆已在雲端入帳；本機帳本尚未更新/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '確認入帳' })).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain('private sync details');
+  });
+
+  it.each(['throws', 'unconfirmed'] as const)('reconciles corrected committed review fields after a %s ledger pull, then retries only the ledger', async (failure) => {
+    const api = makeApi();
+    const corrected: ShortcutInboxItem = { ...notice, amount: 876.5, merchant: 'Synthetic Corrected Merchant',
+      occurred_at: '2026-01-03T09:30:00', status: 'imported', transaction_id: 'transaction-a' };
+    api.review.mockImplementationOnce(async () => {
+      api.listInbox.mockResolvedValue([corrected]);
+      api.listPending.mockResolvedValue({ items: [], pending_count: 0, has_more: false, next_created_at: null, next_id: null });
+      return { status: 'imported', transaction_id: 'transaction-a' };
+    });
+    const onSync = vi.fn<ShortcutsPanelProps['onSync']>().mockImplementationOnce(async () => {
+      if (failure === 'throws') throw new Error('synthetic private sync detail');
+      return { status: 'synced', confirmedTransactionIds: [] };
+    }).mockResolvedValue({ status: 'synced', confirmedTransactionIds: ['transaction-a'] });
+    const { user, data } = await openInbox(api, onSync);
+    await user.selectOptions(screen.getByLabelText('扣款帳戶'), data.accounts[0].id);
+    await user.selectOptions(screen.getByLabelText('支出分類'), data.categories.find(row => row.kind === 'expense')!.id);
+    fireEvent.change(screen.getByLabelText('確認支出金額（TWD）'), { target: { value: '876.5' } });
+    fireEvent.change(screen.getByLabelText('商家／用途'), { target: { value: corrected.merchant } });
+    fireEvent.change(screen.getByLabelText('消費時間（本機時區）'), { target: { value: '2026-01-03T09:30' } });
+    await user.click(screen.getByRole('button', { name: '確認入帳' }));
+    expect(await screen.findByText(corrected.merchant, { selector: 'h3' })).toBeInTheDocument();
+    expect(screen.getByText('NT$876.5')).toBeInTheDocument();
+    expect(screen.getByText(/1\/3.*09:30/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '通知收件匣' })).toBeInTheDocument();
+    expect(screen.queryByText('Example Services', { selector: 'h3' })).not.toBeInTheDocument();
+    expect(screen.getByText(/此筆已在雲端入帳；本機帳本尚未更新/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('synthetic private sync detail');
+    expect(onSync).toHaveBeenCalledExactlyOnceWith(['transaction-a']);
+    expect(api.listInbox).toHaveBeenCalledTimes(2);
+    expect(api.listConnections).toHaveBeenCalledTimes(2);
+    expect(api.listPending).toHaveBeenCalledTimes(2);
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    await waitFor(() => expect(onSync).toHaveBeenCalledTimes(2));
+    expect(onSync).toHaveBeenLastCalledWith(['transaction-a']);
+    expect(api.review).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/本機帳本尚未更新/)).not.toBeInTheDocument();
+  });
+
+  it('reconciles a newly verified connection after an unchanged approval with an unconfirmed ledger', async () => {
+    const eligible = { ...notice, reason: 'manual_review', payload: { title: '合成來源 ID 通知', text: 'Synthetic stable-ID payment' } };
+    const api = makeApi([connection], [eligible]);
+    api.review.mockImplementationOnce(async () => {
+      api.listInbox.mockResolvedValue([{ ...eligible, status: 'imported', transaction_id: 'transaction-a' }]);
+      api.listPending.mockResolvedValue({ items: [], pending_count: 0, has_more: false, next_created_at: null, next_id: null });
+      api.listConnections.mockResolvedValue([{ ...connection, verified_at: '2026-01-03T09:31:00Z', verified_format: 'synthetic-format-v1' }]);
+      return { status: 'imported', transaction_id: 'transaction-a' };
+    });
+    const onSync = vi.fn(async (): Promise<FinanceSyncOutcome> => ({ status: 'partial', confirmedTransactionIds: ['transaction-a'] }));
+    const { user, data } = await openInbox(api, onSync);
+    await user.selectOptions(screen.getByLabelText('扣款帳戶'), data.accounts[0].id);
+    await user.selectOptions(screen.getByLabelText('支出分類'), data.categories.find(row => row.kind === 'expense')!.id);
+    await user.click(screen.getByRole('button', { name: '確認入帳' }));
+    await waitFor(() => expect(api.listConnections).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(/此筆已在雲端入帳；本機帳本尚未更新/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '連線管理' }));
+    expect(screen.getByText(/你已核對含來源 ID 的相容通知/)).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '相容通知自動入帳' })).toBeEnabled();
+    expect(api.review).toHaveBeenCalledTimes(1);
+    expect(onSync).toHaveBeenCalledExactlyOnceWith(['transaction-a']);
+  });
+
+  it.each(['failed', 'confirmed'] as const)('retains the cloud commit and reports a failed state refresh after a %s ledger pull', async (ledger) => {
+    const api = makeApi();
+    const onSync = vi.fn<ShortcutsPanelProps['onSync']>().mockImplementationOnce(async () => {
+      if (ledger === 'failed') throw new Error('synthetic private ledger detail');
+      return { status: 'synced', confirmedTransactionIds: ['transaction-a'] };
+    }).mockResolvedValue({ status: 'synced', confirmedTransactionIds: ['transaction-a'] });
+    const { user, data } = await openInbox(api, onSync);
+    api.review.mockImplementationOnce(async () => {
+      api.listConnections.mockRejectedValueOnce(new Error('synthetic private refresh detail'));
+      api.listInbox.mockResolvedValue([{ ...notice, status: 'imported', transaction_id: 'transaction-a' }]);
+      api.listPending.mockResolvedValue({ items: [], pending_count: 0, has_more: false, next_created_at: null, next_id: null });
+      return { status: 'imported', transaction_id: 'transaction-a' };
+    });
+    await user.selectOptions(screen.getByLabelText('扣款帳戶'), data.accounts[0].id);
+    await user.selectOptions(screen.getByLabelText('支出分類'), data.categories.find(row => row.kind === 'expense')!.id);
+    await user.click(screen.getByRole('button', { name: '確認入帳' }));
+    expect(await screen.findByText(/通知與連線狀態.*尚未更新/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '確認入帳' })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('synthetic private');
+    if (ledger === 'failed') expect(screen.getByText(/本機帳本尚未更新/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '重新整理' }));
+    await waitFor(() => expect(onSync).toHaveBeenCalledTimes(2));
+    expect(onSync).toHaveBeenLastCalledWith(ledger === 'failed' ? ['transaction-a'] : []);
+    expect(api.review).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/通知與連線狀態.*尚未更新/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '通知收件匣' })).toBeInTheDocument();
+  });
+
+  it('does not refresh an old owner after their committed review ledger pull finishes', async () => {
+    const api = makeApi();
+    const pending = deferred<FinanceSyncOutcome>();
+    const onSync = vi.fn(() => pending.promise);
+    const { user, data, view } = await openInbox(api, onSync);
+    await user.selectOptions(screen.getByLabelText('扣款帳戶'), data.accounts[0].id);
+    await user.selectOptions(screen.getByLabelText('支出分類'), data.categories.find(row => row.kind === 'expense')!.id);
+    await user.click(screen.getByRole('button', { name: '確認入帳' }));
+    await waitFor(() => expect(onSync).toHaveBeenCalledTimes(1));
+    view.unmount();
+    await act(async () => pending.resolve({ status: 'synced', confirmedTransactionIds: ['transaction-a'] }));
+    expect(api.listInbox).toHaveBeenCalledTimes(1);
+    expect(api.listConnections).toHaveBeenCalledTimes(1);
+    expect(api.listPending).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['resolve', 'reject'] as const)('preserves a committed import warning when an earlier clipboard operation %s', async (outcome) => {
+    const api = makeApi();
+    api.review.mockImplementationOnce(async () => {
+      api.listInbox.mockResolvedValue([{ ...notice, status: 'imported', transaction_id: 'transaction-a' }]);
+      api.listPending.mockResolvedValue({ items: [], pending_count: 0, has_more: false, next_created_at: null, next_id: null });
+      return { status: 'imported', transaction_id: 'transaction-a' };
+    });
+    const onSync = vi.fn(async () => { throw new Error('synthetic ledger failure'); });
+    const { user, data } = await openInbox(api, onSync);
+    const writing = deferred<void>();
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: vi.fn(() => writing.promise) }, configurable: true });
+    await user.click(screen.getByRole('button', { name: '連接 iPhone' }));
+    await user.click(screen.getByRole('button', { name: '複製測試 JSON' }));
+    await user.click(screen.getByRole('button', { name: /通知收件匣/ }));
+    await user.selectOptions(screen.getByLabelText('扣款帳戶'), data.accounts[0].id);
+    await user.selectOptions(screen.getByLabelText('支出分類'), data.categories.find(row => row.kind === 'expense')!.id);
+    await user.click(screen.getByRole('button', { name: '確認入帳' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('本機帳本尚未更新');
+    await waitFor(() => expect(api.listConnections).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      if (outcome === 'resolve') writing.resolve();
+      else writing.reject(new Error('synthetic clipboard failure'));
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent('本機帳本尚未更新');
+    expect(api.review).toHaveBeenCalledTimes(1);
+    expect(onSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears only its own clipboard error after a successful copy retry', async () => {
+    const { user } = await openInbox();
+    const writeText = vi.fn().mockRejectedValueOnce(new Error('synthetic clipboard failure')).mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    await user.click(screen.getByRole('button', { name: '連接 iPhone' }));
+    await user.click(screen.getByRole('button', { name: '複製測試 JSON' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('無法自動複製');
+    await user.click(screen.getByRole('button', { name: '複製測試 JSON' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('合成測試 JSON 已複製');
+    expect(writeText).toHaveBeenCalledTimes(2);
   });
 
   it('explicitly pulls an older cloud import outside the newest 100 notifications and updates the ledger', async () => {

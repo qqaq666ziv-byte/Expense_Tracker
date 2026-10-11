@@ -1073,6 +1073,63 @@ function credentialExpressionFixtures() {
   return { material, basicFixture, assignments, templates, basics, values: [...assignments, ...templates, ...basics] };
 }
 
+function opaqueAuthorizationFixtures() {
+  const material = ['SYNTHETIC', 'AUTH', 'ONLY', '0123456789'].join('_');
+  const values = ['Authorization', 'Proxy-Authorization', 'proxy_authorization'].flatMap(key => [
+    [key, ': ApiKey ', material].join(''),
+    [key, ' = "Custom ', material, '";'].join(''),
+    [key, ' ??= `Opaque ', material, '`;'].join(''),
+    JSON.stringify({ [key]: ['Token ', material].join('') }),
+    JSON.stringify({ message: JSON.stringify({ [key]: ['Digest ', material].join('') }) }),
+    JSON.stringify({ [key]: material }).replace('uthorization', '\\u0075thorization'),
+    [key, ' = "', material, '";'].join(''),
+    [key, ' = "Public public-value";'].join(''),
+    [key, ' = "ApiKey ${AUTH_VALUE}";'].join(''),
+  ]);
+  return { material, values };
+}
+
+test('withholds every opaque Authorization literal in source and pinned baseline', t => {
+  const f = fixture(t);
+  const { material, values } = opaqueAuthorizationFixtures();
+  for (const value of values) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), value + '\n');
+    assert.throws(() => createPacket(f.options), error => /Suspected/.test(error.message) && !error.message.includes(material));
+    assert.equal(fs.existsSync(f.options.out), false);
+    f.git(['commit', '-am', 'synthetic opaque authorization baseline']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(f.root, 'example.js'), 'safe current source\n');
+    assert.throws(() => createPacket({ ...f.options, base }), /Suspected.*baseline source/);
+  }
+});
+
+test('withholds opaque Authorization in diff-only metadata and check evidence', t => {
+  const f = fixture(t);
+  const { material, values } = opaqueAuthorizationFixtures();
+  for (const key of ['Authorization', 'Proxy-Authorization']) {
+    const name = [key, '=ApiKey ', material, '.txt'].join('');
+    fs.writeFileSync(path.join(f.root, name), 'safe baseline\n');
+    f.git(['add', '--', name]);
+    f.git(['commit', '-m', 'synthetic opaque authorization diff']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(f.root, name), 'safe edit\n');
+    assert.throws(() => createPacket({ ...f.options, base, files: ['example.js', name] }), /Suspected.*cumulative diff/);
+    assert.equal(fs.existsSync(f.options.out), false);
+    f.git(['checkout', '--', name]);
+  }
+  const g = fixture(t);
+  const { metadata, metadataPath } = check(g);
+  for (const value of values) {
+    fs.writeFileSync(metadata.outputFile, value);
+    assert.throws(() => createPacket({ ...g.options, phase: 'review', checks: [metadataPath] }), /Suspected.*check output/);
+    fs.writeFileSync(metadata.outputFile, 'safe synthetic log\n');
+    fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, command: value }));
+    assert.throws(() => createPacket({ ...g.options, phase: 'review', checks: [metadataPath] }), /Suspected/);
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+    assert.equal(fs.existsSync(g.options.out), false);
+  }
+});
+
 function bearerAndCompoundFixtures() {
   // Isolated synthetic strings only; no valid account credential or live data.
   const material = ['SYNTHETIC', 'COMPOUND', 'ONLY', '0123456789'].join('_');
@@ -1161,10 +1218,10 @@ test('preserves exact env and placeholder allowances for compound credentials an
     }
     for (const body of ['${AUTH_VALUE}', '<redacted>', '[REDACTED]']) {
       fs.writeFileSync(path.join(f.root, 'example.js'), ['Authorization ', operator, ' "Bearer ', body, '";\n'].join(''));
-      assert.doesNotThrow(() => captureSource(f.options));
+      assert.throws(() => captureSource(f.options), /Suspected authorization value/);
     }
     fs.writeFileSync(path.join(f.root, 'example.js'), ['Authorization ', operator, ' `Bearer ', '${process.env.AUTH_VALUE}', '`;\n'].join(''));
-    assert.doesNotThrow(() => captureSource(f.options));
+    assert.throws(() => captureSource(f.options), /Suspected authorization value/);
     fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET ', operator, ' process.env.DB_PASS ?? "SYNTHETIC_LITERAL";\n'].join(''));
     assert.throws(() => captureSource(f.options), /Suspected/);
   }
@@ -1221,13 +1278,13 @@ test('rejects Basic authorization bodies across raw quoted JSON and template fie
   const { material, basicFixture, basics } = credentialExpressionFixtures();
   for (const assignment of basics) {
     fs.writeFileSync(path.join(f.root, 'example.js'), `${assignment}\n`);
-    assert.throws(() => createPacket(f.options), error => /Suspected (?:credential assignment|Basic authorization)/.test(error.message)
+    assert.throws(() => createPacket(f.options), error => /Suspected (?:credential assignment|authorization value)/.test(error.message)
       && !error.message.includes(material) && !error.message.includes(basicFixture));
     assert.equal(fs.existsSync(f.options.out), false);
   }
 });
 
-test('keeps complete environment references placeholders and dynamic non-Basic headers usable', t => {
+test('keeps complete environment references and placeholders usable and refuses ambiguous Authorization expressions', t => {
   const f = fixture(t);
   const expressions = ['${DB_PASS}', '"${DB_PASS}"', "'${DB_PASS}'", 'env(DB_PASS)', '"env(DB_PASS)"',
     'process.env.DB_PASS;', "Deno.env.get('DB_PASS');", '"<redacted>"', '"[REDACTED]"', '"example-password"', '""',
@@ -1236,10 +1293,19 @@ test('keeps complete environment references placeholders and dynamic non-Basic h
     fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET', ' = ', expression, '\n'].join(''));
     assert.doesNotThrow(() => captureSource(f.options));
   }
-  for (const expression of ['tokenFromCaller', "request.headers.get('Authorization')", '"Public public-value"',
-    '"Basic ${BASIC_AUTH}"', '`' + '${process.env.AUTHORIZATION}`', '`Basic ' + '${process.env.BASIC_AUTH}`']) {
-    fs.writeFileSync(path.join(f.root, 'example.js'), ['Authorization', ' = ', expression, '\n'].join(''));
-    assert.doesNotThrow(() => captureSource(f.options));
+  for (const key of ['Authorization', 'Proxy-Authorization']) {
+    for (const expression of ['"${AUTH_VALUE}"', '"<redacted>"', '"[REDACTED]"', '"env(AUTH_VALUE)"',
+      'process.env.AUTH_VALUE;', 'process.env.AUTH_VALUE', 'Deno.env.get("AUTH_VALUE");', '`' + '${process.env.AUTH_VALUE}`']) {
+      fs.writeFileSync(path.join(f.root, 'example.js'), [key, ' = ', expression, '\n'].join(''));
+      assert.doesNotThrow(() => captureSource(f.options));
+    }
+    for (const expression of ['tokenFromCaller', "request.headers.get('Authorization')", '"Public public-value"',
+      '"Basic ${BASIC_AUTH}"', '`Basic ' + '${process.env.BASIC_AUTH}`', 'true', 'null',
+      'process.env.AUTH_VALUE ?? "synthetic fallback"', 'process.env.AUTH_VALUE\n + "synthetic suffix"',
+      '`' + '\\u0024{process.env.AUTH_VALUE}`']) {
+      fs.writeFileSync(path.join(f.root, 'example.js'), [key, ' = ', expression, '\n'].join(''));
+      assert.throws(() => captureSource(f.options), /Suspected/);
+    }
   }
 });
 

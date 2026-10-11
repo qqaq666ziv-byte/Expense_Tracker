@@ -13,7 +13,6 @@ const MAX_NPM_LOCKFILE = 512 * 1024;
 const MAX_EVIDENCE = 4 * 1024 * 1024;
 // RFC 6750 b64token includes standard base64 + / and trailing padding.
 const bearerPattern = /\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*/i;
-const authorizationName = value => value.toLowerCase() === 'basic' ? 'Basic' : 'Bearer';
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const hash = value => createHash('sha256').update(value).digest('hex');
 const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -121,7 +120,7 @@ function completeCredentialSuffix(suffix) {
 
 function safeCredentialBody(body, template, bare = false) {
   // Typed absence/config primitives carry no credential string. Quoted values,
-  // numeric passwords and HTTP Basic text do not receive this allowance.
+  // numeric passwords and Authorization values do not receive this allowance.
   if (bare && /^(?:true|false|null|undefined)$/.test(body)) return true;
   const placeholder = body === '' || /^(?:<[A-Za-z][A-Za-z0-9_-]*>|\[REDACTED\]|(?:your|example|test|fake|placeholder|replace)[-_ ][A-Za-z0-9_-]+)$/i.test(body);
   if (template) {
@@ -143,42 +142,20 @@ function checkCredentialAssignments(value, label) {
       // A separate token_hash RPC parameter is not a credential assignment;
       // literal service-token signatures are still checked under any key.
       || /(?:^|[_-])token$/i.test(normalized);
-    const authorization = /^(?:proxy[_-])?authorization$/i.test(normalized);
-    if (!sensitive && !authorization) continue;
+    const authorizationField = /^(?:proxy[_-])?authorization$/i.test(normalized);
+    if (!sensitive && !authorizationField) continue;
     const expression = value.slice(match.index + prefix.length);
-    if (sensitive && /^(?:Deno\.env\.get\((['"])[A-Z][A-Z0-9_]*\1\)|process\.env\.[A-Z][A-Z0-9_]*);[^\S\r\n\u2028\u2029]*(?:\/\/[^\r\n\u2028\u2029]*)?(?:[\r\n\u2028\u2029]|$)/.test(expression)) continue;
-    let authorizationScheme = null;
+    const envRead = /^(?:Deno\.env\.get\((['"])[A-Z][A-Z0-9_]*\1\)|process\.env\.[A-Z][A-Z0-9_]*)/.exec(expression);
+    if (envRead && completeCredentialSuffix(expression.slice(envRead[0].length))) continue;
     let literal = credentialValue(expression);
     // Decode the complete body after extracting its original literal boundary.
     // Escaped quote/comma bytes can never create a shorter safe value. Template
     // exemptions use original bytes: escaped interpolation is literal text.
     if (literal && !literal.template) literal = { ...literal, body: unescapeJsonText(literal.body) };
-    if (authorization) {
-      // Both credential schemes use the complete value/expression guard.
-      // Dynamic headers and other schemes retain their existing behavior.
-      const scheme = /^\s*(Basic|Bearer)\s+([\s\S]*)$/i.exec(literal?.body ?? '');
-      if (scheme) {
-        authorizationScheme = authorizationName(scheme[1]);
-        literal = { ...literal, body: scheme[2] };
-      } else if (literal?.template && /^\s*(Basic|Bearer)\s+/i.test(unescapeJsonText(literal.body))) {
-        // Escaped template bytes may identify a scheme, but cannot prove a pure
-        // environment interpolation. Deny that ambiguous template outright.
-        const decodedScheme = /^\s*(Basic|Bearer)\s+/i.exec(unescapeJsonText(literal.body));
-        fail(`Suspected ${authorizationName(decodedScheme[1])} authorization in ${label}; content withheld.`);
-      }
-      else {
-        const bareScheme = /^(Basic|Bearer)[ \t]+/i.exec(expression);
-        if (!bareScheme) {
-          const unclosedScheme = !literal && /^["'`]\s*(Basic|Bearer)(?:\s|$)/i.exec(expression);
-          if (unclosedScheme) fail(`Suspected ${authorizationName(unclosedScheme[1])} authorization in ${label}; content withheld.`);
-          continue;
-        }
-        authorizationScheme = authorizationName(bareScheme[1]);
-        literal = credentialValue(expression.slice(bareScheme[0].length));
-      }
-    }
-    if (!literal || !safeCredentialBody(literal.body, literal.template, literal.bare && !authorization) || !completeCredentialSuffix(literal.suffix)) {
-      fail(`Suspected ${authorization ? `${authorizationScheme} authorization` : 'credential assignment'} in ${label}; content withheld.`);
+    // Authorization is credential-bearing independently of its scheme. Never
+    // strip a prefix into a shorter safe body or trust an unknown expression.
+    if (!literal || !safeCredentialBody(literal.body, literal.template, literal.bare && !authorizationField) || !completeCredentialSuffix(literal.suffix)) {
+      fail(`Suspected ${authorizationField ? 'authorization value' : 'credential assignment'} in ${label}; content withheld.`);
     }
   }
 }
