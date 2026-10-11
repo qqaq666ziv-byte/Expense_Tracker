@@ -17,6 +17,7 @@ import { recurringRuleParentIssue } from '../domain/recurringSafety';
 import {
   acceptRemoteConflictRecord,
   confirmTransferDependencyConflict,
+  differingSyncRecordFields,
   hasUnresolvedPayloadConflict,
   hasTransferDependencyConflict,
   syncRecordKey,
@@ -770,10 +771,37 @@ export function useFinanceApp(
       const fullySynced = result.report.ownerId === ownerId
         && result.report.status === 'synced'
         && result.report.failures.length === 0;
-      const committedIds = new Set(committed.data.transactions.map((transaction) => transaction.id));
+      const responseTransactions = new Map<string, FinanceData['transactions'][number]>(
+        result.state.data.transactions.map((transaction) => [transaction.id, transaction]),
+      );
+      const committedTransactions = new Map<string, FinanceData['transactions'][number]>(
+        committed.data.transactions.map((transaction) => [transaction.id, transaction]),
+      );
+      const pendingIds = new Set([...result.state.outbox, ...committed.outbox]
+        .filter((operation) => operation.entity === 'transactions')
+        .map((operation) => operation.recordId));
+      const conflictKeys = unresolvedPayloadConflictKeys(
+        [...result.state.outbox, ...committed.outbox],
+        result.report.conflicts,
+        [...(result.state.unresolvedSyncRecordKeys ?? []), ...(committed.unresolvedSyncRecordKeys ?? [])],
+      );
       return {
         status: result.report.status,
-        confirmedTransactionIds: fullySynced ? transactionIds.filter((id) => committedIds.has(id)) : [],
+        // A concurrent conflict can preserve the complete latest snapshot instead
+        // of this response. Only confirm the same live, settled record in both.
+        confirmedTransactionIds: fullySynced ? transactionIds.filter((id) => {
+          const responseTransaction = responseTransactions.get(id);
+          const committedTransaction = committedTransactions.get(id);
+          if (!responseTransaction || !committedTransaction) return false;
+          return responseTransaction.ownerId === ownerId
+            && committedTransaction.ownerId === ownerId
+            && !responseTransaction.deletedAt
+            && !committedTransaction.deletedAt
+            && !pendingIds.has(id)
+            && syncMutationTargets(committed, 'transactions', committedTransaction)
+              .every((target) => !conflictKeys.has(syncRecordKey(target.entity, target.recordId)))
+            && differingSyncRecordFields('transactions', responseTransaction, committedTransaction).length === 0;
+        }) : [],
       };
     } finally {
       releaseSyncToken(token);

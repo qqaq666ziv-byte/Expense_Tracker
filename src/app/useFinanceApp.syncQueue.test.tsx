@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-import { act, renderHook, waitFor } from '@testing-library/react';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { StrictMode, useEffect } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createFinancePersistence, createInMemoryOwnerStateStore } from './localDurability';
 import { useFinanceApp } from './useFinanceApp';
 import { createInitialState } from './state';
@@ -11,6 +11,7 @@ import { syncRecordKey } from '../domain/syncEngine';
 import type { FinanceSyncOutcome } from './useFinanceApp';
 
 type SyntheticSession = { user: { id: string }; access_token: string };
+afterEach(cleanup);
 const mocks = vi.hoisted(() => ({
   sync: vi.fn(), remote: vi.fn(),
   authChange: undefined as ((event: string, session: SyntheticSession | null) => void) | undefined,
@@ -55,16 +56,17 @@ function syncedResult(state: SyncResult['state'], status: SyncReport['status'], 
     pending: [], failures: failedPull ? [{ stage: 'pull', message: 'synthetic failed pull' }] : [], conflicts: [] } };
 }
 
-async function conflictFixture() {
+async function conflictFixture(withConflict = true) {
   const initial = createInitialState('owner-sync');
   initial.initialBootstrap = undefined;
   const account = initial.data.accounts[0];
-  initial.unresolvedSyncRecordKeys = [syncRecordKey('accounts', account.id)];
+  initial.unresolvedSyncRecordKeys = withConflict ? [syncRecordKey('accounts', account.id)] : undefined;
   const store = createInMemoryOwnerStateStore();
   const persistence = createFinancePersistence(store, localStorage);
   expect((await persistence.commit(initial.ownerId, 'seed-conflict', () => initial)).ok).toBe(true);
   mocks.sync.mockResolvedValueOnce(undefined);
   const hook = renderHook(() => useFinanceApp(persistence));
+  await waitFor(() => expect(hook.result.current.state.ownerId).toBe(initial.ownerId));
   await waitFor(() => expect(hook.result.current.state.unresolvedSyncRecordKeys).toEqual(initial.unresolvedSyncRecordKeys));
   await waitFor(() => expect(mocks.sync).toHaveBeenCalledTimes(1));
   await waitFor(() => expect(hook.result.current.syncBusy).toBe(false));
@@ -249,7 +251,11 @@ describe('finance sync request coalescing', () => {
     expect(result.current.safetyNotice).toBe(currentNotice);
     expect(mocks.sync).toHaveBeenCalledTimes(3);
     mocks.sync.mockImplementationOnce(async (started) => {
-      const oldPulled = syncedResult(started, 'synced', 'transaction-old-generation');
+      // The returned owner's original account is still locked. Confirm records
+      // under a separate live parent without implicitly resolving that conflict.
+      const unlockedParent = { ...started.data.accounts[0], id: 'unlocked-synthetic-account' };
+      const ready = { ...started, data: { ...started.data, accounts: [unlockedParent, ...started.data.accounts] } };
+      const oldPulled = syncedResult(ready, 'synced', 'transaction-old-generation');
       return syncedResult(oldPulled.state, 'synced', 'transaction-new-generation');
     });
     let outcome!: FinanceSyncOutcome;
@@ -353,6 +359,50 @@ describe('finance sync request coalescing', () => {
     await waitFor(() => expect(result.current.syncBusy).toBe(false));
   });
 
+  it.each(['latest-only', 'changed-payload', 'deleted'] as const)(
+    'does not confirm a %s record when a cross-tab conflict preserves the latest snapshot', async (scenario) => {
+      const { result, persistence } = await conflictFixture();
+      const targetId = 'cross-tab-target-unconfirmed';
+      const response = deferred<SyncResult | undefined>();
+      mocks.sync.mockReturnValueOnce(response.promise);
+      let requested!: Promise<FinanceSyncOutcome>;
+      act(() => { requested = result.current.syncNow([targetId]); });
+      const started = mocks.sync.mock.calls.at(-1)![0];
+      const pulled = syncedResult(started, 'synced', targetId);
+      const cloudTransaction = pulled.state.data.transactions.find((row) => row.id === targetId)!;
+      const target: Transaction = {
+        ...cloudTransaction,
+        amount: scenario === 'changed-payload' ? 99 : 12,
+        version: 2,
+        lastOperationId: 'different-cross-tab-operation',
+        ...(scenario === 'deleted' ? { deletedAt: '2026-10-08T13:00:00.000Z' } : {}),
+      };
+      expect(await persistence.commit('owner-sync', 'synthetic-cross-tab-conflict', (current) => ({
+        ...current,
+        data: { ...current.data, transactions: [...current.data.transactions, target] },
+        outbox: [...current.outbox, {
+          id: target.lastOperationId, entity: 'transactions', recordId: target.id,
+          record: target, attempts: 0, queuedAt: target.updatedAt, conflict: { kind: 'payload' },
+        }],
+        unresolvedSyncRecordKeys: [
+          ...(current.unresolvedSyncRecordKeys ?? []), syncRecordKey('transactions', target.id),
+        ],
+      }))).toMatchObject({ ok: true });
+
+      let outcome!: FinanceSyncOutcome;
+      await act(async () => {
+        response.resolve(scenario === 'latest-only' ? syncedResult(started, 'synced') : pulled);
+        outcome = await requested;
+      });
+
+      expect(result.current.state.data.transactions).toContainEqual(target);
+      expect(result.current.state.outbox).toContainEqual(expect.objectContaining({
+        recordId: targetId, conflict: { kind: 'payload' },
+      }));
+      expect(outcome.confirmedTransactionIds).toEqual([]);
+    },
+  );
+
   it('does not confirm imported IDs after partial, skipped, or uncommitted syncs', async () => {
     const store = createInMemoryOwnerStateStore();
     const persistence = createFinancePersistence(store, localStorage);
@@ -393,4 +443,59 @@ describe('finance sync request coalescing', () => {
     await act(async () => { uncommitted = await result.current.syncNow(['transaction-uncommitted']); });
     expect(uncommitted).toEqual({ status: 'uncommitted', confirmedTransactionIds: [] });
   });
+});
+
+describe('finance sync confirmation boundaries', () => {
+  beforeEach(() => {
+    localStorage.clear(); mocks.sync.mockReset(); mocks.remote.mockReset().mockReturnValue({});
+    mocks.authChange = undefined;
+  });
+
+  it.each(['not-in-response', 'response-tombstone', 'retryable-pending', 'parent-conflict'] as const)(
+    'does not confirm the %s case without a transaction payload conflict', async (scenario) => {
+      const { result, persistence } = await conflictFixture(false);
+      const id = 'confirmation-boundary-target';
+      const response = deferred<SyncResult | undefined>();
+      mocks.sync.mockReturnValueOnce(response.promise);
+      let requested!: Promise<FinanceSyncOutcome>;
+      act(() => { requested = result.current.syncNow([id]); });
+      const started = mocks.sync.mock.calls.at(-1)![0];
+      const pulled = syncedResult(started, 'synced', id);
+      let target = pulled.state.data.transactions.find((row) => row.id === id)!;
+      if (scenario === 'response-tombstone') {
+        target = { ...target, deletedAt: '2026-10-08T13:00:00.000Z' };
+        pulled.state.data.transactions = [target];
+      }
+      expect(await persistence.commit('owner-sync', 'synthetic-cross-tab-update', (current) => {
+        const parent = current.data.accounts[0];
+        const related = {
+          ...parent, id: scenario === 'parent-conflict' ? parent.id : 'unrelated-conflict-account',
+          version: parent.version + 1, lastOperationId: 'synthetic-account-conflict',
+        };
+        return {
+          ...current,
+          data: {
+            ...current.data,
+            accounts: [...current.data.accounts.filter((row) => row.id !== related.id), related],
+            transactions: [target],
+          },
+          outbox: [{
+            id: related.lastOperationId, entity: 'accounts', recordId: related.id,
+            record: related, attempts: 0, queuedAt: related.updatedAt, conflict: { kind: 'payload' },
+          }, ...(scenario === 'retryable-pending' ? [{
+            id: target.lastOperationId, entity: 'transactions' as const, recordId: id,
+            record: target, attempts: 0, queuedAt: target.updatedAt, conflict: null,
+          }] : [])],
+          unresolvedSyncRecordKeys: [syncRecordKey('accounts', related.id)],
+        };
+      })).toMatchObject({ ok: true });
+
+      let outcome!: FinanceSyncOutcome;
+      await act(async () => {
+        response.resolve(scenario === 'not-in-response' ? syncedResult(started, 'synced') : pulled);
+        outcome = await requested;
+      });
+      expect(outcome.confirmedTransactionIds).toEqual([]);
+    },
+  );
 });
