@@ -1073,6 +1073,103 @@ function credentialExpressionFixtures() {
   return { material, basicFixture, assignments, templates, basics, values: [...assignments, ...templates, ...basics] };
 }
 
+function bearerAndCompoundFixtures() {
+  // Isolated synthetic strings only; no valid account credential or live data.
+  const material = ['SYNTHETIC', 'COMPOUND', 'ONLY', '0123456789'].join('_');
+  const bearerBody = ['ab', '+/', 'SYNTHETICONLY0123456789', '=='].join('');
+  const bearers = [
+    ['Authorization', ': Bearer ', bearerBody].join(''),
+    JSON.stringify({ ['Authorization']: ['Bearer ', bearerBody].join('') }),
+    ['Proxy-Authorization', ' = "bEaReR ', bearerBody, '";'].join(''),
+    JSON.stringify({ message: ['Bearer ', bearerBody].join('') }).replace('+/', '\\u002b\\/'),
+    JSON.stringify({ message: JSON.stringify({ ['Authorization']: ['Bearer ', bearerBody].join('') }).replace('Bearer', '\\u0042earer') }),
+  ];
+  const compounds = ['??=', '||=', '&&=', '+=', '-=', '*=', '/=', '%=', '**=', '<<=', '>>=', '>>>=', '&=', '|=', '^='].flatMap(operator => [
+    ['process.env.POSTGRES_PASSWORD ', operator, ' "', material, '";'].join(''),
+    ['AUTH_TOKEN ', operator, ' "', material, '";'].join(''),
+    ['$env:SLACK_TOKEN ', operator, ' "', material, '";'].join(''),
+    ['API_\\u0053ECRET ', operator, ' "', material, '";'].join(''),
+    ['Authorization ', operator, ' "Bearer ', bearerBody, '";'].join(''),
+    JSON.stringify({ message: ['API_SECRET ', operator, ' "', material, '";'].join('') }),
+  ]);
+  return { material, bearerBody, values: [...bearers, ...compounds] };
+}
+
+test('withholds base64 Bearer and compound credential source and pinned baselines', t => {
+  const f = fixture(t);
+  const { material, bearerBody, values } = bearerAndCompoundFixtures();
+  for (const value of values) {
+    fs.writeFileSync(path.join(f.root, 'example.js'), `${value}\n`);
+    assert.throws(() => createPacket(f.options), error => /Suspected/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(bearerBody));
+    assert.equal(fs.existsSync(f.options.out), false);
+    f.git(['commit', '-am', 'synthetic credential boundary baseline']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(f.root, 'example.js'), 'safe current source\n');
+    assert.throws(() => createPacket({ ...f.options, base }), /Suspected.*baseline source/);
+  }
+});
+
+test('withholds base64 Bearer and compound assignments in diff-only metadata', t => {
+  const f = fixture(t);
+  const { material, bearerBody } = bearerAndCompoundFixtures();
+  // Percent-free synthetic path isolates scanning the cumulative diff metadata;
+  // plus/slash token characters are a complete path in a public parent directory.
+  const names = [
+    ['Authorization', '=Bearer ', bearerBody, '.txt'].join(''),
+    ...['??=', '||=', '&&='].map(operator => ['API_SECRET', operator, material, '.txt'].join('')),
+  ];
+  for (const name of names) {
+    const file = path.join(f.root, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'safe baseline\n');
+    f.git(['add', '--', name]);
+    f.git(['commit', '-m', 'synthetic diff credential boundary']);
+    const base = f.git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(file, 'safe edit\n');
+    assert.throws(() => createPacket({ ...f.options, base, files: ['example.js', name] }), error => /Suspected.*cumulative diff/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(bearerBody));
+    assert.equal(fs.existsSync(f.options.out), false);
+    f.git(['checkout', '--', name]);
+  }
+});
+
+test('withholds base64 Bearer and compound credentials from check logs and metadata', t => {
+  const f = fixture(t);
+  const { metadata, metadataPath } = check(f);
+  const { material, bearerBody, values } = bearerAndCompoundFixtures();
+  for (const value of values) {
+    fs.writeFileSync(metadata.outputFile, value);
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), error => /Suspected.*check output/.test(error.message)
+      && !error.message.includes(material) && !error.message.includes(bearerBody));
+    fs.writeFileSync(metadata.outputFile, 'safe synthetic log\n');
+    fs.writeFileSync(metadataPath, JSON.stringify({ ...metadata, command: value }));
+    assert.throws(() => createPacket({ ...f.options, phase: 'review', checks: [metadataPath] }), /Suspected/);
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata));
+    assert.equal(fs.existsSync(f.options.out), false);
+  }
+});
+
+test('preserves exact env and placeholder allowances for compound credentials and Bearer headers', t => {
+  const f = fixture(t);
+  const expressions = ['"${DB_PASS}"', '"<redacted>"', '"[REDACTED]"', 'process.env.DB_PASS;', 'Deno.env.get("DB_PASS");',
+    '`' + '${process.env.DB_PASS}`'];
+  for (const operator of ['=', '??=', '||=', '&&=']) {
+    for (const expression of expressions) {
+      fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET ', operator, ' ', expression, '\n'].join(''));
+      assert.doesNotThrow(() => captureSource(f.options));
+    }
+    for (const body of ['${AUTH_VALUE}', '<redacted>', '[REDACTED]']) {
+      fs.writeFileSync(path.join(f.root, 'example.js'), ['Authorization ', operator, ' "Bearer ', body, '";\n'].join(''));
+      assert.doesNotThrow(() => captureSource(f.options));
+    }
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['Authorization ', operator, ' `Bearer ', '${process.env.AUTH_VALUE}', '`;\n'].join(''));
+    assert.doesNotThrow(() => captureSource(f.options));
+    fs.writeFileSync(path.join(f.root, 'example.js'), ['API_SECRET ', operator, ' process.env.DB_PASS ?? "SYNTHETIC_LITERAL";\n'].join(''));
+    assert.throws(() => captureSource(f.options), /Suspected/);
+  }
+});
+
 test('rejects credential environment defaults and composed references as complete expressions', t => {
   const f = fixture(t);
   const { material, assignments } = credentialExpressionFixtures();
