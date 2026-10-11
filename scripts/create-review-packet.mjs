@@ -131,7 +131,11 @@ function safeCredentialBody(body, template, bare = false) {
 }
 
 function checkCredentialAssignments(value, label) {
-  const assignments = value.matchAll(/(?=((?:^|[^A-Za-z0-9_$\\-])["']?((?:[A-Za-z_$]|\\u[a-fA-F0-9]{4})(?:[A-Za-z0-9_$-]|\\u[a-fA-F0-9]{4})*)["']?\s*(?:(?:\?\?|\|\||&&|\*\*|<<|>>>|>>|[+\-*/%&|^])?=|:)\s*))/gm);
+  // A computed property keeps its closing bracket between the literal key and
+  // assignment operator. Recognize JS trivia there without rewriting any RHS
+  // bytes or stripping comment-looking text from credential string literals.
+  const lhsTrivia = String.raw`(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n\u2028\u2029]*(?:\r\n|[\r\n\u2028\u2029]|$))*`;
+  const assignments = value.matchAll(new RegExp(String.raw`(?=((?:^|[^A-Za-z0-9_$\\-])["']?((?:[A-Za-z_$]|\\u[a-fA-F0-9]{4})(?:[A-Za-z0-9_$-]|\\u[a-fA-F0-9]{4})*)["']?(?:${lhsTrivia}\])?${lhsTrivia}(?:(?:\?\?|\|\||&&|\*\*|<<|>>>|>>|[+\-*/%&|^])?=|:)\s*))`, 'gm'));
   for (const match of assignments) {
     const [, prefix, key] = match;
     const decodedKey = unescapeJsonText(key);
