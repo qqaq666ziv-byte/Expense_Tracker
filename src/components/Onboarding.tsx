@@ -115,7 +115,7 @@ const COPY: Record<TutorialStep, StepCopy> = {
   "tour-insights": {
     kicker: "功能速覽 · 洞察",
     title: "洞察把交易整理成趨勢",
-    body: "切換今日、本週、本月、本年或自訂期間，再從總覽一路看進分類與明細。",
+    body: "切換今日、週、月、本年或自訂期間；週和月可以選日期，再從總覽一路看進分類與明細。",
     target: "insights-overview",
     continueLabel: "看生活規劃",
   },

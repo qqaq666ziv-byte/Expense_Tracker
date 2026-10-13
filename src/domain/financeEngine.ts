@@ -46,7 +46,10 @@ export interface FinancialSummary {
 
 export interface InsightsOptions {
   period: PeriodKey;
+  /** Current local clock for today, elapsed days and comparison clipping. */
   reference: Date;
+  /** Optional anchor for browsing another calendar period. */
+  periodReference?: Date;
   custom?: CustomRangeInput;
 }
 
@@ -168,8 +171,9 @@ export function calculateInsights(data: FinanceData, options: InsightsOptions): 
     data.categories,
   );
 
-  const currentRange = getPeriodRange(options.period, options.reference, options.custom);
-  const previousRange = getEquivalentPreviousPeriodRange(options.period, options.reference, options.custom);
+  const periodReference = options.periodReference ?? options.reference;
+  const currentRange = getPeriodRange(options.period, periodReference, options.custom);
+  const previousRange = getEquivalentPreviousPeriodRange(options.period, periodReference, options.custom, options.reference);
   const period = summarizePeriod(transactions, data.categories, currentRange, options.reference);
   const previousPeriod = summarizePeriod(transactions, data.categories, previousRange, options.reference);
 

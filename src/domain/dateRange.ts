@@ -177,16 +177,17 @@ export function getEquivalentPreviousPeriodRange(
   period: PeriodKey,
   reference: Date,
   custom?: CustomRangeInput,
+  now: Date = reference,
 ): DateRange {
   const current = getPeriodRange(period, reference, custom);
   const previous = getPreviousPeriodRange(period, reference, custom);
   if (period === 'custom'
-    || reference.getTime() < current.start.getTime()
-    || reference.getTime() >= current.end.getTime()) {
+    || now.getTime() < current.start.getTime()
+    || now.getTime() >= current.end.getTime()) {
     return previous;
   }
 
-  const elapsedDays = countElapsedDays(current, reference);
+  const elapsedDays = countElapsedDays(current, now);
   if (elapsedDays <= 0) return previous;
   const equivalentEnd = endOfLocalDay(shiftLocalDays(previous.start, elapsedDays - 1));
   return {

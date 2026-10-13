@@ -40,6 +40,68 @@ const baseData: FinanceData = {
 };
 
 describe('finance engine', () => {
+  it('uses a selected historical leap month for full-period totals, averages and comparisons while keeping today live', () => {
+    const data: FinanceData = {
+      ...baseData,
+      transactions: [
+        ['2024-01-31 23:59:59.999', 31],
+        ['2024-02-01 00:00', 29],
+        ['2024-02-29 23:59:59.999', 261],
+        ['2024-03-01 00:00', 999],
+        ['2026-10-13 00:00', 13],
+      ].map(([occurredAt, amount], index) => ({
+        id: `synthetic-selected-${index}`, ownerId: 'guest', amount: Number(amount), type: 'expense',
+        categoryId: 'food', categoryName: '餐飲', accountId: 'cash', accountName: '現金',
+        occurredAt: String(occurredAt), version: 1, updatedAt: '2026-10-13T00:00:00.000Z', lastOperationId: 'fixture',
+      })),
+    };
+    const insights = calculateInsights(data, {
+      period: 'month', reference: new Date(2026, 9, 13, 12), periodReference: new Date(2024, 1, 1),
+    });
+    expect(insights.period).toMatchObject({ expense: 290, averageDailyExpense: 10 });
+    expect(insights.previousPeriod).toMatchObject({ expense: 31, averageDailyExpense: 1 });
+    expect(insights.comparison.expenseDelta).toBe(259);
+    expect(insights.today.expense).toBe(13);
+    expect(calculateSpendingTrend(data, insights.period.range)).toEqual([['2024-02-01', 29], ['2024-02-29', 261]]);
+  });
+
+  it('uses a seven-day denominator for selected completed cross-year weeks', () => {
+    const data: FinanceData = {
+      ...baseData,
+      transactions: [{
+        id: 'synthetic-week', ownerId: 'guest', amount: 70, type: 'expense',
+        categoryId: 'food', categoryName: '餐飲', accountId: 'cash', accountName: '現金',
+        occurredAt: '2025-01-05 23:59:59.999', version: 1,
+        updatedAt: '2026-10-13T00:00:00.000Z', lastOperationId: 'fixture',
+      }],
+    };
+    const insights = calculateInsights(data, {
+      period: 'week', reference: new Date(2026, 9, 13, 12), periodReference: new Date(2025, 0, 1),
+    });
+    expect(insights.period).toMatchObject({ expense: 70, averageDailyExpense: 10 });
+    expect(insights.comparison.expenseDelta).toBe(70);
+  });
+
+  it('keeps current-month elapsed-day and comparison rules when selecting its last day', () => {
+    const data: FinanceData = {
+      ...baseData,
+      transactions: [
+        ['2026-09-13 23:59:59.999', 10],
+        ['2026-09-14 00:00', 999],
+        ['2026-10-13 00:00', 130],
+      ].map(([occurredAt, amount], index) => ({
+        id: `synthetic-current-${index}`, ownerId: 'guest', amount: Number(amount), type: 'expense',
+        categoryId: 'food', categoryName: '餐飲', accountId: 'cash', accountName: '現金',
+        occurredAt: String(occurredAt), version: 1, updatedAt: '2026-10-13T00:00:00.000Z', lastOperationId: 'fixture',
+      })),
+    };
+    const insights = calculateInsights(data, {
+      period: 'month', reference: new Date(2026, 9, 13, 12), periodReference: new Date(2026, 9, 31),
+    });
+    expect(insights.period.averageDailyExpense).toBe(10);
+    expect(insights.comparison.expenseDelta).toBe(120);
+  });
+
   it('keeps an active tutorial record out of the normal ledger, assets and analytics', () => {
     const data: FinanceData = {
       ...baseData,
