@@ -178,6 +178,8 @@ def main():
                     if urlparse(route.request.url).netloc != parsed.netloc:
                         external.append(route.request.url)
                         route.abort()
+                    elif urlparse(route.request.url).path == '/__period_fixture__':
+                        route.fulfill(status=200, content_type='text/html', body='<html><body>Local synthetic fixture setup</body></html>')
                     else:
                         route.continue_()
                 context.route('**/*', route_local)
@@ -191,9 +193,10 @@ def main():
                 page.on('pageerror', lambda error: errors.append(str(error)))
                 # Noon in each local timezone, independent of the executor timezone.
                 page.clock.install(time=datetime(2026, 10, 13, 12, tzinfo=ZoneInfo(tz)))
-                page.goto(args.url)
+                # Seed before React mounts, so async durability cannot overwrite the fixture.
+                page.goto(args.url.rstrip('/') + '/__period_fixture__')
                 fixture = page.evaluate(SEED)
-                page.reload()
+                page.goto(args.url)
                 verify(page, screenshots, capture=width == 390 and tz == 'Asia/Taipei')
                 if cdp:
                     # Keep calendar selections stable when the device timezone changes

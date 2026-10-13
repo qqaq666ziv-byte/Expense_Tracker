@@ -59,6 +59,8 @@ describe('InsightsView selected calendar periods', () => {
     fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2027-01-03' } });
     expect(picker()).toHaveTextContent('2026/12/28 — 2027/1/3');
     expect(expense()).toHaveTextContent('225');
+    expect(screen.getByText('已選日期：2027-01-03')).toBeVisible();
+    expect(screen.getByLabelText('選擇週內日期')).toHaveAccessibleDescription(/已選日期：2027-01-03.*2026\/12\/28/);
     const trend = screen.getByRole('img', { name: '支出趨勢折線圖' });
     expect(trend).toHaveTextContent('2026-12-28：');
     expect(trend).toHaveTextContent('2027-01-03：');
@@ -80,6 +82,8 @@ describe('InsightsView selected calendar periods', () => {
     render(<InsightsView data={fixture()} onOpenLedger={vi.fn()} />);
     fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2028-02' } });
     expect(summary()).toHaveTextContent('2028/2/1 — 2028/2/29');
+    expect(screen.getByText('已選月份：2028-02')).toBeVisible();
+    expect(screen.getByLabelText('選擇月份')).toHaveAccessibleDescription(/已選月份：2028-02/);
     expect(expense()).toHaveTextContent('290');
     for (let index = 0; index < 3; index++) {
       fireEvent.click(screen.getByRole('button', { name: '週' }));
@@ -117,6 +121,7 @@ describe('InsightsView selected calendar periods', () => {
     render(<InsightsView data={fixture()} onOpenLedger={vi.fn()} />);
     fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '' } });
     expect(screen.getByRole('alert')).toHaveTextContent('請選擇有效的月份');
+    expect(screen.queryByText(/^已選月份：/)).not.toBeInTheDocument();
     expect(screen.queryByRole('region', { name: '這段時間的收支' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '下一月' })).toBeDisabled();
     fireEvent.click(screen.getByRole('button', { name: '回本月' }));

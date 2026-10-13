@@ -68,3 +68,15 @@ UI 檢查涵蓋選擇／前後／回本期、總額與日均、上期比較、�
 ```sh
 git switch -c restore/select-week-month-baseline checkpoint/20261013-before-select-week-month
 ```
+
+## 手機原生日期欄位重疊修正（2026-10-13）
+
+- 實際取得並開啟使用者 Library 圖片 `libfile_eee043ea1d3481919568dc288d5a2669`（97,595 bytes）；圖中日期輸入框右緣與下一週箭頭重疊。使用者圖片保留在倉庫外，未加入 Git。
+- 原三欄配置把日期原生控制與兩個箭頭放在同一列；iPhone 原生控制的尺寸行為使欄位侵入旁邊按鈕。舊 Chromium 檢查只量外框及 viewport，無法排除原生內部文字裁切或 Safari 的尺寸差異。
+- 修正為日期欄位獨立整列，明確設定 border-box、inline min/max sizing 及 appearance；完整區間另列可換行，下方上期／回本期／下期為有文字的 44px 以上按鈕，可隨文字放大換行。另以 `1rem`、可換行的「已選月份／已選日期」顯示精確完整值，並透過 `aria-describedby` 連結至輸入控制；無效輸入時不顯示舊值。未更動統計計算、資料持久化或原生 date/month 類型。
+- `python scripts/verify-period-layout.py`：320、375、390、414、430、440px，100%／150%／200% 字級，各自合成資料／空資料，並在同一 context 旋轉至橫向；共 72 組 viewport／字級／資料案例，每組均測週及月。檢查控制間不重疊、按鈕文字與完整日期範圍不溢出、touch target、前後／回本期、跨年週、閏月及長英文月份 September，並比對帳務未修改。此為 root font-size 模擬，不等於 iOS Dynamic Type 實測。
+- 測試 fixture 改在同源空白頁建立完成後才載入 React，排除初始空狀態持久化與合成資料注入競爭；仍維持隔離 context、外部請求封鎖與資料未變斷言。
+- 已重跑原 16 組日期／統計／圖表／明細 UI 與動態時區測試、typecheck、lint、54 檔／637 項 tests、build、PGlite migration、npm audit（0 vulnerabilities），及三時區各 67 項 focused tests。
+- 獨立 reviewer 未發現阻塞問題；320px／200% 下 Chromium 原生長英文月份的年份仍可能部分裁切，精確已選值及完整日期範圍另列可讀；未透過縮小字級或換成自訂日期控制掩蓋此瀏覽器限制。原生 shadow 內文裁切無法靠 input.scrollWidth 判斷，因此測試通過不代表原生欄位內所有文字均完整。Safari／iPhone 實機及原生面板仍未驗。
+- 合成畫面：[修正前 320px／200%](screenshots/period-layout-before-320-200pct.png)、[修正後 320px／200%](screenshots/period-layout-after-320-200pct.png)、[修正後 440px](screenshots/period-layout-after-440.png)。修正後的局部圖僅在截圖瞬間隱藏無關 sticky header／bottom nav，避免局部擷取疊入導覽列；實際幾何與點擊測試保持導覽列正常。修正前的 Chromium 圖展示日期內文裁切，不宣稱重現 iPhone 的相同外框重疊。
+- 本次修正前遠端 checkpoint：`checkpoint/20261013-before-mobile-period-layout` → `41b81254a236d7bbf195138ece3768e3ed277a52`。需要還原時從此 tag 建立新分支，保留遠端歷史：`git switch -c restore/before-mobile-period-layout checkpoint/20261013-before-mobile-period-layout`。

@@ -232,36 +232,43 @@ export function InsightsView({
       </div>
       {selectablePeriod && (
         <div className="calendar-period-picker" role="group" aria-label={selectablePeriod === "week" ? "選擇週" : "選擇月"}>
-          <div className="calendar-period-controls">
-            <button type="button" aria-label={selectablePeriod === "week" ? "上一週" : "上一月"}
-              disabled={!previousSelection} onClick={() => previousSelection && setSelection(previousSelection)}>
-              <ChevronLeft aria-hidden="true" className="h-5 w-5" />
-            </button>
-            <label>
-              {selectablePeriod === "week" ? "選擇週內任一天" : "選擇月份"}
-              <input
-                aria-label={selectablePeriod === "week" ? "選擇週內日期" : "選擇月份"}
-                aria-invalid={Boolean(selectionError)}
-                aria-describedby={selectionError ? "period-selection-error" : "selected-period-range"}
-                type={selectablePeriod === "week" ? "date" : "month"}
-                min={selectablePeriod === "week" ? "0101-01-01" : "0101-01"}
-                max={selectablePeriod === "week" ? "9999-12-31" : "9999-12"}
-                value={selectionValue}
-                onChange={(event) => setSelection(event.target.value)}
-              />
-            </label>
-            <button type="button" aria-label={selectablePeriod === "week" ? "下一週" : "下一月"}
-              disabled={!nextSelection} onClick={() => nextSelection && setSelection(nextSelection)}>
-              <ChevronRight aria-hidden="true" className="h-5 w-5" />
-            </button>
-          </div>
+          <label className="calendar-period-field">
+            {selectablePeriod === "week" ? "選擇週內任一天" : "選擇月份"}
+            <input
+              aria-label={selectablePeriod === "week" ? "選擇週內日期" : "選擇月份"}
+              aria-invalid={Boolean(selectionError)}
+              aria-describedby={selectionError ? "period-selection-error" : "selected-period-value selected-period-range"}
+              type={selectablePeriod === "week" ? "date" : "month"}
+              min={selectablePeriod === "week" ? "0101-01-01" : "0101-01"}
+              max={selectablePeriod === "week" ? "9999-12-31" : "9999-12"}
+              value={selectionValue}
+              onChange={(event) => setSelection(event.target.value)}
+            />
+          </label>
+          {selectedRange && (
+            <p id="selected-period-value" className="calendar-period-value">
+              {selectablePeriod === "week" ? "已選日期：" : "已選月份："}{selectionValue}
+            </p>
+          )}
           <div className="calendar-period-caption">
             <p id="selected-period-range" aria-live="polite">
               {selectedRange && `${selectedRange.start.toLocaleDateString("zh-TW")} — ${selectedRange.end.toLocaleDateString("zh-TW")}`}
               {selectedRange && selectablePeriod === "week" && <small>週一至週日</small>}
             </p>
-            <button type="button" onClick={() => setSelection(undefined)}>
+          </div>
+          <div className="calendar-period-actions">
+            <button type="button" aria-label={selectablePeriod === "week" ? "上一週" : "上一月"}
+              disabled={!previousSelection} onClick={() => previousSelection && setSelection(previousSelection)}>
+              <ChevronLeft aria-hidden="true" />
+              {selectablePeriod === "week" ? "上一週" : "上一月"}
+            </button>
+            <button type="button" className="calendar-period-reset" onClick={() => setSelection(undefined)}>
               {selectablePeriod === "week" ? "回本週" : "回本月"}
+            </button>
+            <button type="button" aria-label={selectablePeriod === "week" ? "下一週" : "下一月"}
+              disabled={!nextSelection} onClick={() => nextSelection && setSelection(nextSelection)}>
+              {selectablePeriod === "week" ? "下一週" : "下一月"}
+              <ChevronRight aria-hidden="true" />
             </button>
           </div>
           {selectionError && <p id="period-selection-error" className="error-message" role="alert">{selectionError}</p>}
