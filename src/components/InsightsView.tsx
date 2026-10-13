@@ -168,10 +168,10 @@ export function InsightsView({
     [data, reference],
   );
   const trend = useMemo(
-    () => calculateSpendingTrend(data, insights.period.range),
-    [data, insights.period.range],
+    () => calculateSpendingTrend(data, insights.period.range, 14, reference),
+    [data, insights.period.range, reference],
   );
-  const periodTransactions = getAnalyticsTransactions(data).filter((item) =>
+  const periodTransactions = getAnalyticsTransactions(data, reference).filter((item) =>
     within(item, insights.period.range.start, insights.period.range.end),
   );
   const selectedTransactions = selectedCategoryId

@@ -1,8 +1,9 @@
 import type { FinanceData, Transaction } from './model';
 import { isFinancialTransaction } from './tutorialRecord';
+import { getTodayRange, parseLocalDateTime } from './dateRange';
 
 /** Read-only analytics projection. Never persist these records or use them for account balances. */
-export function getAnalyticsTransactions(data: FinanceData): Transaction[] {
+export function getAnalyticsTransactions(data: FinanceData, throughDate?: Date): Transaction[] {
   const transactions = data.transactions.filter(isFinancialTransaction);
   const categoryIds = new Set([
     ...data.categories.map((category) => category.id),
@@ -29,5 +30,9 @@ export function getAnalyticsTransactions(data: FinanceData): Transaction[] {
       occurredAt: transfer.occurredAt,
       note: `轉帳手續費：${transfer.sourceAccountName} → ${transfer.destinationAccountName}`,
     }));
-  return [...transactions, ...fees];
+  const projected = [...transactions, ...fees];
+  if (!throughDate) return projected;
+  // Calendar reports include the whole local day, never tomorrow's planned records.
+  const cutoff = getTodayRange(throughDate).end.getTime();
+  return projected.filter((record) => parseLocalDateTime(record.occurredAt).getTime() <= cutoff);
 }

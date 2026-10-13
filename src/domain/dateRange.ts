@@ -171,7 +171,7 @@ export function getPreviousPeriodRange(
  * Return a previous-period comparison with the same number of included local
  * days when the selected calendar period is still in progress. A shorter
  * previous period is clamped at its natural end (for example, March 31 versus
- * February), while completed or historical/custom periods remain unchanged.
+ * February), while completed periods remain unchanged.
  */
 export function getEquivalentPreviousPeriodRange(
   period: PeriodKey,
@@ -181,8 +181,7 @@ export function getEquivalentPreviousPeriodRange(
 ): DateRange {
   const current = getPeriodRange(period, reference, custom);
   const previous = getPreviousPeriodRange(period, reference, custom);
-  if (period === 'custom'
-    || now.getTime() < current.start.getTime()
+  if (now.getTime() < current.start.getTime()
     || now.getTime() >= current.end.getTime()) {
     return previous;
   }

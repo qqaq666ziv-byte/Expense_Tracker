@@ -35,6 +35,8 @@ SEED = """async () => {
     ['2025-01-05 23:59:59.999', 140, '週日餐費'],
     ['2025-01-06 00:00', 500, '次週餐費'],
     ['2026-10-13 12:00', 13, '今日餐費'],
+    ['2026-10-14 00:00', 777, '未來餐費'],
+    ['2026-11-01 00:00', 999, '未來月份'],
   ].map(([occurredAt, amount, note], index) => ({
     ...stamp, id: `synthetic-ui-${index}`, occurredAt, amount, note, type: 'expense',
     categoryId: food.id, categoryName: food.name, accountId: account.id, accountName: account.name,
@@ -45,6 +47,7 @@ SEED = """async () => {
   data.transfers = [{ ...stamp, id: 'synthetic-ui-fee', amount: 1000, fee: 15,
     sourceAccountId: account.id, sourceAccountName: account.name,
     destinationAccountId: 'synthetic-bank', destinationAccountName: '銀行', occurredAt: '2025-01-05 20:00' }];
+  data.transfers.push({ ...data.transfers[0], id: 'synthetic-future-fee', occurredAt: '2026-10-14 00:00' });
   data.budgets = [{ ...stamp, id: 'synthetic-ui-budget', scope: 'overall',
     period: 'monthly', amount: 1000, isActive: true }];
   localStorage.setItem(storageKey('guest'), JSON.stringify(state));
@@ -60,6 +63,13 @@ def verify(page, screenshot_dir, capture):
     expense = summary.locator('.insight-metric.expense strong')
     month = page.get_by_label('選擇月份', exact=True)
     expect(month).to_have_value('2026-10')
+    expect(expense).to_have_text('NT$13')
+    expect(page.get_by_role('img', name='支出趨勢折線圖')).not_to_contain_text('2026-10-14')
+    expect(page.get_by_role('region', name='預算進度')).to_contain_text('已用 NT$13')
+    month.fill('2026-11')
+    expect(expense).to_have_text('NT$0')
+    expect(summary.locator('.metric-delta').first).to_contain_text('沒有變化')
+    expect(page.get_by_text('還沒有趨勢資料', exact=True)).to_be_visible()
     month.fill('2024-02')
     expect(summary).to_contain_text('2024/2/1 — 2024/2/29')
     expect(expense).to_have_text('NT$290')
@@ -145,6 +155,20 @@ def verify(page, screenshot_dir, capture):
     page.get_by_label('自訂開始日').fill('2024-12-30')
     page.get_by_label('自訂結束日').fill('2025-01-05')
     expect(expense).to_have_text('NT$225')
+
+    # Planned records remain stored and become reportable on their local date.
+    page.get_by_role('button', name='週', exact=True).click()
+    page.get_by_role('button', name='回本週', exact=True).click()
+    expect(expense).to_have_text('NT$13')
+    next_midnight = page.evaluate('new Date(2026, 9, 14, 0, 0, 0).getTime()')
+    page.clock.set_system_time(datetime.fromtimestamp(next_midnight / 1000, tz=ZoneInfo('UTC')))
+    page.evaluate("window.dispatchEvent(new Event('focus'))")
+    expect(expense).to_have_text('NT$805')
+    expect(summary.locator('.insight-metric').nth(3).locator('strong')).to_have_text('NT$268.33')
+    expect(page.get_by_role('img', name='支出趨勢折線圖')).to_contain_text('2026-10-14：NT$792')
+    expect(page.get_by_role('region', name='預算進度')).to_contain_text('已用 NT$805')
+    page.get_by_role('button', name=re.compile('手續費')).click()
+    expect(page.get_by_role('heading', name='手續費明細')).to_be_visible()
 
 
 def main():

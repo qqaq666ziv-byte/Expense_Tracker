@@ -105,10 +105,11 @@ export function calculateSpendingTrend(
   data: FinanceData,
   range: DateRange,
   maxPoints = 14,
+  throughDate?: Date,
 ): SpendingTrendPoint[] {
   if (maxPoints <= 0) return [];
   const totals = new Map<string, number>();
-  for (const transaction of getAnalyticsTransactions(data)) {
+  for (const transaction of getAnalyticsTransactions(data, throughDate)) {
     if (!isFinancialTransaction(transaction) || transaction.type !== 'expense' || !isWithinRange(transaction.occurredAt, range)) {
       continue;
     }
@@ -164,7 +165,7 @@ export function calculateFinancials(data: FinanceData): FinancialSummary {
 }
 
 export function calculateInsights(data: FinanceData, options: InsightsOptions): InsightsSummary {
-  const transactions = getAnalyticsTransactions(data);
+  const transactions = getAnalyticsTransactions(data, options.reference);
   const todayRange = getTodayRange(options.reference);
   const today = summarizeCashFlow(
     transactions.filter((transaction) => isWithinRange(transaction.occurredAt, todayRange)),
@@ -175,7 +176,11 @@ export function calculateInsights(data: FinanceData, options: InsightsOptions): 
   const currentRange = getPeriodRange(options.period, periodReference, options.custom);
   const previousRange = getEquivalentPreviousPeriodRange(options.period, periodReference, options.custom, options.reference);
   const period = summarizePeriod(transactions, data.categories, currentRange, options.reference);
-  const previousPeriod = summarizePeriod(transactions, data.categories, previousRange, options.reference);
+  // A period that has not started has no elapsed window on either side.
+  const previousPeriod = summarizePeriod(
+    currentRange.start.getTime() > todayRange.end.getTime() ? [] : transactions,
+    data.categories, previousRange, options.reference,
+  );
 
   return {
     today: {

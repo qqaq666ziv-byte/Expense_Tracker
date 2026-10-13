@@ -80,3 +80,26 @@ git switch -c restore/select-week-month-baseline checkpoint/20261013-before-sele
 - 獨立 reviewer 未發現阻塞問題；320px／200% 下 Chromium 原生長英文月份的年份仍可能部分裁切，精確已選值及完整日期範圍另列可讀；未透過縮小字級或換成自訂日期控制掩蓋此瀏覽器限制。原生 shadow 內文裁切無法靠 input.scrollWidth 判斷，因此測試通過不代表原生欄位內所有文字均完整。Safari／iPhone 實機及原生面板仍未驗。
 - 合成畫面：[修正前 320px／200%](screenshots/period-layout-before-320-200pct.png)、[修正後 320px／200%](screenshots/period-layout-after-320-200pct.png)、[修正後 440px](screenshots/period-layout-after-440.png)。修正後的局部圖僅在截圖瞬間隱藏無關 sticky header／bottom nav，避免局部擷取疊入導覽列；實際幾何與點擊測試保持導覽列正常。修正前的 Chromium 圖展示日期內文裁切，不宣稱重現 iPhone 的相同外框重疊。
 - 本次修正前遠端 checkpoint：`checkpoint/20261013-before-mobile-period-layout` → `41b81254a236d7bbf195138ece3768e3ed277a52`。需要還原時從此 tag 建立新分支，保留遠端歷史：`git switch -c restore/before-mobile-period-layout checkpoint/20261013-before-mobile-period-layout`。
+
+
+## 未來日期截止修正與發佈候選（2026-10-13）
+
+- 依使用者授權，只修未來日期提前影響已發生收支的口徑，不新增指標教學或額外 UI 標示，不改 14 點趨勢或小額占比。
+- 洞察以裝置當地今天 23:59:59.999 截止；今日晚間的已記錄帳仍算，明日起交易與轉帳手續費先不算。收支、日均、分類、最大筆、明細與趨勢共用截止，預算「已用」亦一致。
+- 歷史週／月仍算完整期間；本期平均以包含今天的已過日數為分母，上期取相同日數（較短月份止於月底）。跨今天的自訂期間也使用同日數比较，今日的一日區間與已完成自訂區間維持完整比較。
+- 未開始的期間收支、日均與比較雙側皆為 0；今日摘要仍正常。跨午夜／恢復焦點後，當天到期的帳自然納入。未刪除、改寫或持久化分析投影；記帳、帳戶餘額與全期間計算維持原資料。
+- 新增今日末毫秒／明日零時、未來收入與費用、空支出、歷史、未開始期間、UTC→當地日期、Santiago DST、午夜刷新、預算及原始資料不變測試。原先歷史互動測試使用的未來 fixture 日期已改成真正歷史日期。
+- 修復既有 durability 測試初始化競態：先等 durable loading 與背景 recurrence 提交結束，再注入儲存失敗並單獨計數使用者寫入；仍驗證第一筆失敗、第二筆遭阻擋、原狀態保留、只提交一次，並新增該次 attempt ID 的斷言。沒有改 production persistence 程式。
+- 本次遠端 checkpoint：`checkpoint/20261013-before-future-period-fix` → `48a126e9a9e014997a84bda399ba398432aa984a`。
+- 發佈前實際確認正式網域指向 `dpl_9adyym1BS2tC54bZ5SNRgkgAEqVW`，READY、production、main `4a0c335233a544eb30cf59767c464a45efc7a2d0`；project `prj_PDwYdTxA52vgkfRek2AzNofUJCHW`。這是具備 transfer/fee 支援的 frontend 還原點，無資料庫變動。最終 merge SHA、正式部署 ID 與 canonical smoke 結果記錄於 PR #23 的發佈紀錄。
+
+Final future-date verification: typecheck, lint, all 55 test files / 648 tests,
+production PWA build, offline PGlite migration verification, and dependency audit
+(0 vulnerabilities) passed. Focused date/analytics/UI regressions passed in
+Asia/Taipei, America/New_York and America/Santiago (85 tests each). The corrected
+durability test passed five independent runs (3 tests each). Chromium passed all
+16 functional viewport/timezone cases and 72 mobile layout/data/text-scale cases,
+including tomorrow's expense/fee appearing after a simulated local midnight.
+The browser clock advance uses Python datetime explicitly (numeric Playwright
+clock values are seconds, while JavaScript timestamps are milliseconds).
+Independent review found no remaining blocker. Real iPhone/Safari remains untested.

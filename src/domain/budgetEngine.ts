@@ -1,4 +1,4 @@
-import { getPeriodRange, isWithinRange } from './dateRange';
+import { getPeriodRange, getTodayRange, isWithinRange } from './dateRange';
 import type { Budget, FinanceData } from './model';
 import { stableLegacyId } from './legacyMigration';
 import { addMoney, subtractMoney, sumMoney } from './money';
@@ -90,6 +90,8 @@ export function calculateBudgetUsage(data: FinanceData, reference: Date): Budget
     .filter((budget) => !budget.deletedAt && budget.isActive)
     .map((budget) => {
       const range = getPeriodRange(budget.period === 'weekly' ? 'week' : 'month', reference);
+      const todayEnd = getTodayRange(reference).end;
+      if (range.end.getTime() > todayEnd.getTime()) range.end = todayEnd;
       const transactionExpense = sumMoney(expenses
         .filter((transaction) => (
           isWithinRange(transaction.occurredAt, range)

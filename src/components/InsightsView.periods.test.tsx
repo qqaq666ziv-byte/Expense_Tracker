@@ -20,12 +20,12 @@ function fixture(): FinanceData {
     ['2026-09-30 23:59:59.999', 31, 'outside-start'],
     ['2026-10-01 00:00', 100, 'october-start'],
     ['2026-10-13 12:00', 13, 'today'],
-    ['2026-12-27 23:59:59.999', 19, 'outside-week'],
-    ['2026-12-28 00:00', 70, 'week-start'],
-    ['2027-01-03 23:59:59.999', 140, 'week-end'],
-    ['2027-01-04 00:00', 500, 'after-week'],
-    ['2028-02-29 23:59:59.999', 290, 'leap-day'],
-    ['2028-03-01 00:00', 300, 'after-leap-day'],
+    ['2024-12-29 23:59:59.999', 19, 'outside-week'],
+    ['2024-12-30 00:00', 70, 'week-start'],
+    ['2025-01-05 23:59:59.999', 140, 'week-end'],
+    ['2025-01-06 00:00', 500, 'after-week'],
+    ['2024-02-29 23:59:59.999', 290, 'leap-day'],
+    ['2024-03-01 00:00', 300, 'after-leap-day'],
   ].map(([occurredAt, amount, note], index) => ({
     id: `synthetic-${index}`, ownerId: 'guest', version: 1,
     updatedAt: '2026-10-13T00:00:00.000Z', lastOperationId: `synthetic-${index}`,
@@ -52,26 +52,26 @@ describe('InsightsView selected calendar periods', () => {
       id: 'synthetic-fee', ownerId: 'guest', version: 1, updatedAt: '2026-10-13T00:00:00.000Z',
       lastOperationId: 'synthetic-fee', sourceAccountId: data.accounts[0].id, sourceAccountName: '現金',
       destinationAccountId: data.accounts[1].id, destinationAccountName: '銀行', amount: 1000, fee: 15,
-      occurredAt: '2027-01-03 20:00',
+      occurredAt: '2025-01-05 20:00',
     }];
     render(<InsightsView data={data} onOpenLedger={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: '週' }));
-    fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2027-01-03' } });
-    expect(picker()).toHaveTextContent('2026/12/28 — 2027/1/3');
+    fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2025-01-05' } });
+    expect(picker()).toHaveTextContent('2024/12/30 — 2025/1/5');
     expect(expense()).toHaveTextContent('225');
-    expect(screen.getByText('已選日期：2027-01-03')).toBeVisible();
-    expect(screen.getByLabelText('選擇週內日期')).toHaveAccessibleDescription(/已選日期：2027-01-03.*2026\/12\/28/);
+    expect(screen.getByText('已選日期：2025-01-05')).toBeVisible();
+    expect(screen.getByLabelText('選擇週內日期')).toHaveAccessibleDescription(/已選日期：2025-01-05.*2024\/12\/30/);
     const trend = screen.getByRole('img', { name: '支出趨勢折線圖' });
-    expect(trend).toHaveTextContent('2026-12-28：');
-    expect(trend).toHaveTextContent('2027-01-03：');
-    expect(trend).not.toHaveTextContent('2027-01-04');
+    expect(trend).toHaveTextContent('2024-12-30：');
+    expect(trend).toHaveTextContent('2025-01-05：');
+    expect(trend).not.toHaveTextContent('2025-01-06');
     fireEvent.click(screen.getByRole('button', { name: new RegExp(data.categories.find((item) => item.kind === 'expense')!.name) }));
     expect(screen.getByText('week-start')).toBeInTheDocument();
     expect(screen.getByText('week-end')).toBeInTheDocument();
     expect(screen.queryByText('after-week')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /手續費/ }));
     expect(screen.getByText('轉帳手續費：現金 → 銀行')).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2025-01-01' } });
+    fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2025-04-01' } });
     expect(screen.queryByRole('heading', { name: '手續費明細' })).not.toBeInTheDocument();
     expect(expense()).toHaveTextContent('0');
     expect(screen.getByText('這段時間沒有支出')).toBeInTheDocument();
@@ -80,17 +80,17 @@ describe('InsightsView selected calendar periods', () => {
 
   it('keeps independent week/month choices across repeated switching and returns to the live current period', () => {
     render(<InsightsView data={fixture()} onOpenLedger={vi.fn()} />);
-    fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2028-02' } });
-    expect(summary()).toHaveTextContent('2028/2/1 — 2028/2/29');
-    expect(screen.getByText('已選月份：2028-02')).toBeVisible();
-    expect(screen.getByLabelText('選擇月份')).toHaveAccessibleDescription(/已選月份：2028-02/);
+    fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2024-02' } });
+    expect(summary()).toHaveTextContent('2024/2/1 — 2024/2/29');
+    expect(screen.getByText('已選月份：2024-02')).toBeVisible();
+    expect(screen.getByLabelText('選擇月份')).toHaveAccessibleDescription(/已選月份：2024-02/);
     expect(expense()).toHaveTextContent('290');
     for (let index = 0; index < 3; index++) {
       fireEvent.click(screen.getByRole('button', { name: '週' }));
-      if (index === 0) fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2027-01-03' } });
+      if (index === 0) fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2025-01-05' } });
       expect(expense()).toHaveTextContent('210');
       fireEvent.click(screen.getByRole('button', { name: '月' }));
-      expect(screen.getByLabelText('選擇月份')).toHaveValue('2028-02');
+      expect(screen.getByLabelText('選擇月份')).toHaveValue('2024-02');
       expect(expense()).toHaveTextContent('290');
     }
     fireEvent.click(screen.getByRole('button', { name: '下一月' }));
@@ -102,16 +102,16 @@ describe('InsightsView selected calendar periods', () => {
     expect(expense()).toHaveTextContent('113');
     fireEvent.click(screen.getByRole('button', { name: '週' }));
     fireEvent.click(screen.getByRole('button', { name: '下一週' }));
-    expect(screen.getByLabelText('選擇週內日期')).toHaveValue('2027-01-04');
+    expect(screen.getByLabelText('選擇週內日期')).toHaveValue('2025-01-06');
     fireEvent.click(screen.getByRole('button', { name: '上一週' }));
-    expect(screen.getByLabelText('選擇週內日期')).toHaveValue('2026-12-28');
+    expect(screen.getByLabelText('選擇週內日期')).toHaveValue('2024-12-30');
     fireEvent.click(screen.getByRole('button', { name: '回本週' }));
     expect(picker()).toHaveTextContent('2026/10/12 — 2026/10/18');
   });
 
   it('keeps today and current budgets tied to the live clock while browsing another month', () => {
     render(<InsightsView data={fixture()} onOpenLedger={vi.fn()} />);
-    fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2028-02' } });
+    fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2024-02' } });
     const today = screen.getByRole('region', { name: '我今天花了多少？' });
     expect(today.querySelector('.today-answer strong')).toHaveTextContent('13');
     expect(screen.getByRole('region', { name: '預算進度' })).toHaveTextContent('已用 NT$113');
@@ -142,8 +142,8 @@ describe('InsightsView selected calendar periods', () => {
     fireEvent.click(screen.getByRole('button', { name: '本年' }));
     expect(summary()).toHaveTextContent('2026/1/1 — 2026/12/31');
     fireEvent.click(screen.getByRole('button', { name: '自訂' }));
-    fireEvent.change(screen.getByLabelText('自訂開始日'), { target: { value: '2026-12-28' } });
-    fireEvent.change(screen.getByLabelText('自訂結束日'), { target: { value: '2027-01-03' } });
+    fireEvent.change(screen.getByLabelText('自訂開始日'), { target: { value: '2024-12-30' } });
+    fireEvent.change(screen.getByLabelText('自訂結束日'), { target: { value: '2025-01-05' } });
     expect(expense()).toHaveTextContent('210');
     fireEvent.click(within(screen.getByRole('region', { name: '我今天花了多少？' })).getByRole('button'));
     expect(openLedger).toHaveBeenCalledOnce();
@@ -157,10 +157,10 @@ describe('InsightsView selected calendar periods', () => {
     clock.now = new Date(2026, 10, 1, 0, 1);
     rerender(<InsightsView data={data} onOpenLedger={vi.fn()} />);
     expect(screen.getByLabelText('選擇月份')).toHaveValue('2026-11');
-    fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2028-02' } });
+    fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2024-02' } });
     clock.now = new Date(2026, 11, 1);
     rerender(<InsightsView data={data} onOpenLedger={vi.fn()} />);
-    expect(screen.getByLabelText('選擇月份')).toHaveValue('2028-02');
+    expect(screen.getByLabelText('選擇月份')).toHaveValue('2024-02');
     fireEvent.click(screen.getByRole('button', { name: '回本月' }));
     expect(screen.getByLabelText('選擇月份')).toHaveValue('2026-12');
     clock.now = new Date(2027, 0, 1);
@@ -174,26 +174,55 @@ describe('InsightsView selected calendar periods', () => {
       process.env.TZ = 'Asia/Taipei';
       const data = fixture();
       const { rerender } = render(<InsightsView data={data} onOpenLedger={vi.fn()} />);
-      fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2028-02' } });
+      fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2024-02' } });
       expect(expense()).toHaveTextContent('290');
       process.env.TZ = 'America/Los_Angeles';
       clock.now = new Date(clock.now.getTime());
       rerender(<InsightsView data={data} onOpenLedger={vi.fn()} />);
-      expect(screen.getByLabelText('選擇月份')).toHaveValue('2028-02');
-      expect(summary()).toHaveTextContent('2028/2/1 — 2028/2/29');
+      expect(screen.getByLabelText('選擇月份')).toHaveValue('2024-02');
+      expect(summary()).toHaveTextContent('2024/2/1 — 2024/2/29');
       expect(expense()).toHaveTextContent('290');
 
       process.env.TZ = 'Asia/Taipei';
       fireEvent.click(screen.getByRole('button', { name: '週' }));
-      fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2027-01-04' } });
+      fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2025-01-06' } });
       process.env.TZ = 'America/Los_Angeles';
       clock.now = new Date(clock.now.getTime());
       rerender(<InsightsView data={data} onOpenLedger={vi.fn()} />);
-      expect(summary()).toHaveTextContent('2027/1/4 — 2027/1/10');
+      expect(summary()).toHaveTextContent('2025/1/6 — 2025/1/12');
       expect(expense()).toHaveTextContent('500');
     } finally {
       if (previousTimezone === undefined) delete process.env.TZ;
       else process.env.TZ = previousTimezone;
     }
   });
+  it('keeps future transactions and fees out of every visible report until the local day arrives', () => {
+    const data = fixture();
+    data.transactions.push({ ...data.transactions[0], id: 'future-expense', amount: 777,
+      occurredAt: '2026-10-14 00:00', note: 'tomorrow-only' });
+    data.transfers = [{ id: 'future-fee', ownerId: 'guest', version: 1,
+      updatedAt: '2026-10-13T00:00:00Z', lastOperationId: 'future-fee', amount: 100, fee: 15,
+      sourceAccountId: data.accounts[0].id, sourceAccountName: '現金',
+      destinationAccountId: 'synthetic-bank', destinationAccountName: '銀行', occurredAt: '2026-10-14 00:00' }];
+    const original = structuredClone(data);
+    const { rerender } = render(<InsightsView data={data} onOpenLedger={vi.fn()} />);
+    expect(expense()).toHaveTextContent('113');
+    expect(screen.getByRole('region', { name: '預算進度' })).toHaveTextContent('已用 NT$113');
+    expect(screen.getByRole('img', { name: '支出趨勢折線圖' })).not.toHaveTextContent('2026-10-14');
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(data.categories.find(c => c.kind === 'expense')!.name) }));
+    expect(screen.queryByText('tomorrow-only')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /手續費/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '週' }));
+    expect(expense()).toHaveTextContent('13');
+    expect(summary()).toHaveTextContent('NT$6.5');
+    clock.now = new Date(2026, 9, 14, 0);
+    rerender(<InsightsView data={data} onOpenLedger={vi.fn()} />);
+    expect(expense()).toHaveTextContent('805');
+    expect(screen.getByRole('img', { name: '支出趨勢折線圖' })).toHaveTextContent('2026-10-14');
+    expect(screen.getByRole('region', { name: '預算進度' })).toHaveTextContent('已用 NT$905');
+    fireEvent.click(screen.getByRole('button', { name: /手續費/ }));
+    expect(screen.getByText('轉帳手續費：現金 → 銀行')).toBeInTheDocument();
+    expect(data).toEqual(original);
+  });
+
 });
