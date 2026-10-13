@@ -4,12 +4,15 @@ import {
   ArrowRight,
   ArrowUpRight,
   CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   Minus,
   TrendingUp,
 } from "lucide-react";
 import type { FinanceData, Transaction } from "../domain/model";
 import type { PeriodKey } from "../domain/dateRange";
 import {
+  getPeriodRange,
   parseLocalDateTime,
   validateCustomRangeInput,
 } from "../domain/dateRange";
@@ -22,14 +25,15 @@ import {
 import { localDate, shortDate } from "../app/format";
 import { displayMoney } from "../app/presentation";
 import { useCalendarReference } from "../app/useCalendarReference";
+import { parsePeriodSelection, periodSelectionValue, shiftPeriodSelection } from "../app/periodSelection";
 import { isFinancialTransaction } from "../domain/tutorialRecord";
 import { FinanceIcon } from "./FinanceIcon";
 
 type AnalysisPeriod = "day" | PeriodKey;
 const PERIODS: { key: AnalysisPeriod; label: string }[] = [
   { key: "day", label: "今日" },
-  { key: "week", label: "本週" },
-  { key: "month", label: "本月" },
+  { key: "week", label: "週" },
+  { key: "month", label: "月" },
   { key: "year", label: "本年" },
   { key: "custom", label: "自訂" },
 ];
@@ -108,6 +112,9 @@ export function InsightsView({
 }) {
   const reference = useCalendarReference();
   const [period, setPeriod] = useState<AnalysisPeriod>("month");
+  // Undefined follows the live clock; explicit choices survive midnight/focus.
+  const [selectedWeek, setSelectedWeek] = useState<string>();
+  const [selectedMonth, setSelectedMonth] = useState<string>();
   const [customStart, setCustomStart] = useState(() =>
     localDate(new Date(reference.getFullYear(), reference.getMonth(), 1)),
   );
@@ -117,7 +124,28 @@ export function InsightsView({
   const customValidation = validateCustomRangeInput(customRange);
   const customError =
     "message" in customValidation ? customValidation.message : undefined;
-  const periodReady = period !== "custom" || customValidation.valid;
+  const selectablePeriod = period === "week" || period === "month" ? period : undefined;
+  const selectionValue = selectablePeriod
+    ? (selectablePeriod === "week" ? selectedWeek : selectedMonth)
+      ?? periodSelectionValue(selectablePeriod, reference)
+    : "";
+  // Reparse in the current device timezone after the calendar clock refreshes.
+  const selectedReference = selectablePeriod ? parsePeriodSelection(selectablePeriod, selectionValue) : null;
+  const selectedRange = selectablePeriod && selectedReference
+    ? getPeriodRange(selectablePeriod, selectedReference)
+    : null;
+  const selectionError = selectablePeriod && !selectedReference
+    ? selectablePeriod === "week" ? "請選擇有效的週內日期。" : "請選擇有效的月份（YYYY-MM）。"
+    : undefined;
+  const periodReady = (period !== "custom" || customValidation.valid) && !selectionError;
+  const periodReferenceTime = selectedReference?.getTime();
+  const previousSelection = selectablePeriod ? shiftPeriodSelection(selectablePeriod, selectionValue, -1) : null;
+  const nextSelection = selectablePeriod ? shiftPeriodSelection(selectablePeriod, selectionValue, 1) : null;
+  const setSelection = (value: string | undefined) => {
+    if (selectablePeriod === "week") setSelectedWeek(value);
+    else if (selectablePeriod === "month") setSelectedMonth(value);
+    setSelectedCategoryId(undefined);
+  };
   const customRangeValid = customValidation.valid;
   const insights = useMemo(() => {
     const options = period === "day"
@@ -131,18 +159,19 @@ export function InsightsView({
         : {
             period: period === "custom" ? ("month" as const) : period,
             reference,
+            periodReference: periodReferenceTime === undefined ? reference : new Date(periodReferenceTime),
           };
     return calculateInsights(data, options);
-  }, [data, period, customStart, customEnd, customRangeValid, reference]);
+  }, [data, period, customStart, customEnd, customRangeValid, reference, periodReferenceTime]);
   const budgets = useMemo(
     () => calculateBudgetUsage(data, reference),
     [data, reference],
   );
   const trend = useMemo(
-    () => calculateSpendingTrend(data, insights.period.range),
-    [data, insights.period.range],
+    () => calculateSpendingTrend(data, insights.period.range, 14, reference),
+    [data, insights.period.range, reference],
   );
-  const periodTransactions = getAnalyticsTransactions(data).filter((item) =>
+  const periodTransactions = getAnalyticsTransactions(data, reference).filter((item) =>
     within(item, insights.period.range.start, insights.period.range.end),
   );
   const selectedTransactions = selectedCategoryId
@@ -201,6 +230,50 @@ export function InsightsView({
           </button>
         ))}
       </div>
+      {selectablePeriod && (
+        <div className="calendar-period-picker" role="group" aria-label={selectablePeriod === "week" ? "選擇週" : "選擇月"}>
+          <label className="calendar-period-field">
+            {selectablePeriod === "week" ? "選擇週內任一天" : "選擇月份"}
+            <input
+              aria-label={selectablePeriod === "week" ? "選擇週內日期" : "選擇月份"}
+              aria-invalid={Boolean(selectionError)}
+              aria-describedby={selectionError ? "period-selection-error" : "selected-period-value selected-period-range"}
+              type={selectablePeriod === "week" ? "date" : "month"}
+              min={selectablePeriod === "week" ? "0101-01-01" : "0101-01"}
+              max={selectablePeriod === "week" ? "9999-12-31" : "9999-12"}
+              value={selectionValue}
+              onChange={(event) => setSelection(event.target.value)}
+            />
+          </label>
+          {selectedRange && (
+            <p id="selected-period-value" className="calendar-period-value">
+              {selectablePeriod === "week" ? "已選日期：" : "已選月份："}{selectionValue}
+            </p>
+          )}
+          <div className="calendar-period-caption">
+            <p id="selected-period-range" aria-live="polite">
+              {selectedRange && `${selectedRange.start.toLocaleDateString("zh-TW")} — ${selectedRange.end.toLocaleDateString("zh-TW")}`}
+              {selectedRange && selectablePeriod === "week" && <small>週一至週日</small>}
+            </p>
+          </div>
+          <div className="calendar-period-actions">
+            <button type="button" aria-label={selectablePeriod === "week" ? "上一週" : "上一月"}
+              disabled={!previousSelection} onClick={() => previousSelection && setSelection(previousSelection)}>
+              <ChevronLeft aria-hidden="true" />
+              {selectablePeriod === "week" ? "上一週" : "上一月"}
+            </button>
+            <button type="button" className="calendar-period-reset" onClick={() => setSelection(undefined)}>
+              {selectablePeriod === "week" ? "回本週" : "回本月"}
+            </button>
+            <button type="button" aria-label={selectablePeriod === "week" ? "下一週" : "下一月"}
+              disabled={!nextSelection} onClick={() => nextSelection && setSelection(nextSelection)}>
+              {selectablePeriod === "week" ? "下一週" : "下一月"}
+              <ChevronRight aria-hidden="true" />
+            </button>
+          </div>
+          {selectionError && <p id="period-selection-error" className="error-message" role="alert">{selectionError}</p>}
+        </div>
+      )}
       {period === "custom" && (
         <div className="custom-range">
           <label>
@@ -510,7 +583,7 @@ export function InsightsView({
       <section className="budget-glance" aria-labelledby="budget-title">
         <div className="plain-heading">
           <div>
-            <p className="section-kicker">這個週期</p>
+            <p className="section-kicker">目前週／月</p>
             <h2 id="budget-title">預算進度</h2>
           </div>
         </div>

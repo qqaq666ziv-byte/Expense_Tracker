@@ -26,7 +26,13 @@ describe('useFinanceApp durable commit boundary', () => {
       recover: vi.fn(basePersistence.recover),
     };
     const { result } = renderHook(() => useFinanceApp(persistence));
-    await waitFor(() => expect(persistence.load).toHaveBeenCalledWith('guest'));
+    await waitFor(() => expect(result.current.authLoading).toBe(false));
+    // Initialization also commits recurrence state. Finish that work before
+    // injecting a failure and counting this user's two write attempts.
+    await act(async () => {
+      await Promise.all(persistence.commit.mock.results.map(call => call.value));
+    });
+    persistence.commit.mockClear();
     const before = structuredClone(result.current.state);
     const category = before.data.categories.find((candidate) => candidate.kind === 'expense')!;
     const account = before.data.accounts[0];
@@ -64,6 +70,7 @@ describe('useFinanceApp durable commit boundary', () => {
     expect(result.current.state).toEqual(before);
     expect(result.current.storageError).toMatch(/quota exhausted/);
     expect(persistence.commit).toHaveBeenCalledOnce();
+    expect(persistence.commit.mock.calls[0]?.[1]).toBe(record.lastOperationId);
   });
 
   it('propagates a real durable write failure through the controller without clearing the form', async () => {

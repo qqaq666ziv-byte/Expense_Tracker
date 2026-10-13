@@ -81,6 +81,37 @@ describe('calendar date range', () => {
     expect([previous.end.getMonth(), previous.end.getDate()]).toEqual([6, 23]);
   });
 
+  it('compares completed selected months and weeks against the full previous period', () => {
+    const now = new Date(2026, 9, 13, 12);
+    const month = getEquivalentPreviousPeriodRange('month', new Date(2024, 1, 1), undefined, now);
+    const week = getEquivalentPreviousPeriodRange('week', new Date(2025, 0, 1), undefined, now);
+    expect([toLocalDateKey(month.start), toLocalDateKey(month.end)]).toEqual(['2024-01-01', '2024-01-31']);
+    expect([toLocalDateKey(week.start), toLocalDateKey(week.end)]).toEqual(['2024-12-23', '2024-12-29']);
+  });
+
+  it('clips current-period comparisons by the real clock rather than the chosen anchor day', () => {
+    const now = new Date(2026, 9, 13, 12);
+    const month = getEquivalentPreviousPeriodRange('month', new Date(2026, 9, 31), undefined, now);
+    const week = getEquivalentPreviousPeriodRange('week', new Date(2026, 9, 18), undefined, now);
+    expect(toLocalDateKey(month.end)).toBe('2026-09-13');
+    expect(toLocalDateKey(week.end)).toBe('2026-10-06');
+  });
+
+  it('navigates a selected week across DST using calendar days', () => {
+    const previousTimezone = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    try {
+      const range = getPeriodRange('week', new Date(2026, 2, 8, 12));
+      expect([toLocalDateKey(range.start), toLocalDateKey(range.end)]).toEqual(['2026-03-02', '2026-03-08']);
+      expect(countElapsedDays(range, new Date(2026, 2, 8, 23, 59))).toBe(7);
+      expect(isWithinRange('2026-03-08 23:59:59.999', range)).toBe(true);
+      expect(isWithinRange('2026-03-09 00:00', range)).toBe(false);
+    } finally {
+      if (previousTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTimezone;
+    }
+  });
+
   it('clamps short previous months and preserves elapsed-day equivalence across leap years', () => {
     const shortMonth = getEquivalentPreviousPeriodRange('month', new Date(2026, 2, 31, 12));
     const leapYear = getEquivalentPreviousPeriodRange('year', new Date(2028, 1, 29, 12));
