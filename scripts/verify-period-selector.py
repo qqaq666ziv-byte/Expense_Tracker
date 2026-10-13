@@ -166,8 +166,12 @@ def main():
         browser = getattr(p, args.browser).launch(**launch_options)
         for width, height in [(390, 844), (375, 667), (320, 568), (1280, 900)]:
             for tz in ['Asia/Taipei', 'America/Los_Angeles', 'UTC', 'America/Santiago']:
-                context = browser.new_context(viewport={'width': width, 'height': height},
-                    is_mobile=width < 600, has_touch=width < 600, timezone_id=tz)
+                dynamic_timezone = args.browser == 'chromium' and width == 390 and tz == 'Asia/Taipei'
+                context_options = dict(viewport={'width': width, 'height': height},
+                    is_mobile=width < 600, has_touch=width < 600)
+                if not dynamic_timezone:
+                    context_options['timezone_id'] = tz
+                context = browser.new_context(**context_options)
                 # Abort every non-local request, even if a future app change adds one.
                 external = []
                 def route_local(route):
@@ -178,6 +182,9 @@ def main():
                         route.continue_()
                 context.route('**/*', route_local)
                 page = context.new_page()
+                cdp = context.new_cdp_session(page) if dynamic_timezone else None
+                if cdp:
+                    cdp.send('Emulation.setTimezoneOverride', {'timezoneId': tz})
                 page.add_init_script("""localStorage.setItem('shiba-finance:onboarding:v2:guest',
                   JSON.stringify({ version: 2, chapter: 'full', status: 'completed', step: 'complete' }));""")
                 errors = []
@@ -188,6 +195,25 @@ def main():
                 fixture = page.evaluate(SEED)
                 page.reload()
                 verify(page, screenshots, capture=width == 390 and tz == 'Asia/Taipei')
+                if cdp:
+                    # Keep calendar selections stable when the device timezone changes
+                    # while the app is backgrounded, then its live clock refreshes.
+                    page.get_by_role('button', name='月', exact=True).click()
+                    page.get_by_label('選擇月份', exact=True).fill('2024-02')
+                    cdp.send('Emulation.setTimezoneOverride', {'timezoneId': 'America/Los_Angeles'})
+                    page.evaluate("window.dispatchEvent(new Event('focus'))")
+                    summary = page.get_by_role('region', name='這段時間的收支')
+                    expect(summary).to_contain_text('2024/2/1 — 2024/2/29')
+                    expect(summary.locator('.insight-metric.expense strong')).to_have_text('NT$290')
+                    cdp.send('Emulation.setTimezoneOverride', {'timezoneId': 'Asia/Taipei'})
+                    page.evaluate("window.dispatchEvent(new Event('focus'))")
+                    page.get_by_role('button', name='週', exact=True).click()
+                    page.get_by_label('選擇週內日期').fill('2025-01-06')
+                    cdp.send('Emulation.setTimezoneOverride', {'timezoneId': 'America/Los_Angeles'})
+                    page.evaluate("window.dispatchEvent(new Event('focus'))")
+                    expect(summary).to_contain_text('2025/1/6 — 2025/1/12')
+                    expect(summary.locator('.insight-metric.expense strong')).to_have_text('NT$500')
+                    print('[pass] device timezone change + focus preserves selected week/month and totals')
                 persisted = page.evaluate("JSON.stringify(JSON.parse(localStorage.getItem('shiba-finance:v3:guest')).data)")
                 assert persisted == fixture['data'], 'Browsing periods mutated financial data'
                 assert not errors, errors

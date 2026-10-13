@@ -162,4 +162,33 @@ describe('InsightsView selected calendar periods', () => {
     rerender(<InsightsView data={data} onOpenLedger={vi.fn()} />);
     expect(screen.getByLabelText('選擇月份')).toHaveValue('2027-01');
   });
+
+  it('reinterprets pinned calendar choices in the new device timezone after a clock refresh', () => {
+    const previousTimezone = process.env.TZ;
+    try {
+      process.env.TZ = 'Asia/Taipei';
+      const data = fixture();
+      const { rerender } = render(<InsightsView data={data} onOpenLedger={vi.fn()} />);
+      fireEvent.change(screen.getByLabelText('選擇月份'), { target: { value: '2028-02' } });
+      expect(expense()).toHaveTextContent('290');
+      process.env.TZ = 'America/Los_Angeles';
+      clock.now = new Date(clock.now.getTime());
+      rerender(<InsightsView data={data} onOpenLedger={vi.fn()} />);
+      expect(screen.getByLabelText('選擇月份')).toHaveValue('2028-02');
+      expect(summary()).toHaveTextContent('2028/2/1 — 2028/2/29');
+      expect(expense()).toHaveTextContent('290');
+
+      process.env.TZ = 'Asia/Taipei';
+      fireEvent.click(screen.getByRole('button', { name: '週' }));
+      fireEvent.change(screen.getByLabelText('選擇週內日期'), { target: { value: '2027-01-04' } });
+      process.env.TZ = 'America/Los_Angeles';
+      clock.now = new Date(clock.now.getTime());
+      rerender(<InsightsView data={data} onOpenLedger={vi.fn()} />);
+      expect(summary()).toHaveTextContent('2027/1/4 — 2027/1/10');
+      expect(expense()).toHaveTextContent('500');
+    } finally {
+      if (previousTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTimezone;
+    }
+  });
 });

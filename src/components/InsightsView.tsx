@@ -129,10 +129,8 @@ export function InsightsView({
     ? (selectablePeriod === "week" ? selectedWeek : selectedMonth)
       ?? periodSelectionValue(selectablePeriod, reference)
     : "";
-  const selectedReference = useMemo(
-    () => selectablePeriod ? parsePeriodSelection(selectablePeriod, selectionValue) : null,
-    [selectablePeriod, selectionValue],
-  );
+  // Reparse in the current device timezone after the calendar clock refreshes.
+  const selectedReference = selectablePeriod ? parsePeriodSelection(selectablePeriod, selectionValue) : null;
   const selectedRange = selectablePeriod && selectedReference
     ? getPeriodRange(selectablePeriod, selectedReference)
     : null;
@@ -140,7 +138,7 @@ export function InsightsView({
     ? selectablePeriod === "week" ? "請選擇有效的週內日期。" : "請選擇有效的月份（YYYY-MM）。"
     : undefined;
   const periodReady = (period !== "custom" || customValidation.valid) && !selectionError;
-  const periodReference = selectedReference ?? reference;
+  const periodReferenceTime = selectedReference?.getTime();
   const previousSelection = selectablePeriod ? shiftPeriodSelection(selectablePeriod, selectionValue, -1) : null;
   const nextSelection = selectablePeriod ? shiftPeriodSelection(selectablePeriod, selectionValue, 1) : null;
   const setSelection = (value: string | undefined) => {
@@ -161,10 +159,10 @@ export function InsightsView({
         : {
             period: period === "custom" ? ("month" as const) : period,
             reference,
-            periodReference,
+            periodReference: periodReferenceTime === undefined ? reference : new Date(periodReferenceTime),
           };
     return calculateInsights(data, options);
-  }, [data, period, customStart, customEnd, customRangeValid, reference, periodReference]);
+  }, [data, period, customStart, customEnd, customRangeValid, reference, periodReferenceTime]);
   const budgets = useMemo(
     () => calculateBudgetUsage(data, reference),
     [data, reference],
